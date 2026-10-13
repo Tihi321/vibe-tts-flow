@@ -1,0 +1,11 @@
+pynput
+sounddevice
+numpy
+pystray
+Pillow
+pywin32
+requests
+tomli-w
+sv-ttk
+kokoro-onnx
+pytest
