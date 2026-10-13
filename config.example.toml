@@ -1,0 +1,29 @@
+# VibeTTS configuration. Copied to config.toml on first run; edit config.toml.
+
+[hotkey]
+# Press to read the selected text aloud; press again (or Esc) to stop.
+# Names: ctrl ctrl_l ctrl_r alt alt_l alt_r shift win caps_lock space f1..f24 a..z
+# Chords are joined with "+", e.g. "ctrl+shift+r". Single keys work too: "f9".
+read = "alt+win"
+
+[speech]
+model = "models/kokoro-v1.0.int8.onnx"   # or models/kokoro-v1.0.onnx (fp32, 3.5x larger)
+voices = "models/voices-v1.0.bin"
+voice = "af_heart"           # af_* / am_* American, bf_* / bm_* British (f = female, m = male)
+speed = 1.0                  # 0.5 .. 2.0
+sentence_pause = 0.25        # seconds of silence between sentences
+volume = 1.0                 # 0 .. 1
+device = ""                  # "" = Windows default output; or part of the device name
+preload = true               # load the model at startup so the first read starts at once
+
+[selection]
+copy_timeout_ms = 400        # how long to wait for the app to answer the copy shortcut
+fallback_to_clipboard = true # nothing selected: read the clipboard text instead
+restore_clipboard = true     # put the previous clipboard content back after copying
+clean_markdown = true        # skip markdown symbols, say "link" for web addresses
+max_chars = 20000            # longer selections are cut; 0 = no limit
+
+[ui]
+show_pill = true
+pill_position = "bottom"     # bottom | top
+show_settings_on_start = true
