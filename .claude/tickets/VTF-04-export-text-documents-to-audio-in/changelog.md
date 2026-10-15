@@ -142,4 +142,8 @@ Repo: `vibe-tts-flow`. Branch: `VTF-04_export-audio-mcp`, created from `origin/m
 - **Build output.** `dist\` was rebuilt by the verification build.
 
 ### Commit status
+<<<<<<< HEAD
 Committed as 271973e on `VTF-04_export-audio-mcp` (not pushed).
+=======
+Not committed. All changes are in the working tree on `VTF-04_export-audio-mcp`.
+>>>>>>> 271973e5f9e0a3e5423aa5430a5ba7d97a9e6d42
