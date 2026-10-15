@@ -16,8 +16,8 @@ class FakeEngine:
     def voices(self):
         return ["af_heart"]
 
-    def synth(self, text, voice, speed):
-        self.calls.append((text, voice, speed))
+    def synth(self, text, voice, speed, lang=None):
+        self.calls.append((text, voice, speed, lang))
         if text == self.fail_on:
             raise RuntimeError("boom")
         time.sleep(self.delay)
@@ -67,7 +67,7 @@ def test_plays_all_chunks_with_gaps_and_volume():
     r = req(["one", "two"], pause=0.1, volume=0.5)
     sp.speak_and_wait(r, timeout=5)
     assert [c[0] for c in engine.calls] == ["one", "two"]
-    assert engine.calls[0][1:] == ("af_heart", 1.1)
+    assert engine.calls[0][1:] == ("af_heart", 1.1, None)
     out = FakeOutput.instances[0]
     audio = np.concatenate(out.frames)
     # chunk (0.05 s) + gap (0.1 s) + chunk (0.05 s)
@@ -133,10 +133,52 @@ def test_voice_helpers():
 
 
 def test_omni_voice_helpers():
-    assert voice_supported("omni_hr:default") and voice_supported("omni_hr")
-    assert not voice_supported("omni_")
-    assert voice_label("omni_hr:default") == "Default (Croatian)"
-    assert voice_label("omni_hr:ana_marija") == "Ana Marija (Croatian)"
-    assert voice_label("omni_hr") == "Default (Croatian)"
+    assert voice_supported("omni:default") and voice_supported("omni:ana_marija")
+    assert voice_supported("omni_hr:default") and voice_supported("omni_hr")  # legacy
+    assert not voice_supported("omni_") and not voice_supported("omni:")
+    assert voice_label("omni:default") == "Default (OmniVoice)"
+    assert voice_label("omni:ana_marija") == "Ana Marija (OmniVoice)"
+    assert voice_label("omni_hr:default") == "Default (OmniVoice)"
     assert voice_label("af_heart") == "Heart (American English, female)"  # unchanged
     assert not voice_supported("ox_foo")
+
+
+def test_omni_id_helpers():
+    from vibetts.tts import is_omni_voice, normalize_omni_voice, omni_preset
+
+    assert is_omni_voice("omni:x") and is_omni_voice("omni_hr:x") and is_omni_voice("omni")
+    assert not is_omni_voice("af_heart") and not is_omni_voice("omnivore")
+    assert normalize_omni_voice("omni_hr:alma") == "omni:alma"
+    assert normalize_omni_voice("omni_hr") == "omni:default"
+    assert normalize_omni_voice("omni:alma") == "omni:alma"
+    assert normalize_omni_voice("af_heart") == "af_heart"
+    assert omni_preset("omni:alma") == "alma" and omni_preset("omni_hr") == "default"
+
+
+def test_request_lang_reaches_the_engine():
+    eng = FakeEngine()
+    req = SpeakRequest([Chunk("Bok.", 0.0)], "omni:default", 1.0, 0.0, lang="hr")
+    Speaker(lambda: eng, FakeOutput).speak_and_wait(req, timeout=5)
+    assert eng.calls == [("Bok.", "omni:default", 1.0, "hr")]
+    assert SpeakRequest([], "af_heart", 1.0, 0.0).lang is None
+
+
+def test_kokoro_ignores_lang(monkeypatch):
+    import sys
+    import types
+
+    from vibetts.tts import KokoroEngine
+
+    seen = {}
+
+    class K:
+        def __init__(self, *a):
+            pass
+
+        def create(self, text, voice, speed, lang):
+            seen.update(voice=voice, lang=lang)
+            return np.zeros(4, np.float32), 24000
+
+    monkeypatch.setitem(sys.modules, "kokoro_onnx", types.SimpleNamespace(Kokoro=K))
+    KokoroEngine("m", "v").synth("Hello", "bf_emma", 1.0, "hr")
+    assert seen == {"voice": "bf_emma", "lang": "en-gb"}  # still the voice's own language

@@ -9,6 +9,7 @@ safetensors
 onnx
 onnxscript
 onnxruntime
-huggingface_hub
+requests
 numpy
 tokenizers
+tomli_w

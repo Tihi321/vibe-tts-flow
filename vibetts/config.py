@@ -50,10 +50,12 @@ class SpeechConfig:
     volume: float = 1.0          # 0 .. 1
     device: str = ""             # "" = Windows default output, or part of the device name
     preload: bool = True         # load the model at startup so the first read starts at once
-    omnivoice_dir: str = "models/omnivoice"  # Croatian (OmniVoice) files, see scripts/build_omnivoice.py
+    engine: str = "kokoro"       # "kokoro" | "omnivoice": which engine reads normal text
+    omnivoice_dir: str = "models/omnivoice"  # OmniVoice files, installed from Settings
     omnivoice_steps: int = 6     # 4 .. 16: fewer = faster, more = better quality
-    croatian_voice: str = "omni_hr:default"  # voice used for text that looks Croatian
-    auto_language: bool = True   # switch to croatian_voice when the selection looks Croatian
+    omni_voice: str = "omni:default"  # voice of the OmniVoice engine (omni:<preset>)
+    croatian_voice: str = ""     # "" = omni_voice, else omni:<preset>, for text that looks Croatian
+    auto_language: bool = True   # use the OmniVoice engine (hr) when the selection looks Croatian
 
 
 @dataclass
@@ -153,8 +155,47 @@ def _clamp_steps(steps: int) -> int:
     return max(lo, min(hi, int(steps)))
 
 
+ENGINES = ("kokoro", "omnivoice")
+OMNI_DEFAULT_VOICE = "omni:default"
+
+
+def is_omni_voice(voice: str) -> bool:
+    """OmniVoice voice id: 'omni:<preset>' (or the legacy 'omni_hr[:<preset>]' / bare 'omni')."""
+    return voice == "omni" or voice.startswith(("omni:", "omni_"))
+
+
+def normalize_omni_voice(voice: str) -> str:
+    """'omni_hr:alma' -> 'omni:alma'; a bare 'omni' / 'omni_hr' -> 'omni:default'; ids that
+    are already 'omni:<preset>' are kept. Anything else is returned unchanged."""
+    if not is_omni_voice(voice):
+        return voice
+    return f"omni:{voice.partition(':')[2] or 'default'}"
+
+
+def _migrate_voices(s: SpeechConfig) -> None:
+    """Old configs: an OmniVoice id in `voice` meant 'read everything with it' (engine
+    omnivoice); 'omni_hr:<x>' ids are now 'omni:<x>'."""
+    if is_omni_voice(s.voice):
+        s.engine = "omnivoice"
+        s.omni_voice = normalize_omni_voice(s.voice)
+        s.croatian_voice = ""  # the old code ignored croatian_voice in this case
+        s.voice = SpeechConfig().voice
+    if is_omni_voice(s.omni_voice):
+        s.omni_voice = normalize_omni_voice(s.omni_voice)
+    else:
+        s.omni_voice = OMNI_DEFAULT_VOICE
+    if s.croatian_voice:
+        s.croatian_voice = (normalize_omni_voice(s.croatian_voice)
+                            if is_omni_voice(s.croatian_voice) else "")
+    if s.engine not in ENGINES:
+        log.warning("config: speech.engine %r is not one of %s; using kokoro", s.engine,
+                    ", ".join(ENGINES))
+        s.engine = "kokoro"
+
+
 def config_from_dict(d: dict) -> Config:
     cfg = _build(Config, d, "config")
+    _migrate_voices(cfg.speech)
     clamped = _clamp_steps(cfg.speech.omnivoice_steps)
     if clamped != cfg.speech.omnivoice_steps:
         log.warning("config: speech.omnivoice_steps %d out of range %d..%d; using %d",

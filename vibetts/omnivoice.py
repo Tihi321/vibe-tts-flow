@@ -1,9 +1,9 @@
-"""OmniVoice speech engine: Croatian (and many other languages) on CPU without torch.
+"""OmniVoice speech engine: English, Croatian and many other languages on CPU without torch.
 
 A numpy + onnxruntime + tokenizers port of the k2-fsa/OmniVoice generation loop: a masked
 diffusion language model that fills 8 audio codebooks over a fixed number of frames in a few
 unmasking steps, with classifier-free guidance. The model files are built once by
-scripts/build_omnivoice.py into models/omnivoice/ (see manifest.json there).
+vibetts/omnivoice_setup.py (Settings > OmniVoice) into models/omnivoice/ (see manifest.json there).
 
 Every chunk is generated with a *voice preset* as its reference prefix (codes + text of a short
 clip the model produced earlier), so the speaker stays the same from sentence to sentence.
@@ -37,8 +37,8 @@ import numpy as np
 log = logging.getLogger(__name__)
 
 SAMPLE_RATE = 24000
-OMNI_PREFIX = "omni_"
-DEFAULT_VOICE = "omni_hr:default"
+OMNI_PREFIX = "omni"
+DEFAULT_VOICE = "omni:default"
 DEFAULT_DIR = Path("models/omnivoice")
 MANIFEST = "manifest.json"
 DEFAULT_TEXT = "Dobar dan, ovo je test čitanja na hrvatskom jeziku."
@@ -74,7 +74,8 @@ DESIGN_LANG = "hr"
 # ---------------------------------------------------------------- voice ids and files
 
 def is_omni(voice: str) -> bool:
-    return voice.startswith(OMNI_PREFIX)
+    """'omni:<preset>', or the legacy 'omni_<lang>[:<preset>]' / bare 'omni'."""
+    return voice == OMNI_PREFIX or voice.startswith((OMNI_PREFIX + ":", OMNI_PREFIX + "_"))
 
 
 def _manifest_files(model_dir: Path) -> list[str] | None:
@@ -96,18 +97,50 @@ def _voices_dir(model_dir: Path) -> Path:
 
 
 def list_presets(model_dir: Path) -> list[str]:
-    """Voice ids ('omni_hr:<name>') of the presets in <model_dir>/voices. No model load."""
+    """Voice ids ('omni:<name>') of the presets in <model_dir>/voices. No model load."""
     d = _voices_dir(model_dir)
     if not d.is_dir():
         return []
-    return [f"omni_hr:{p.stem}" for p in sorted(d.glob("*.npy"))
+    return [f"omni:{p.stem}" for p in sorted(d.glob("*.npy"))
             if p.with_suffix(".txt").is_file()]
 
 
-def parse_voice(voice: str) -> tuple[str, str]:
-    """'omni_hr:default' -> ('hr', 'default'); a bare 'omni_hr' has no preset ('')."""
+def preset_info(model_dir: Path, name: str) -> dict:
+    """What the Voices list shows for preset `name`: {'name', 'voice', 'kind', 'description',
+    'lang'}. kind is 'default', 'description' (designed), 'recording' (cloned) or 'random';
+    lang is the language id of the preset's sample ('' when unknown)."""
+    meta: dict = {}
+    try:
+        meta = json.loads(_preset_files(model_dir, name)[3].read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        pass
+    if not isinstance(meta, dict):
+        meta = {}
+    kind = {"design": "description", "clone": "recording"}.get(meta.get("kind"), "random")
+    if name == RESERVED_NAME:
+        kind = "default"
+    description = str(meta.get("instruct") or meta.get("source") or "")
+    if kind == "random" and "seed" in meta:
+        description = f"seed {meta['seed']}"
+    lang = str(meta.get("lang") or ("hr" if name == RESERVED_NAME else ""))
+    return {"name": name, "voice": f"omni:{name}", "kind": kind, "description": description,
+            "lang": lang}
+
+
+def list_preset_info(model_dir: Path) -> list[dict]:
+    """preset_info of every listable preset ('default' first)."""
+    names = [v.partition(":")[2] for v in list_presets(model_dir)]
+    names.sort(key=lambda n: (n != RESERVED_NAME, n))
+    return [preset_info(model_dir, n) for n in names]
+
+
+def parse_voice(voice: str) -> tuple[str | None, str]:
+    """(language, preset) of a voice id. 'omni:default' -> (None, 'default'): the language
+    comes from the request. Legacy ids carry one: 'omni_hr:default' -> ('hr', 'default'), a
+    bare 'omni_hr' -> ('hr', '') (no preset)."""
     head, _, preset = voice.partition(":")
-    return head[len(OMNI_PREFIX):] or "hr", preset
+    legacy = head[len(OMNI_PREFIX) + 1:] if head.startswith(OMNI_PREFIX + "_") else ""
+    return (legacy or None), preset
 
 
 def load_preset(model_dir: Path, name: str) -> tuple[np.ndarray, str]:
@@ -212,7 +245,7 @@ def save_preset(model_dir: Path, name: str, clip: VoiceClip, overwrite: bool = F
     meta.write_text(json.dumps({**clip.meta, "created": time.strftime("%Y-%m-%d %H:%M:%S")},
                                indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     np.save(npy, np.asarray(clip.codes).astype(np.int16))  # last: this makes it listable
-    return f"omni_hr:{name}"
+    return f"omni:{name}"
 
 
 def delete_preset(model_dir: Path, name: str) -> None:
@@ -456,8 +489,11 @@ class OmniVoiceEngine:
     def voices(self) -> list[str]:
         return list_presets(self.model_dir)
 
-    def synth(self, text: str, voice: str, speed: float) -> np.ndarray:
-        lang, preset = parse_voice(voice)
+    def synth(self, text: str, voice: str, speed: float, lang: str | None = None) -> np.ndarray:
+        """`lang` is the language id of `text` ('hr', 'en', ...); default English (a legacy
+        'omni_hr' voice id keeps Croatian)."""
+        legacy, preset = parse_voice(voice)
+        lang = lang or legacy or "en"
         ref_codes, ref_text = load_preset(self.model_dir, preset) if preset else (None, "")
         with self._lock:
             return self._synth(text.strip(), lang, ref_codes, ref_text, speed)
@@ -485,12 +521,15 @@ class OmniVoiceEngine:
                     lang: str | None = None) -> VoiceClip:
         """A ~3 s voice described in words ('female, young adult, low pitch'), no reference.
 
-        `text` is what the clip says (default: DESIGN_TEXTS[DESIGN_LANG]); `lang` is its language
-        id (default: DESIGN_LANG for the default text, else 'hr'). Takes a few seconds (16 steps).
-        Raises ValueError for a bad description."""
+        `text` is what the clip says (default: DESIGN_TEXTS[lang]); `lang` is its language
+        id (default: DESIGN_LANG for the default text, else 'hr'; 'hr' and 'en' have built-in
+        texts). Takes a few seconds (16 steps). Raises ValueError for a bad description."""
         instruct = validate_instruct(instruct)
         if text is None:
             lang = lang or DESIGN_LANG
+            if lang not in DESIGN_TEXTS:
+                raise ValueError(f"No built-in sample text for language {lang!r}; "
+                                 f"choose one of {', '.join(DESIGN_TEXTS)}.")
             text = DESIGN_TEXTS[lang]
         text = text.strip()
         lang = lang or "hr"
@@ -502,13 +541,14 @@ class OmniVoiceEngine:
         meta = {"kind": "design", "instruct": instruct, "seed": int(seed), "lang": lang}
         return VoiceClip(codes.astype(np.int16), text, audio, meta)
 
-    def clone_clip(self, wav_path: Path, ref_text: str) -> VoiceClip:
+    def clone_clip(self, wav_path: Path, ref_text: str, lang: str | None = None) -> VoiceClip:
         """A voice cloned from a recording of someone saying `ref_text`.
 
         The recording is mixed to mono and silence-trimmed; under 2 s or over 8 s of speech is
         rejected (a cut clip would no longer match its transcript).
         The fp32 encoders are loaded for this call only. Raises ValueError (bad WAV, too short,
-        empty text) or FileNotFoundError (encoders not installed). Takes a few seconds."""
+        empty text) or FileNotFoundError (encoders not installed). Takes a few seconds.
+        `lang` (language id of the recording) is only stored with the preset."""
         import soxr
 
         ref_text = ref_text.strip()
@@ -539,6 +579,8 @@ class OmniVoiceEngine:
             audio = post_process(self._decode(codes))
         meta = {"kind": "clone", "source": Path(wav_path).name,
                 "seconds": round(len(x) / SAMPLE_RATE, 2)}
+        if lang:
+            meta["lang"] = lang
         if warning:
             meta["warning"] = warning  # also in clip.warning
         return VoiceClip(codes.astype(np.int16), ref_text, audio, meta, warning)
@@ -547,7 +589,7 @@ class OmniVoiceEngine:
         d = self.model_dir / ENCODERS_DIR
         if not encoders_present(self.model_dir):
             raise FileNotFoundError("The voice cloning encoders are not installed; "
-                                    "run scripts/build_omnivoice.py (without --no-encoders).")
+                                    "install OmniVoice with voice cloning (Settings > OmniVoice).")
         return {n: _session(d / f"{n}.onnx") for n in ENCODER_NAMES}
 
     def _release_encoders(self) -> None:
@@ -643,9 +685,12 @@ def make_voice(engine: OmniVoiceEngine, name: str, seed: int, text: str = DEFAUL
     codes = engine.generate_codes(text, lang)
     d = _voices_dir(engine.model_dir)
     d.mkdir(parents=True, exist_ok=True)
-    np.save(d / f"{name}.npy", codes.astype(np.int16))
     (d / f"{name}.txt").write_text(text.strip() + "\n", encoding="utf-8")
     write_wav(d / f"{name}.wav", post_process(engine._decode(codes)))
+    meta = {"kind": "seed", "seed": int(seed), "lang": lang,
+            "created": time.strftime("%Y-%m-%d %H:%M:%S")}
+    (d / f"{name}.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+    np.save(d / f"{name}.npy", codes.astype(np.int16))  # last: this makes it listable
     return d / f"{name}.wav"
 
 
@@ -683,6 +728,7 @@ def main(argv: list[str] | None = None) -> int:
     say.add_argument("--voice", default=DEFAULT_VOICE)
     say.add_argument("--steps", type=int, default=6)
     say.add_argument("--speed", type=float, default=1.0)
+    say.add_argument("--lang", default="hr", help="language id of the text (default hr)")
     say.add_argument("--out", default="")
     for p in (mk, ds, cl, say):
         p.add_argument("--model-dir", default=str(DEFAULT_DIR))
@@ -692,7 +738,7 @@ def main(argv: list[str] | None = None) -> int:
 
     model_dir = Path(a.model_dir)
     if not models_present(model_dir):
-        print(f"OmniVoice model files missing in {model_dir}; run scripts/build_omnivoice.py",
+        print(f"OmniVoice model files missing in {model_dir}; install them from Settings > OmniVoice",
               file=sys.stderr)
         return 1
     engine = OmniVoiceEngine(model_dir, getattr(a, "steps", 6))
@@ -713,7 +759,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"saved {wav} in {time.perf_counter() - t0:.1f}s")
         return 0
     t0 = time.perf_counter()
-    samples = engine.synth(a.text, a.voice, a.speed)
+    samples = engine.synth(a.text, a.voice, a.speed, a.lang)
     dt = time.perf_counter() - t0
     audio = len(samples) / SAMPLE_RATE - 0.2  # without the 0.1 s pads
     print(f"synth {dt:.2f}s for {audio:.2f}s of audio, RTF {dt / max(audio, 1e-3):.2f}")

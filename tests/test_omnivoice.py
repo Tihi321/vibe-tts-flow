@@ -81,8 +81,11 @@ def write_preset(model_dir, name, text="Dobar dan.", frames=10):
 
 
 def test_is_omni_and_parse_voice():
-    assert is_omni("omni_hr:default") and is_omni("omni_hr")
-    assert not is_omni("af_heart") and not is_omni("")
+    assert is_omni("omni:default") and is_omni("omni") and is_omni("omni_hr:default")
+    assert is_omni("omni_hr")  # legacy ids are still accepted
+    assert not is_omni("af_heart") and not is_omni("") and not is_omni("omnivore")
+    assert parse_voice("omni:default") == (None, "default")  # the language comes per request
+    assert parse_voice("omni") == (None, "")
     assert parse_voice("omni_hr:default") == ("hr", "default")
     assert parse_voice("omni_hr") == ("hr", "")
     assert parse_voice("omni_sr:ana") == ("sr", "ana")
@@ -106,8 +109,8 @@ def test_list_presets(tmp_path):
     write_preset(tmp_path, "ana")
     np.save(tmp_path / "voices" / "orphan.npy", np.zeros((8, 3)))  # no text file
     (tmp_path / "voices" / "ana.wav").write_bytes(b"")
-    assert list_presets(tmp_path) == ["omni_hr:ana", "omni_hr:default"]
-    assert fake_engine(tmp_path).voices() == ["omni_hr:ana", "omni_hr:default"]
+    assert list_presets(tmp_path) == ["omni:ana", "omni:default"]
+    assert fake_engine(tmp_path).voices() == ["omni:ana", "omni:default"]
 
 
 def test_load_preset_validates_shape(tmp_path):
@@ -264,7 +267,9 @@ def test_make_voice_saves_preset_files(tmp_path):
     eng = fake_engine(tmp_path, steps=2)
     wav = ov.make_voice(eng, "ana", seed=3, text="Dobar dan.")
     assert wav == tmp_path / "voices" / "ana.wav" and wav.is_file()
-    assert list_presets(tmp_path) == ["omni_hr:ana"]
+    meta = json.loads((tmp_path / "voices" / "ana.json").read_text(encoding="utf-8"))
+    assert meta["seed"] == 3 and meta["lang"] == "hr" and meta["kind"] == "seed"
+    assert list_presets(tmp_path) == ["omni:ana"]
     codes, text = load_preset(tmp_path, "ana")
     assert codes.shape[0] == CODEBOOKS and text == "Dobar dan."
     assert eng.seed == 3
@@ -552,7 +557,7 @@ def a_clip(frames=12, text="Dobar dan."):
 
 def test_save_preset_writes_files_and_meta(tmp_path):
     vid = ov.save_preset(tmp_path, "Moj Glas", a_clip())
-    assert vid == "omni_hr:moj-glas"
+    assert vid == "omni:moj-glas"
     d = tmp_path / "voices"
     assert sorted(p.name for p in d.iterdir()) == ["moj-glas.json", "moj-glas.npy", "moj-glas.txt",
                                                    "moj-glas.wav"]
@@ -560,7 +565,7 @@ def test_save_preset_writes_files_and_meta(tmp_path):
     assert meta["kind"] == "design" and meta["seed"] == 1 and "created" in meta
     codes, text = load_preset(tmp_path, "moj-glas")
     assert codes.shape == (CODEBOOKS, 12) and text == "Dobar dan."
-    assert list_presets(tmp_path) == ["omni_hr:moj-glas"]  # the .json/.wav are ignored
+    assert list_presets(tmp_path) == ["omni:moj-glas"]  # the .json/.wav are ignored
 
 
 def test_save_preset_refuses_default_bad_names_and_overwrite(tmp_path):
@@ -588,11 +593,11 @@ def test_delete_preset(tmp_path):
     write_preset(tmp_path, "default")
     ov.save_preset(tmp_path, "ana", a_clip())
     ov.delete_preset(tmp_path, "ana")
-    assert list_presets(tmp_path) == ["omni_hr:default"]
+    assert list_presets(tmp_path) == ["omni:default"]
     assert sorted(p.name for p in (tmp_path / "voices").iterdir()) == ["default.npy", "default.txt"]
     with pytest.raises(ValueError, match="cannot be deleted"):
         ov.delete_preset(tmp_path, "default")
-    assert list_presets(tmp_path) == ["omni_hr:default"]
+    assert list_presets(tmp_path) == ["omni:default"]
     with pytest.raises(FileNotFoundError):
         ov.delete_preset(tmp_path, "ana")
     with pytest.raises(ValueError):
@@ -602,3 +607,73 @@ def test_delete_preset(tmp_path):
 def test_cli_design_without_model_files(tmp_path, capsys):
     assert ov.main(["design-voice", "x", "--instruct", "male", "--model-dir", str(tmp_path)]) == 1
     assert "missing" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------- language per request
+
+def spy_lang(eng):
+    seen = []
+    real = eng._build
+
+    def build(text, frames, lang, *a, **k):
+        seen.append(lang)
+        return real(text, frames, lang, *a, **k)
+    eng._build = build
+    return seen
+
+
+def test_synth_uses_the_request_language(tmp_path):
+    write_preset(tmp_path, "default")
+    eng = fake_engine(tmp_path, steps=1)
+    seen = spy_lang(eng)
+    eng.synth("Hello there.", "omni:default", 1.0)  # no language given: English
+    eng.synth("Dobar dan.", "omni:default", 1.0, "hr")
+    eng.synth("Hello there.", "omni:default", 1.0, None)
+    assert seen[0] == "en" and seen[1] == "hr" and seen[2] == "en"
+
+
+def test_legacy_voice_id_keeps_its_language(tmp_path):
+    write_preset(tmp_path, "default")
+    eng = fake_engine(tmp_path, steps=1)
+    seen = spy_lang(eng)
+    eng.synth("Dobar dan.", "omni_hr:default", 1.0)
+    eng.synth("Hello.", "omni_hr:default", 1.0, "en")  # an explicit language wins
+    assert seen[0] == "hr" and seen[1] == "en"
+
+
+def test_design_clip_language_and_meta(tmp_path):
+    eng = fake_engine(tmp_path, steps=1)
+    hr = eng.design_clip("female", 0)  # default: Croatian sample
+    assert hr.meta["lang"] == "hr" and hr.text == ov.DESIGN_TEXTS["hr"]
+    en = eng.design_clip("female", 0, None, "en")
+    assert en.meta["lang"] == "en" and en.text == ov.DESIGN_TEXTS["en"]
+    with pytest.raises(ValueError, match="sample text"):
+        eng.design_clip("female", 0, None, "xx")
+    custom = eng.design_clip("male", 1, "Hello world.", "en")
+    assert custom.text == "Hello world." and custom.meta["lang"] == "en"
+
+
+def test_preset_json_records_lang(tmp_path):
+    clip = a_clip()
+    clip.meta["lang"] = "en"
+    ov.save_preset(tmp_path, "eng", clip)
+    meta = json.loads((tmp_path / "voices" / "eng.json").read_text(encoding="utf-8"))
+    assert meta["lang"] == "en"
+
+
+def test_preset_info_kinds(tmp_path):
+    write_preset(tmp_path, "default")  # no json: the built-in Croatian default
+    d = a_clip()
+    d.meta.update(instruct="female, young adult", lang="en")
+    ov.save_preset(tmp_path, "alma", d)
+    c = ov.VoiceClip(a_clip().codes, "Tekst.", np.zeros(10, np.float32),
+                     {"kind": "clone", "source": "me.wav", "lang": "hr"})
+    ov.save_preset(tmp_path, "ja", c)
+    rows = {r["name"]: r for r in ov.list_preset_info(tmp_path)}
+    assert [r["name"] for r in ov.list_preset_info(tmp_path)][0] == "default"
+    assert rows["default"]["kind"] == "default" and rows["default"]["lang"] == "hr"
+    assert rows["alma"] == {"name": "alma", "voice": "omni:alma", "kind": "description",
+                            "description": "female, young adult", "lang": "en"}
+    assert rows["ja"]["kind"] == "recording" and rows["ja"]["description"] == "me.wav"
+    write_preset(tmp_path, "plain")
+    assert ov.preset_info(tmp_path, "plain")["kind"] == "random"

@@ -69,3 +69,24 @@ def test_download_named_unknown(tmp_path):
 def test_files_table():
     assert set(model_setup.files()) == {"int8", "fp32", "voices"}
     assert model_setup.DEFAULT_MODEL in model_setup.MODELS
+
+
+def test_download_full_url(tmp_path, monkeypatch):
+    urls = []
+    monkeypatch.setattr(model_setup.requests, "get",
+                        lambda url, **kw: urls.append(url) or Resp(b"0123456789"))
+    url = "https://huggingface.co/some/repo/resolve/abc123/sub/dir/f.bin"
+    path = model_setup.download("f.bin", tmp_path, expected_size=10, url=url)
+    assert urls == [url]  # not the Kokoro release URL
+    assert path.read_bytes() == b"0123456789"
+
+
+def test_download_full_url_cancel_and_size_check(tmp_path, monkeypatch):
+    monkeypatch.setattr(model_setup.requests, "get", lambda url, **kw: Resp(b"short"))
+    with pytest.raises(model_setup.SetupError, match="expected 10"):
+        model_setup.download("f.bin", tmp_path, expected_size=10, url="https://x/f.bin")
+    cancel = threading.Event()
+    cancel.set()
+    with pytest.raises(model_setup.DownloadCancelled):
+        model_setup.download("f.bin", tmp_path, cancel=cancel, url="https://x/f.bin")
+    assert not list(tmp_path.iterdir())

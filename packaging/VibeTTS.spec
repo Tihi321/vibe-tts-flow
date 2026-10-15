@@ -9,6 +9,8 @@ from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
 ROOT = os.path.abspath(os.path.join(SPECPATH, os.pardir))
 
 datas = [(os.path.join(ROOT, "config.example.toml"), ".")]
+datas += [(os.path.join(ROOT, "vibetts", "data", "omnivoice"), os.path.join("vibetts", "data", "omnivoice"))]
+# int4 LLM graph + weight map for the in-app OmniVoice install
 datas += collect_data_files("sv_ttk")
 datas += collect_data_files("kokoro_onnx")       # config.json (vocabulary)
 datas += collect_data_files("espeakng_loader")   # espeak-ng-data (phoneme rules)
@@ -24,8 +26,9 @@ hiddenimports = [
     "vibetts.single_instance",
     "vibetts.selection",
     "vibetts.textprep",
-    # Croatian voice (OmniVoice): imported lazily; model files are built locally, not bundled
+    # Croatian voice (OmniVoice): imported lazily; model files are installed from Settings, not bundled
     "vibetts.omnivoice",
+    "vibetts.omnivoice_setup",
     "tokenizers",
     "soxr",
     "soxr.soxr_ext",

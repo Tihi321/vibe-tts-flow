@@ -16,6 +16,7 @@ from typing import Any, Callable, Protocol
 
 import numpy as np
 
+from .config import is_omni_voice, normalize_omni_voice  # noqa: F401  (re-exported)
 from .textprep import Chunk
 
 log = logging.getLogger(__name__)
@@ -31,14 +32,10 @@ LANG_LABELS = {"a": "American English", "b": "British English", "e": "Spanish",
                "f": "French", "h": "Hindi", "i": "Italian", "p": "Portuguese (BR)"}
 
 
-# OmniVoice (Croatian) voices are "omni_hr:<preset>"; the engine itself lives in
+# OmniVoice voices are "omni:<preset>" (legacy: "omni_hr:<preset>"); the engine itself lives in
 # vibetts.omnivoice (kept out of here so this module stays light to import).
-OMNI_PREFIX = "omni_"
-LANG_LABELS["o"] = "Croatian"  # tray group for the OmniVoice presets
-
-
-def is_omni_voice(voice: str) -> bool:
-    return voice.startswith(OMNI_PREFIX)
+OMNI_LABEL = "OmniVoice"
+OMNI_LANG_NAMES = {"hr": "Croatian", "en": "English"}
 
 
 def voice_lang(voice: str) -> str:
@@ -47,21 +44,24 @@ def voice_lang(voice: str) -> str:
 
 def voice_supported(voice: str) -> bool:
     if is_omni_voice(voice):
-        return len(voice) > len(OMNI_PREFIX)
+        head, sep, name = voice.partition(":")
+        if sep:
+            return bool(name) and head != "omni_"
+        return head == "omni" or len(head) > len("omni_")  # bare 'omni' / 'omni_hr'
     return len(voice) > 3 and voice[:1] in VOICE_LANGS and voice[2:3] == "_"
 
 
 def omni_preset(voice: str) -> str:
-    """'omni_hr:alma' -> 'alma'; a bare 'omni_hr' is the default preset."""
+    """'omni:alma' (or legacy 'omni_hr:alma') -> 'alma'; a bare 'omni' is the default preset."""
     return voice.partition(":")[2] or "default"
 
 
 def voice_label(voice: str) -> str:
-    """'af_heart' -> 'Heart (American English, female)'; 'omni_hr:default' -> 'Default (Croatian)'."""
+    """'af_heart' -> 'Heart (American English, female)'; 'omni:ana_marija' -> 'Ana Marija (OmniVoice)'."""
     if not voice_supported(voice):
         return voice
     if is_omni_voice(voice):
-        return f"{omni_preset(voice).replace('_', ' ').title()} (Croatian)"
+        return f"{omni_preset(voice).replace('_', ' ').title()} ({OMNI_LABEL})"
     gender = {"f": "female", "m": "male"}.get(voice[1:2], "")
     name = voice[3:].replace("_", " ").title()
     lang = LANG_LABELS.get(voice[:1], "")
@@ -70,7 +70,8 @@ def voice_label(voice: str) -> str:
 
 class Engine(Protocol):
     def voices(self) -> list[str]: ...
-    def synth(self, text: str, voice: str, speed: float) -> np.ndarray: ...
+    def synth(self, text: str, voice: str, speed: float,
+              lang: str | None = None) -> np.ndarray: ...
 
 
 class KokoroEngine:
@@ -88,7 +89,9 @@ class KokoroEngine:
     def voices(self) -> list[str]:
         return [v for v in self._kokoro.get_voices() if voice_supported(v)]
 
-    def synth(self, text: str, voice: str, speed: float) -> np.ndarray:
+    def synth(self, text: str, voice: str, speed: float,
+              lang: str | None = None) -> np.ndarray:
+        """`lang` is the request language for OmniVoice; Kokoro picks it from the voice."""
         with self._lock:
             samples, _ = self._kokoro.create(text, voice=voice, speed=speed,
                                              lang=voice_lang(voice))
@@ -162,13 +165,14 @@ def write_wav(path: Path, samples: np.ndarray) -> None:
 
 class SpeakRequest:
     def __init__(self, chunks: list[Chunk], voice: str, speed: float, pause: float,
-                 volume: float = 1.0, device: str = ""):
+                 volume: float = 1.0, device: str = "", lang: str | None = None):
         self.chunks = chunks
         self.voice = voice
         self.speed = speed
         self.pause = pause
         self.volume = volume
         self.device = device
+        self.lang = lang  # "hr" / "en": language of the text, used by OmniVoice
 
 
 _END = object()
@@ -247,7 +251,7 @@ class Speaker:
                 if stop.is_set():
                     return
                 t0 = time.perf_counter()
-                samples = engine.synth(chunk.text, req.voice, req.speed)
+                samples = engine.synth(chunk.text, req.voice, req.speed, req.lang)
                 log.debug("synth %d chars -> %.2fs audio in %.2fs", len(chunk.text),
                           len(samples) / SAMPLE_RATE, time.perf_counter() - t0)
                 gap = int(req.pause * chunk.pause_after * SAMPLE_RATE)

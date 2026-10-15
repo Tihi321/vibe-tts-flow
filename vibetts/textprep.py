@@ -12,11 +12,11 @@ FIRST_CHUNK_CHARS = 100   # split the first sentence at a comma when it is longe
 MAX_CHUNK_CHARS = 400     # split any sentence longer than this
 MERGE_BELOW_CHARS = 40    # glue very short sentences ("Hi.", "OK.") to the next one...
 MERGE_MAX_CHARS = 100     # ...as long as the result stays short
-# Croatian (OmniVoice) pays a fixed cost per chunk for the voice preset prefix, so after
-# the first chunk it gets longer chunks; otherwise short sentences synthesize slower than
+# OmniVoice pays a fixed cost per chunk for the voice preset prefix (whatever the language), so
+# after the first chunk it gets longer chunks; otherwise short sentences synthesize slower than
 # they play and leave gaps.
-HR_MERGE_BELOW_CHARS = 140
-HR_MERGE_MAX_CHARS = 260
+LONG_MERGE_BELOW_CHARS = 140
+LONG_MERGE_MAX_CHARS = 260
 
 _URL = re.compile(r"\b(?:https?://|www\.)[^\s<>()\[\]]+", re.IGNORECASE)
 _MD_IMAGE = re.compile(r"!\[([^\]]*)\]\([^)]*\)")
@@ -159,13 +159,15 @@ def split_chunks(text: str, merge_below: int = MERGE_BELOW_CHARS,
 
 
 def prepare(text: str, markdown: bool = True, max_chars: int = 0,
-            lang: str = "en") -> list[Chunk]:
+            lang: str = "en", long_chunks: bool = False) -> list[Chunk]:
+    """Clean and split `text`. `lang` picks the word spoken for URLs; `long_chunks` (set for
+    OmniVoice requests, whatever the language) merges short sentences into longer chunks."""
     text = clean_text(text, markdown, lang)
     if max_chars and len(text) > max_chars:
         cut = text.rfind(" ", 0, max_chars)
         text = text[: cut if cut > 0 else max_chars]
-    if lang == "hr":
-        return split_chunks(text, HR_MERGE_BELOW_CHARS, HR_MERGE_MAX_CHARS)
+    if long_chunks:
+        return split_chunks(text, LONG_MERGE_BELOW_CHARS, LONG_MERGE_MAX_CHARS)
     return split_chunks(text)
 
 

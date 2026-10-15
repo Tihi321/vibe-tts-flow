@@ -116,10 +116,16 @@ def test_looks_croatian_empty():
     assert not looks_croatian("123 456 !!!")
 
 
-def test_croatian_merges_longer_chunks_after_the_first():
+def test_long_chunks_merge_after_the_first():
     text = "Dobar dan. " + " ".join(f"Ovo je kratka recenica broj {i}." for i in range(8))
-    en, hr = prepare(text), prepare(text, lang="hr")
+    en, hr = prepare(text), prepare(text, long_chunks=True)
     assert hr[0].text == en[0].text  # the first chunk stays short: audio starts quickly
     assert len(hr) < len(en)
     assert all(len(c.text) <= 260 for c in hr)
     assert " ".join(c.text for c in hr) == " ".join(c.text for c in en)
+
+
+def test_long_chunks_do_not_depend_on_language():
+    text = "Hello. " + " ".join(f"This is short sentence number {i}." for i in range(8))
+    assert len(prepare(text, long_chunks=True)) < len(prepare(text))
+    assert prepare(text, lang="hr") == prepare(text)  # language only picks the URL word
