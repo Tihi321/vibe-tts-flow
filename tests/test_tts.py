@@ -182,3 +182,61 @@ def test_kokoro_ignores_lang(monkeypatch):
     monkeypatch.setitem(sys.modules, "kokoro_onnx", types.SimpleNamespace(Kokoro=K))
     KokoroEngine("m", "v").synth("Hello", "bf_emma", 1.0, "hr")
     assert seen == {"voice": "bf_emma", "lang": "en-gb"}  # still the voice's own language
+
+
+# ---------------------------------------------------------------- request completion state
+
+def test_request_done_after_normal_play():
+    sp = make(FakeEngine(), [])
+    r = req(["one", "two"])
+    assert not r.done.is_set()
+    sp.speak_and_wait(r, timeout=5)
+    assert r.done.is_set() and r.error is None and not r.interrupted
+
+
+def test_request_interrupted_by_stop():
+    events = []
+    sp = make(FakeEngine(delay=0.2), events)
+    r = req([f"s{i}" for i in range(20)])
+    sp.speak(r)
+    deadline = time.monotonic() + 3
+    while not events and time.monotonic() < deadline:
+        time.sleep(0.01)
+    sp.stop(wait=3)
+    assert r.done.wait(3) and r.interrupted and r.error is None
+
+
+def test_request_error_is_recorded():
+    sp = make(FakeEngine(fail_on="bad"), [])
+    r = req(["good", "bad"])
+    sp.speak_and_wait(r, timeout=5)
+    assert r.done.is_set() and "boom" in r.error and not r.interrupted
+
+    def broken():
+        raise RuntimeError("no model")
+
+    r2 = req(["x"])
+    Speaker(broken, FakeOutput).speak_and_wait(r2, timeout=5)
+    assert r2.done.is_set() and r2.error == "no model"
+
+
+def test_replaced_request_is_done_and_interrupted():
+    sp = make(FakeEngine(delay=0.1), [])
+    first, second = req([f"a{i}" for i in range(20)]), req(["b"])
+    sp.speak(first)
+    time.sleep(0.2)
+    sp.speak_and_wait(second, timeout=5)
+    assert first.done.is_set() and first.interrupted
+    assert second.done.is_set() and not second.interrupted
+
+
+def test_write_wav_roundtrip(tmp_path):
+    import wave
+
+    from vibetts.tts import write_wav
+
+    path = tmp_path / "a.wav"
+    write_wav(path, np.array([0.0, 0.5, -2.0], np.float32))
+    with wave.open(str(path)) as w:
+        assert w.getnframes() == 3 and w.getframerate() == SAMPLE_RATE
+        assert np.frombuffer(w.readframes(3), "<i2").tolist() == [0, 16383, -32767]

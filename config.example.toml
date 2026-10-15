@@ -36,3 +36,13 @@ max_chars = 20000            # longer selections are cut; 0 = no limit
 show_pill = true
 pill_position = "bottom"     # bottom | top
 show_settings_on_start = true
+
+[export]
+folder = ""                  # "" = Documents/VibeTTS; relative paths are next to the app
+format = "mp3"               # mp3 (small) | wav (lossless)
+mp3_bitrate = 64             # 32 | 48 | 64 | 96 | 128 | 160 kbps
+
+[mcp]
+enabled = false              # local MCP server so AI agents can export audio (opt-in)
+port = 7723                  # 1024 .. 65535, listens on 127.0.0.1 only
+max_chars = 200000           # longest text one tool call may read; 0 = no limit

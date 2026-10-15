@@ -7,6 +7,9 @@ import pytest
 
 from vibetts import model_setup, settings_ui
 from vibetts.config import Config
+from vibetts.docload import Document, DocumentError
+from vibetts.export import (ExportBusy, ExportCancelled, ExportProgress, ExportRequest,
+                            ExportResult)
 from vibetts.settings_ui import (ANY, ENCODERS_MISSING, SAME_VOICE, TABS, SettingsHooks,
                                  SettingsWindow, VoiceCreator, build_instruct,
                                  config_from_form, form_from_config, model_choice)
@@ -163,6 +166,10 @@ class Recorder:
         self.error = None
         self.config = Config()
         self.installer = FakeInstaller(self)
+        self.mp3 = True
+        self.mcp = {"enabled": False, "running": False, "url": "", "error": ""}
+        self.doc = Document("Hello there.", True, "notes")
+        self.exports, self.export_error = [], None
 
     def hooks(self):
         def design(instruct, seed, text=None, lang=None):
@@ -213,7 +220,27 @@ class Recorder:
             play_preset=lambda name: self.played.append(("preset", name)),
             design_clip=design, clone_clip=clone, save_voice=save, delete_voice=delete,
             play_clip=lambda clip: self.played.append(clip),
-            encoders_present=lambda: self.encoders)
+            encoders_present=lambda: self.encoders,
+            load_document=self._load_document, export_audio=self._export_audio,
+            cancel_export=lambda: self.calls.append("cancel_export"),
+            mp3_available=lambda: self.mp3,
+            mcp_status=lambda: dict(self.mcp),
+            open_folder=lambda p: self.calls.append(("open_folder", p)))
+
+    def _load_document(self, path):
+        self.calls.append(("load", path))
+        if isinstance(self.doc, Exception):
+            raise self.doc
+        return self.doc
+
+    def _export_audio(self, req, progress=None, cancel=None):
+        self.exports.append(req)
+        if progress:
+            progress(ExportProgress(2, 10, 192.0))
+        if self.export_error:
+            raise self.export_error
+        return ExportResult(path=req.out, fmt="mp3", seconds=192.0, chunks=10, bytes=1,
+                            voice="af_heart", lang="en")
 
 
 @pytest.fixture(scope="module")
@@ -393,11 +420,11 @@ def state(widget):
 
 
 def test_tabs_and_engine_radio(tk_root):
-    assert TABS == ("general", "voice", "kokoro", "omnivoice", "about")
+    assert TABS == ("general", "voice", "export", "kokoro", "omnivoice", "mcp", "about")
     rec = Recorder()
     win = make_window(tk_root, rec)
     assert [win._nb.tab(i, "text") for i in range(len(TABS))] == [
-        "General", "Voice", "Kokoro", "OmniVoice", "About"]
+        "General", "Voice", "Export", "Kokoro", "OmniVoice", "Agents (MCP)", "About"]
     assert win._vars["engine"].get() == "kokoro"
     assert state(win._engine_radios["omnivoice"]) == "normal"
     assert win._engine_hint.cget("text") == ""
@@ -633,3 +660,260 @@ def test_window_fits_a_1080p_screen(tk_root):
     win._nb.select(TABS.index("omnivoice"))
     win.top.update_idletasks()
     assert win.top.winfo_reqheight() <= 1080 - 90
+
+
+# ---------------------------------------------------------------- export / mcp tabs
+
+def test_export_mcp_form_round_trip():
+    cfg = Config()
+    form = form_from_config(cfg)
+    assert form["export_format"] == "mp3" and form["mp3_bitrate"] == "64"
+    cfg.export.folder, cfg.export.format, cfg.export.mp3_bitrate = "D:/audio", "wav", 128
+    cfg.mcp.enabled, cfg.mcp.port, cfg.mcp.max_chars = True, 8000, 0
+    assert config_from_form(cfg, form_from_config(cfg)) == cfg
+
+
+def test_export_bitrate_snaps_and_bad_values_rejected():
+    form = form_from_config(Config())
+    form["mp3_bitrate"] = "100"
+    assert config_from_form(Config(), form).export.mp3_bitrate == 96
+    for key, value in (("mcp_port", "80"), ("mcp_port", "70000"), ("mcp_port", "x"),
+                       ("mcp_max_chars", "-1"), ("export_format", "ogg"),
+                       ("mp3_bitrate", "x")):
+        bad = form_from_config(Config())
+        bad[key] = value
+        with pytest.raises(ValueError):
+            config_from_form(Config(), bad)
+    bad = form_from_config(Config())
+    bad["mcp_port"] = "80"
+    with pytest.raises(ValueError, match="MCP port must be at least 1024"):
+        config_from_form(Config(), bad)
+
+
+def test_show_export_tab(tk_root):
+    win = make_window(tk_root, Recorder())
+    win.show("export")
+    assert win._nb.index(win._nb.select()) == TABS.index("export")
+    win.show("mcp")
+    assert win._nb.index(win._nb.select()) == TABS.index("mcp")
+
+
+def export_win(tk_root, monkeypatch, rec=None, save_to=None):
+    rec = rec or Recorder()
+    win = make_window(tk_root, rec)
+    if save_to is not None:
+        monkeypatch.setattr(settings_ui.filedialog, "asksaveasfilename", lambda **k: str(save_to))
+    return rec, win
+
+
+def test_open_document_fills_text(tk_root, monkeypatch):
+    rec, win = export_win(tk_root, monkeypatch)
+    monkeypatch.setattr(settings_ui.filedialog, "askopenfilename", lambda **k: "C:/x/notes.md")
+    win._export_open()
+    assert rec.calls[-1] == ("load", "C:/x/notes.md")
+    assert win._export_text.get("1.0", "end-1c") == "Hello there."
+    assert win._export_title == "notes" and win._export_markdown is True
+    assert "12 characters" in win._export_info.cget("text")
+    assert state(win._export_open_btn) == "normal"
+    win._export_clear()
+    assert win._export_title == "" and win._export_text.get("1.0", "end-1c") == ""
+
+
+def test_open_document_cancelled_and_error(tk_root, monkeypatch):
+    rec, win = export_win(tk_root, monkeypatch)
+    monkeypatch.setattr(settings_ui.filedialog, "askopenfilename", lambda **k: "")
+    win._export_open()
+    assert rec.calls == [] and win._export_text.get("1.0", "end-1c") == ""
+    errors = []
+    monkeypatch.setattr(settings_ui.messagebox, "showerror", lambda *a, **k: errors.append(a))
+    monkeypatch.setattr(settings_ui.filedialog, "askopenfilename", lambda **k: "C:/x/a.pdf")
+    rec.doc = DocumentError("This PDF has no text")
+    win._export_open()
+    assert errors and "no text" in errors[0][1]
+    assert win._export_text.get("1.0", "end-1c") == ""
+
+
+def test_export_runs_hook_with_request(tk_root, monkeypatch, tmp_path):
+    out = tmp_path / "x.mp3"
+    rec, win = export_win(tk_root, monkeypatch, save_to=out)
+    win._export_set_text("Some text to read.")
+    win._export_lang.set("Croatian")
+    win._export_speed.set("1.25")
+    win._vars["mp3_bitrate"].set("96")
+    win._export_start()
+    assert len(rec.exports) == 1
+    req = rec.exports[0]
+    assert isinstance(req, ExportRequest)
+    assert (req.text, req.out, req.voice, req.lang, req.bitrate, req.speed) == (
+        "Some text to read.", out, None, "hr", 96, 1.25)
+    assert req.fmt is None and req.overwrite is True and req.markdown is True
+    assert win._export_status.cget("text") == "Saved x.mp3 \u00b7 3:12"
+    assert state(win._export_btn) == "normal" and state(win._export_cancel_btn) == "disabled"
+    assert state(win._export_folder_btn) == "normal"
+    win._export_folder_btn.invoke()
+    assert rec.calls[-1] == ("open_folder", tmp_path)
+    win._vars["mp3_bitrate"].set("64")
+    assert not win._is_dirty()  # transient export controls are not settings
+
+
+def test_export_voice_choice_and_missing_extension(tk_root, monkeypatch, tmp_path):
+    rec, win = export_win(tk_root, monkeypatch, save_to=tmp_path / "speech")
+    win._export_set_text("Hi")
+    win._export_voice.set(next(d for d in win._export_voice_ids if d.startswith("bf_emma")))
+    win._vars["export_format"].set("wav")
+    win._export_start()
+    req = rec.exports[0]
+    assert req.voice == "bf_emma" and req.out == tmp_path / "speech.wav"
+
+
+def spy_status(win):
+    labels = []
+    real = win._export_status.configure
+    win._export_status.configure = lambda **kw: (labels.append(kw.get("text")), real(**kw))
+    return labels
+
+
+def test_export_progress_label(tk_root, monkeypatch, tmp_path):
+    pending = []
+    rec = Recorder()
+    win = make_window(tk_root, rec, spawn=pending.append)
+    monkeypatch.setattr(settings_ui.filedialog, "asksaveasfilename",
+                        lambda **k: str(tmp_path / "a.wav"))
+    win._export_set_text("Hi")
+    labels = spy_status(win)
+    win._export_start()
+    assert state(win._export_btn) == "disabled" and state(win._export_cancel_btn) == "normal"
+    pending.pop()()
+    assert "Chunk 2/10 \u00b7 3:12 audio" in labels
+
+
+def test_export_paused_label(tk_root, monkeypatch, tmp_path):
+    rec = Recorder()
+    orig = rec._export_audio
+
+    def paused(req, progress=None, cancel=None):
+        progress(ExportProgress(3, 10, 5.0, paused=True))
+        return orig(req)
+    make_hooks = rec.hooks
+
+    def hooks():
+        h = make_hooks()
+        h.export_audio = paused
+        return h
+    rec.hooks = hooks
+    win = make_window(tk_root, rec)
+    monkeypatch.setattr(settings_ui.filedialog, "asksaveasfilename",
+                        lambda **k: str(tmp_path / "a.wav"))
+    win._export_set_text("Hi")
+    labels = spy_status(win)
+    win._export_start()
+    assert "Paused while reading aloud" in labels
+
+
+def test_export_busy_cancelled_and_failed(tk_root, monkeypatch, tmp_path):
+    errors = []
+    monkeypatch.setattr(settings_ui.messagebox, "showerror", lambda *a, **k: errors.append(a))
+    rec, win = export_win(tk_root, monkeypatch, save_to=tmp_path / "a.wav")
+    win._export_set_text("Hi")
+    rec.export_error = ExportBusy("busy")
+    win._export_start()
+    assert "Another export" in win._export_status.cget("text") and errors == []
+    assert state(win._export_btn) == "normal"
+    rec.export_error = ExportCancelled()
+    win._export_start()
+    assert win._export_status.cget("text") == "Cancelled"
+    rec.export_error = RuntimeError("disk full")
+    win._export_start()
+    assert "disk full" in win._export_status.cget("text") and errors
+    assert state(win._export_btn) == "normal"
+
+
+def test_export_blank_text_does_not_call_hook(tk_root, monkeypatch, tmp_path):
+    shown = []
+    monkeypatch.setattr(settings_ui.messagebox, "showinfo", lambda *a, **k: shown.append(a))
+    rec, win = export_win(tk_root, monkeypatch, save_to=tmp_path / "a.wav")
+    win._export_set_text("   ")
+    win._export_start()
+    assert rec.exports == [] and shown
+
+
+def test_export_save_dialog_cancelled(tk_root, monkeypatch):
+    rec, win = export_win(tk_root, monkeypatch, save_to="")
+    win._export_set_text("Hi")
+    win._export_start()
+    assert rec.exports == [] and not win._export_busy
+
+
+def test_export_cancel_button(tk_root, monkeypatch, tmp_path):
+    pending = []
+    rec = Recorder()
+    win = make_window(tk_root, rec, spawn=pending.append)
+    monkeypatch.setattr(settings_ui.filedialog, "asksaveasfilename",
+                        lambda **k: str(tmp_path / "a.wav"))
+    win._export_set_text("Hi")
+    win._export_start()
+    win._export_cancel_btn.invoke()
+    assert win._export_cancel.is_set() and "cancel_export" in rec.calls
+    pending.pop()()
+
+
+def test_mp3_unavailable_disables_mp3(tk_root, monkeypatch, tmp_path):
+    rec = Recorder()
+    rec.mp3 = False
+    win = make_window(tk_root, rec)
+    assert state(win._export_radios["mp3"]) == "disabled"
+    assert state(win._export_bitrate) == "disabled"
+    assert "lameenc" in win._export_mp3_note.cget("text")
+    monkeypatch.setattr(settings_ui.filedialog, "asksaveasfilename",
+                        lambda **k: str(tmp_path / "a"))
+    win._export_set_text("Hi")  # form says mp3, but only wav is possible
+    win._export_start()
+    assert rec.exports[0].out == tmp_path / "a.wav"
+
+
+def test_export_folder_hint_when_empty(tk_root):
+    win = make_window(tk_root, Recorder())
+    assert "VibeTTS" in win._export_folder_hint.cget("text")
+    win._vars["export_folder"].set("D:/audio")
+    assert win._export_folder_hint.cget("text") == ""
+
+
+@pytest.mark.parametrize("status,enabled,expected", [
+    ({"enabled": True, "running": True, "url": "http://127.0.0.1:7723/mcp", "error": ""}, True,
+     "Running at http://127.0.0.1:7723/mcp"),
+    ({"enabled": False, "running": False, "url": "", "error": ""}, False, "Off"),
+    ({"enabled": True, "running": False, "url": "", "error": "port in use"}, True,
+     "Error: port in use"),
+    ({"enabled": False, "running": False, "url": "", "error": ""}, True,
+     "Enabled \u2014 save to start"),
+])
+def test_mcp_status_text(tk_root, status, enabled, expected):
+    rec = Recorder()
+    rec.mcp = status
+    rec.config.mcp.enabled = enabled
+    win = make_window(tk_root, rec)
+    assert win._mcp_status.cget("text") == expected
+
+
+def test_mcp_command_follows_port_and_copies(tk_root):
+    win = make_window(tk_root, Recorder())
+    assert "http://127.0.0.1:7723/mcp" in win._mcp_cmd.get()
+    win._vars["mcp_port"].set("8123")
+    assert win._mcp_cmd.get() == "claude mcp add --transport http vibetts http://127.0.0.1:8123/mcp"
+    snippet = win._mcp_json.get("1.0", "end-1c")
+    assert snippet == ('{"mcpServers": {"vibetts": {"type": "http", '
+                       '"url": "http://127.0.0.1:8123/mcp"}}}')
+    win._copy(snippet)
+    assert tk_root.clipboard_get() == snippet
+
+
+def test_mcp_fields_save_and_dirty(tk_root):
+    rec = Recorder()
+    win = make_window(tk_root, rec)
+    assert not win._is_dirty()
+    win._vars["mcp_enabled"].set(True)
+    win._vars["mcp_port"].set("8123")
+    assert win._is_dirty()
+    assert win.save() is True
+    assert rec.config.mcp.enabled and rec.config.mcp.port == 8123
+    assert not win._is_dirty()

@@ -29,6 +29,12 @@ hiddenimports = [
     # Croatian voice (OmniVoice): imported lazily; model files are installed from Settings, not bundled
     "vibetts.omnivoice",
     "vibetts.omnivoice_setup",
+    # VTF-04: export to audio files + local MCP server (all imported lazily)
+    "vibetts.docload",
+    "vibetts.export",
+    "vibetts.mcp_server",
+    "lameenc",
+    "pypdf",
     "tokenizers",
     "soxr",
     "soxr.soxr_ext",

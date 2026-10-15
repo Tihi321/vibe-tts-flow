@@ -20,6 +20,8 @@ dependencies = [
     "kokoro-onnx",
     "tokenizers",
     "soxr",
+    "pypdf>=4",
+    "lameenc>=1.7",
 ]
 
 [project.optional-dependencies]
