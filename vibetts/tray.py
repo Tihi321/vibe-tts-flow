@@ -42,6 +42,7 @@ class TrayHooks:
     current_engine: Callable[[], str] = lambda: "kokoro"   # "kokoro" | "omnivoice"
     set_engine: Callable[[str], None] = lambda engine: None
     omni_available: Callable[[], bool] = lambda: False     # OmniVoice installed?
+    open_export: Callable[[], None] = lambda: None         # Settings > Export
 
 
 def make_icon(color: str) -> Image.Image:
@@ -141,6 +142,7 @@ class Tray:
         voice_menu = self._voice_menu()
         items = [
             M("Settings…", act(h.open_settings), default=True),
+            M("Export audio…", act(h.open_export)),
             M("Download voice model…", act(h.download_model),
               visible=lambda item: bool(h.model_missing())),
             M("Enabled", act(lambda: h.set_enabled(not h.is_enabled())), checked=chk(h.is_enabled)),

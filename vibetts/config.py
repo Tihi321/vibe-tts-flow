@@ -74,12 +74,33 @@ class UiConfig:
     show_settings_on_start: bool = True
 
 
+EXPORT_FORMATS = ("wav", "mp3")
+MP3_BITRATES = (32, 48, 64, 96, 128, 160)  # kbps; MPEG-2 Layer III at 24 kHz caps at 160
+MCP_DEFAULT_PORT = 7723
+
+
+@dataclass
+class ExportConfig:
+    folder: str = ""        # "" = ~/Documents/VibeTTS; relative paths are next to the app
+    format: str = "mp3"     # wav | mp3
+    mp3_bitrate: int = 64   # one of MP3_BITRATES
+
+
+@dataclass
+class McpConfig:
+    enabled: bool = False          # local MCP server for AI agents (opt-in)
+    port: int = MCP_DEFAULT_PORT   # 1024 .. 65535, listens on 127.0.0.1 only
+    max_chars: int = 200000        # longest text one tool call may synthesize; 0 = no limit
+
+
 @dataclass
 class Config:
     hotkey: HotkeyConfig = field(default_factory=HotkeyConfig)
     speech: SpeechConfig = field(default_factory=SpeechConfig)
     selection: SelectionConfig = field(default_factory=SelectionConfig)
     ui: UiConfig = field(default_factory=UiConfig)
+    export: ExportConfig = field(default_factory=ExportConfig)
+    mcp: McpConfig = field(default_factory=McpConfig)
 
 
 def config_path() -> Path:
@@ -90,6 +111,13 @@ def config_path() -> Path:
 def resolve_path(p: str | Path) -> Path:
     p = Path(p)
     return p if p.is_absolute() else ROOT / p
+
+
+def export_folder(cfg: Config) -> Path:
+    """Default folder for exported audio: [export] folder, else ~/Documents/VibeTTS."""
+    if cfg.export.folder.strip():
+        return resolve_path(cfg.export.folder.strip())
+    return Path.home() / "Documents" / "VibeTTS"
 
 
 def portable_path(p: str | Path) -> str:
@@ -201,7 +229,38 @@ def config_from_dict(d: dict) -> Config:
         log.warning("config: speech.omnivoice_steps %d out of range %d..%d; using %d",
                     cfg.speech.omnivoice_steps, *OMNIVOICE_STEPS_RANGE, clamped)
         cfg.speech.omnivoice_steps = clamped
+    _validate_export(cfg.export)
+    _validate_mcp(cfg.mcp)
     return cfg
+
+
+def snap_bitrate(kbps: int) -> int:
+    """The allowed MP3 bitrate nearest to `kbps`."""
+    return min(MP3_BITRATES, key=lambda b: (abs(b - int(kbps)), b))
+
+
+def _validate_export(e: ExportConfig) -> None:
+    fmt = e.format.strip().lower()
+    if fmt not in EXPORT_FORMATS:
+        log.warning("config: export.format %r is not one of %s; using wav", e.format,
+                    ", ".join(EXPORT_FORMATS))
+        fmt = "wav"
+    e.format = fmt
+    snapped = snap_bitrate(e.mp3_bitrate)
+    if snapped != e.mp3_bitrate:
+        log.warning("config: export.mp3_bitrate %d is not one of %s; using %d",
+                    e.mp3_bitrate, MP3_BITRATES, snapped)
+        e.mp3_bitrate = snapped
+
+
+def _validate_mcp(m: McpConfig) -> None:
+    if not 1024 <= m.port <= 65535:
+        log.warning("config: mcp.port %d out of range 1024..65535; using %d", m.port,
+                    MCP_DEFAULT_PORT)
+        m.port = MCP_DEFAULT_PORT
+    if m.max_chars < 0:
+        log.warning("config: mcp.max_chars %d is negative; using 0 (no limit)", m.max_chars)
+        m.max_chars = 0
 
 
 def config_to_dict(cfg: Config) -> dict:

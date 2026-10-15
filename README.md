@@ -11,6 +11,8 @@ Sister app of [VibeFlow](https://github.com/Tihi321/vibe-whisper-flow) (voice �
 - 41 voices: American and British English, plus Spanish, French, Hindi, Italian, Brazilian Portuguese
 - Optional second engine, [OmniVoice](https://github.com/k2-fsa/OmniVoice) (CPU, installed from Settings, non-commercial weights): English, Croatian and more, custom voices from a description or a recording; text that looks Croatian is read as Croatian automatically
 - Speed, pause between sentences, volume, output device
+- Export to an audio file (WAV or MP3): type or paste text, or open a .txt, .md, .html, .docx, .epub or .pdf document (Settings > Export)
+- Local MCP server so AI agents (Claude Code and others) can speak text or turn text and documents into audio files (off by default)
 - Cleans markdown before reading (no "asterisk asterisk", web addresses become "link")
 - Restores your clipboard after copying the selection (text, images, files, rich text)
 - Status pill while reading, tray icon with engine, voice and speed menus, Settings window
@@ -83,10 +85,49 @@ Each voice command writes `models\omnivoice\voices\<name>.*` and prints the voic
 pythonw run.pyw            # background, no console window
 python run.pyw --console   # prints the log to the terminal
 python -m vibetts --say "Hello there"                 # speak once, no tray
-python -m vibetts --say "Hello there" --wav out.wav   # write a WAV instead
+python -m vibetts --say "Hello there" --out out.mp3   # write an audio file instead (.wav or .mp3; --wav still works)
+python -m vibetts --doc C:\path\to\book.epub --out book.mp3   # a whole document to an audio file
 ```
 
 A speaker icon appears in the tray. Left-click it for Settings, right-click for the menu (engine, voice, speed, stop, launch at login, quit). `--hidden` starts without opening the Settings window (used by launch at login). The first start opens Settings on the Kokoro tab when the model is missing: click **Download voice** (see below).
+
+## Export to an audio file
+
+Open **Settings > Export** (or tray > **Export audio…**). Type or paste text, or press **Open document…** to load a `.txt`, `.md`, `.html`, `.docx`, `.epub` or `.pdf` file. Only text-based PDFs work: scanned pages have no text to read. Pick a voice, speed and language. **Auto** uses the same routing as the hotkey, so Croatian text gets the Croatian voice. Then press **Export…** and choose where to save.
+
+The file name's extension picks the format:
+
+- `.mp3`: the default, 64 kbps mono, about 0.5 MB per minute.
+- `.wav`: about 2.9 MB per minute.
+
+The format, MP3 bitrate and default folder (`~\Documents\VibeTTS`) are saved in `[export]` in `config.toml`.
+
+The export runs in the background with a progress bar and **Cancel**; a cancelled or failed export leaves no file behind. Reading aloud has priority: if you press the hotkey while an export runs, the export pauses until the reading ends. Only one export runs at a time, whether it comes from the window or from an agent. Export ignores the playback volume.
+
+## Agents (MCP)
+
+VibeTTS can run a small [MCP](https://modelcontextprotocol.io) server inside the app, so AI agents can use your local voices. Turn it on in **Settings > Agents (MCP)** and press **Save**. The tab shows the status and the command to connect Claude Code:
+
+```powershell
+claude mcp add --transport http vibetts http://127.0.0.1:7723/mcp
+```
+
+The same setting as `.mcp.json`: `{"mcpServers": {"vibetts": {"type": "http", "url": "http://127.0.0.1:7723/mcp"}}}`. Any client that supports the Streamable HTTP transport works. The server only runs while VibeTTS is running.
+
+| Tool | What it does |
+|---|---|
+| `synthesize_to_file` | Turns `text` or a document `path` into a `.wav` / `.mp3` file. Optional: `output`, `format`, `voice`, `speed`, `lang` (`en` / `hr`), `overwrite`. Returns the path, duration and size |
+| `speak` | Reads text aloud on your speakers, like the hotkey, and replaces what is playing. With `wait = true` it returns when it has finished |
+| `list_voices` | Voice ids (Kokoro and OmniVoice presets) and the current defaults |
+| `create_voice` | Designs a new OmniVoice voice from a `description` (e.g. `female, young adult, low pitch`) and saves it as `omni:<name>`; optional `seed`, `lang` (sample language), `overwrite`. Needs OmniVoice |
+| `stop` | Stops reading; `cancel_export = true` also cancels a running export |
+
+**Security.** The server is off by default.
+
+- **Who can reach it.** It listens on `127.0.0.1` only, so other computers cannot reach it. Requests whose `Host` or `Origin` is not localhost are refused, which stops web pages from calling it through DNS rebinding.
+- **No password.** Any program on this computer can use it while it is on.
+- **Where files go.** An `output` path can be absolute; a bare file name goes into the export folder. Only `.wav` and `.mp3` are written, and an existing file is only replaced with `overwrite = true`.
+- **Size limit.** `[mcp] max_chars` (default 200000) limits the text of one call.
 
 ## How to use
 
@@ -184,7 +225,7 @@ python scripts\build_omnivoice.py            # see --help for --export-graph and
 
 ## Privacy
 
-Everything runs locally. Selected text is never written to disk (only its length goes to the log). No telemetry.
+Everything runs locally. Selected text is never written to disk (only its length goes to the log). Export writes only the audio file you choose; the text is not stored. The MCP server is off by default and only listens on 127.0.0.1. No telemetry.
 
 ## Project layout
 
@@ -195,7 +236,10 @@ scripts/build.ps1        builds the portable exe + zip
 scripts/build_omnivoice.py  developer tool: torch path that exports the OmniVoice graph (end users install from Settings)
 packaging/VibeTTS.spec   PyInstaller spec
 vibetts/
-  app.py                 wiring: hotkey -> selection -> speech; tray and settings hooks; --say CLI
+  app.py                 wiring: hotkey -> selection -> speech; tray and settings hooks; export, MCP bridge; --say/--doc CLI
+  export.py              streaming export to WAV / MP3 (lameenc)
+  docload.py             text from .txt .md .html .docx .epub .pdf
+  mcp_server.py          local MCP server (stdlib HTTP, JSON-RPC) and its tools
   hotkeys.py             global hotkey listener (named bindings), chord parsing
   selection.py           copy the selection, snapshot and restore the clipboard
   textprep.py            markdown cleanup, sentence chunking

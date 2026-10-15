@@ -14,9 +14,11 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Any, Callable
 
-from . import model_setup
-from .config import (OMNI_DEFAULT_VOICE, OMNIVOICE_STEPS_RANGE, ROOT, Config, ENGINES,
-                     is_omni_voice, normalize_omni_voice)
+from . import docload, model_setup
+from .config import (EXPORT_FORMATS, MCP_DEFAULT_PORT, MP3_BITRATES, OMNI_DEFAULT_VOICE,
+                     OMNIVOICE_STEPS_RANGE, ROOT, Config, ENGINES, export_folder,
+                     is_omni_voice, normalize_omni_voice, snap_bitrate)
+from .export import ExportBusy, ExportCancelled, ExportProgress, ExportRequest
 from .hotkeys import parse_chord
 from .tts import omni_preset, voice_label
 
@@ -27,9 +29,9 @@ except ImportError:  # pragma: no cover
 
 log = logging.getLogger(__name__)
 
-TABS = ("general", "voice", "kokoro", "omnivoice", "about")
-TAB_TITLES = {"general": "General", "voice": "Voice", "kokoro": "Kokoro",
-              "omnivoice": "OmniVoice", "about": "About"}
+TABS = ("general", "voice", "export", "kokoro", "omnivoice", "mcp", "about")
+TAB_TITLES = {"general": "General", "voice": "Voice", "export": "Export", "kokoro": "Kokoro",
+              "omnivoice": "OmniVoice", "mcp": "Agents (MCP)", "about": "About"}
 PILL_POSITIONS = ("top", "bottom")
 SAMPLE_TEXT = ("Hello! This is how VibeTTS sounds. Select any text, press the hotkey, "
                "and I will read it aloud.")
@@ -67,6 +69,43 @@ OMNI_NOTE = ("One-time download of about 2.9 GB, or 3.5 GB with voice cloning (f
              "huggingface.co), converted "
              "on this computer. It then uses about 1.3 GB of disk. The OmniVoice weights are "
              "CC-BY-NC: non-commercial use only.")
+
+
+EXPORT_CHARS_PER_SECOND = 15.0  # rough speech rate at speed 1.0, for the length estimate
+EXPORT_LANGS = {"Auto": None, "English": "en", "Croatian": "hr"}
+AUTO_VOICE = "Auto (as configured)"
+MCP_NOTE = ("Listens on 127.0.0.1 only. Agents can read text aloud and write .wav/.mp3 "
+            "files. Off by default.")
+MCP_TOOLS = "Tools: synthesize_to_file, speak, list_voices, stop."
+
+
+def mcp_url(port: Any) -> str:
+    return f"http://127.0.0.1:{str(port).strip() or MCP_DEFAULT_PORT}/mcp"
+
+
+def mcp_command(url: str) -> str:
+    return f"claude mcp add --transport http vibetts {url}"
+
+
+def mcp_snippet(url: str) -> str:
+    return '{"mcpServers": {"vibetts": {"type": "http", "url": "' + url + '"}}}'
+
+
+def estimate_text(text: str, speed: float = 1.0) -> str:
+    n = len(text.strip())
+    minutes = n / EXPORT_CHARS_PER_SECOND / max(speed, 0.1) / 60.0
+    if n == 0:
+        about = "0 min"
+    elif minutes < 1:
+        about = "under 1 min"
+    else:
+        about = f"{round(minutes)} min"
+    return f"{n:,} characters · about {about} of audio"
+
+
+def _clock(seconds: float) -> str:
+    s = int(round(seconds))
+    return f"{s // 60}:{s % 60:02d}"
 
 
 def _lang_name(code: str) -> str:
@@ -110,6 +149,12 @@ def form_from_config(cfg: Config) -> dict[str, Any]:
         "omnivoice_steps": str(s.omnivoice_steps),
         "croatian_voice": s.croatian_voice,
         "auto_language": bool(s.auto_language),
+        "export_folder": cfg.export.folder,
+        "export_format": cfg.export.format,
+        "mp3_bitrate": str(cfg.export.mp3_bitrate),
+        "mcp_enabled": bool(cfg.mcp.enabled),
+        "mcp_port": str(cfg.mcp.port),
+        "mcp_max_chars": str(cfg.mcp.max_chars),
     }
 
 
@@ -190,6 +235,13 @@ def config_from_form(base: Config, form: dict[str, Any]) -> Config:
     croatian = _voice_token(form.get("croatian_voice", ""))
     s.croatian_voice = normalize_omni_voice(croatian) if is_omni_voice(croatian) else ""
     s.auto_language = bool(form.get("auto_language"))
+
+    cfg.export.folder = str(form.get("export_folder", "")).strip()
+    cfg.export.format = _choice(form, "export_format", "Export format", EXPORT_FORMATS)
+    cfg.export.mp3_bitrate = snap_bitrate(_int(form, "mp3_bitrate", "MP3 bitrate (kbps)", 1))
+    cfg.mcp.enabled = bool(form.get("mcp_enabled"))
+    cfg.mcp.port = _int(form, "mcp_port", "MCP port", 1024, 65535)
+    cfg.mcp.max_chars = _int(form, "mcp_max_chars", "MCP maximum characters", 0)
     return cfg
 
 
@@ -197,6 +249,10 @@ def config_from_form(base: Config, form: dict[str, Any]) -> Config:
 
 def _unavailable() -> Any:
     raise RuntimeError("OmniVoice is not available")
+
+
+def _not_supported() -> Any:
+    raise RuntimeError("Not supported")
 
 
 def _fallback_bytes(include_encoders: bool) -> int:
@@ -239,6 +295,14 @@ class SettingsHooks:
     delete_voice: Callable[[str], None] = lambda name: _unavailable()
     play_clip: Callable[[Any], None] = lambda clip: _unavailable()
     encoders_present: Callable[[], bool] = lambda: False
+    # export (blocking: the window runs them on a worker thread) and the MCP server
+    load_document: Callable[[str], Any] = lambda path: _not_supported()  # -> docload.Document
+    export_audio: Callable[..., Any] = lambda req, progress=None, cancel=None: _not_supported()
+    cancel_export: Callable[[], None] = lambda: None
+    mp3_available: Callable[[], bool] = lambda: False
+    mcp_status: Callable[[], dict] = lambda: {"enabled": False, "running": False, "url": "",
+                                              "error": ""}
+    open_folder: Callable[[Path], None] = lambda path: None
 
 
 # ---------------------------------------------------------------- win32 / theme helpers
@@ -324,6 +388,10 @@ class SettingsWindow:
         self._omni_cancel = threading.Event()
         self._omni_installed = False
         self._omni_encoders = False
+        self._export_busy = False
+        self._export_cancel = threading.Event()
+        self._export_title = ""
+        self._export_markdown = True
 
     # -- public -----------------------------------------------------------
     def is_visible(self) -> bool:
@@ -366,6 +434,8 @@ class SettingsWindow:
             self._safe_ui(self._follow_config)
             self._safe_ui(self._refresh_files)
             self._safe_ui(self._load_voices)
+            self._safe_ui(self._refresh_export)
+            self._safe_ui(self._refresh_mcp)
 
     def _follow_config(self) -> None:
         form = form_from_config(self.hooks.get_config())
@@ -461,7 +531,7 @@ class SettingsWindow:
         self._nb.pack(side="top", fill="both", expand=True)
         frames = {}
         for name in TABS:
-            if name == "omnivoice":  # the tallest tab: scrolls instead of growing the window
+            if name in ("omnivoice", "export"):  # the tallest tab: scrolls instead of growing the window
                 holder = ScrollableFrame(self._nb, height=int(480 * scale))
                 self._nb.add(holder, text=TAB_TITLES[name])
                 frames[name] = holder.body
@@ -471,8 +541,10 @@ class SettingsWindow:
             frames[name] = f
         self._build_general(frames["general"])
         self._build_voice(frames["voice"])
+        self._build_export(frames["export"])
         self._build_kokoro(frames["kokoro"])
         self._build_omnivoice(frames["omnivoice"])
+        self._build_mcp(frames["mcp"])
         self._build_about(frames["about"])
         self._on_engine_change()
         top.update_idletasks()
@@ -663,6 +735,383 @@ class SettingsWindow:
         if not ready and str(self._vars["engine"].get()) == "omnivoice":
             self._engine_hint.configure(text="OmniVoice is not installed: Kokoro reads for now. "
                                         "Install it in the OmniVoice tab.")
+
+    # -- Export ------------------------------------------------------------------
+    def _build_export(self, f: ttk.Frame) -> None:
+        src = ttk.LabelFrame(f, text="Text", padding=10)
+        src.pack(fill="x")
+        box_row = ttk.Frame(src)
+        box_row.pack(fill="x")
+        self._export_text = tk.Text(box_row, height=7, wrap="word", undo=True)
+        bar = ttk.Scrollbar(box_row, orient="vertical", command=self._export_text.yview)
+        self._export_text.configure(yscrollcommand=bar.set)
+        bar.pack(side="right", fill="y")
+        self._export_text.pack(side="left", fill="x", expand=True)
+        for seq in ("<KeyRelease>", "<<Paste>>", "<<Cut>>"):
+            self._export_text.bind(seq, lambda e: self._export_text_changed())
+        row = ttk.Frame(src)
+        row.pack(fill="x", pady=(6, 0))
+        self._export_open_btn = ttk.Button(row, text="Open document…",
+                                           command=self._export_open)
+        self._export_open_btn.pack(side="left")
+        ttk.Button(row, text="Paste", command=self._export_paste).pack(side="left", padx=6)
+        ttk.Button(row, text="Clear", command=self._export_clear).pack(side="left")
+        self._export_info = ttk.Label(src, text=estimate_text(""), foreground="gray")
+        self._export_info.pack(anchor="w", pady=(4, 0))
+
+        vo = ttk.LabelFrame(f, text="Voice", padding=10)
+        vo.pack(fill="x", pady=(10, 0))
+        self._export_voice_ids: dict[str, str | None] = {AUTO_VOICE: None}
+        self._export_voice = tk.StringVar(value=AUTO_VOICE)
+        ttk.Label(vo, text="Voice").grid(row=0, column=0, sticky="w", pady=3, padx=(0, 10))
+        self._export_voice_combo = ttk.Combobox(
+            vo, textvariable=self._export_voice, values=[AUTO_VOICE], width=44,
+            state="readonly")
+        self._export_voice_combo.grid(row=0, column=1, columnspan=2, sticky="w", pady=3)
+        self._export_speed = tk.StringVar(value=_num(self.hooks.get_config().speech.speed))
+        ttk.Label(vo, text="Speed").grid(row=1, column=0, sticky="w", pady=3, padx=(0, 10))
+        ttk.Entry(vo, textvariable=self._export_speed, width=6).grid(
+            row=1, column=1, sticky="w", pady=3)
+        ttk.Label(vo, text="0.5 .. 2.0", foreground="gray").grid(
+            row=1, column=2, sticky="w", padx=8)
+        self._export_speed.trace_add("write", lambda *_: self._safe_ui(self._export_text_changed))
+        self._export_lang = tk.StringVar(value="Auto")
+        ttk.Label(vo, text="Language").grid(row=2, column=0, sticky="w", pady=3, padx=(0, 10))
+        ttk.Combobox(vo, textvariable=self._export_lang, values=list(EXPORT_LANGS),
+                     width=12, state="readonly").grid(row=2, column=1, sticky="w", pady=3)
+
+        out = ttk.LabelFrame(f, text="Output", padding=10)
+        out.pack(fill="x", pady=(10, 0))
+        fmt_var = self._var("export_format", "mp3")
+        ttk.Label(out, text="Format").grid(row=0, column=0, sticky="w", pady=3, padx=(0, 10))
+        fmt_row = ttk.Frame(out)
+        fmt_row.grid(row=0, column=1, columnspan=2, sticky="w", pady=3)
+        self._export_radios: dict[str, ttk.Radiobutton] = {}
+        for value in EXPORT_FORMATS:
+            rb = ttk.Radiobutton(fmt_row, text=value.upper(), value=value, variable=fmt_var)
+            rb.pack(side="left", padx=(0, 12))
+            self._export_radios[value] = rb
+        self._export_bitrate = self._combo(out, 1, "MP3 bitrate (kbps)", "mp3_bitrate",
+                                           [str(b) for b in MP3_BITRATES], 8, readonly=True)
+        self._export_mp3_note = ttk.Label(out, text="", foreground="gray")
+        self._export_mp3_note.grid(row=2, column=1, columnspan=2, sticky="w")
+        ttk.Label(out, text="Folder").grid(row=3, column=0, sticky="w", pady=3, padx=(0, 10))
+        folder_row = ttk.Frame(out)
+        folder_row.grid(row=3, column=1, columnspan=2, sticky="we", pady=3)
+        folder_var = self._var("export_folder", "")
+        ttk.Entry(folder_row, textvariable=folder_var, width=40).pack(side="left")
+        ttk.Button(folder_row, text="Browse…", command=self._export_browse).pack(
+            side="left", padx=6)
+        self._export_folder_hint = ttk.Label(out, text="", foreground="gray")
+        self._export_folder_hint.grid(row=4, column=1, columnspan=2, sticky="w")
+        folder_var.trace_add("write", lambda *_: self._safe_ui(self._update_folder_hint))
+
+        run = ttk.LabelFrame(f, text="Export", padding=10)
+        run.pack(fill="x", pady=(10, 0))
+        btns = ttk.Frame(run)
+        btns.pack(fill="x")
+        self._export_btn = ttk.Button(btns, text="Export…", command=self._export_start,
+                                      style="Accent.TButton" if sv_ttk else "TButton")
+        self._export_btn.pack(side="left")
+        self._export_cancel_btn = ttk.Button(btns, text="Cancel", command=self._export_cancel_now,
+                                             state="disabled")
+        self._export_cancel_btn.pack(side="left", padx=6)
+        self._export_progress = ttk.Progressbar(btns, mode="determinate", length=220,
+                                                maximum=100)
+        self._export_progress.pack(side="left", padx=(12, 0))
+        self._export_folder_btn = ttk.Button(btns, text="Open folder", state="disabled",
+                                             command=self._export_open_folder)
+        self._export_folder_btn.pack(side="right")
+        self._export_status = ttk.Label(run, text="", wraplength=580, justify="left")
+        self._export_status.pack(anchor="w", pady=(4, 0))
+        self._export_result: Path | None = None
+
+    def _refresh_export(self) -> None:
+        """Voice list, MP3 availability and the default-folder hint."""
+        try:
+            voices = list(self.hooks.voices())
+        except Exception:
+            log.debug("voice list failed", exc_info=True)
+            voices = []
+        ids: dict[str, str | None] = {AUTO_VOICE: None}
+        for v in voices:
+            ids[f"{v}  {voice_label(v)}"] = v
+        keep = self._export_voice_ids.get(self._export_voice.get())
+        self._export_voice_ids = ids
+        self._export_voice_combo.configure(values=list(ids))
+        self._export_voice.set(next((d for d, v in ids.items() if v == keep), AUTO_VOICE))
+        mp3 = self._mp3_ok()
+        try:
+            self._export_radios["mp3"].configure(state="normal" if mp3 else "disabled")
+            self._export_bitrate.configure(state="readonly" if mp3 else "disabled")
+            self._export_mp3_note.configure(text="" if mp3 else "MP3 needs the lameenc package")
+        except tk.TclError:
+            pass
+        self._update_folder_hint()
+
+    def _mp3_ok(self) -> bool:
+        try:
+            return bool(self.hooks.mp3_available())
+        except Exception:
+            return False
+
+    def _export_default_folder(self) -> Path:
+        cfg = self.hooks.get_config()
+        cfg.export.folder = str(self._vars["export_folder"].get()).strip()
+        return export_folder(cfg)
+
+    def _update_folder_hint(self) -> None:
+        if str(self._vars["export_folder"].get()).strip():
+            self._export_folder_hint.configure(text="")
+        else:
+            self._export_folder_hint.configure(
+                text=f"Default: {self._export_default_folder()}")
+
+    def _export_browse(self) -> None:
+        chosen = filedialog.askdirectory(parent=self.top, title="Export folder")
+        if chosen:
+            self._vars["export_folder"].set(chosen)
+
+    def _export_set_text(self, text: str) -> None:
+        self._export_text.delete("1.0", "end")
+        self._export_text.insert("1.0", text)
+        self._export_text_changed()
+
+    def _export_text_changed(self) -> None:
+        text = self._export_text.get("1.0", "end-1c")
+        if not text.strip():
+            self._export_title, self._export_markdown = "", True
+        try:
+            speed = float(str(self._export_speed.get()).strip() or 1.0)
+        except ValueError:
+            speed = 1.0
+        self._export_info.configure(text=estimate_text(text, speed))
+
+    def _export_clear(self) -> None:
+        self._export_set_text("")
+        self._export_title, self._export_markdown = "", True
+
+    def _export_paste(self) -> None:
+        try:
+            clip = self.root.clipboard_get()
+        except tk.TclError:
+            return
+        self._export_text.insert("insert", clip)
+        self._export_text_changed()
+
+    def _export_open(self) -> None:
+        patterns = " ".join(f"*{ext}" for ext in docload.SUPPORTED)
+        types = [("Documents", patterns)] + [
+            (ext[1:].upper(), f"*{ext}") for ext in docload.SUPPORTED]
+        path = filedialog.askopenfilename(parent=self.top, title="Open document",
+                                          filetypes=types)
+        if not path:
+            return
+        self._export_open_btn.configure(state="disabled")
+        self._export_status.configure(text="Reading the document…", foreground="")
+
+        def run() -> None:
+            doc: Any = None
+            error: Exception | None = None
+            try:
+                doc = self.hooks.load_document(path)
+            except Exception as e:  # noqa: BLE001
+                error = e
+                if not isinstance(e, docload.DocumentError):
+                    log.exception("could not load the document")
+
+            def finish() -> None:
+                self._export_open_btn.configure(state="normal")
+                if error is not None:
+                    msg = str(error) or error.__class__.__name__
+                    self._export_status.configure(text=f"Could not open: {msg}",
+                                                 foreground="#d33")
+                    messagebox.showerror("Open document", msg, parent=self.top)
+                    return
+                self._export_status.configure(text="")
+                self._export_set_text(doc.text)
+                self._export_title = doc.title
+                self._export_markdown = bool(doc.markdown)
+            self._post(lambda: self._safe_ui(finish))
+
+        self._spawn(run)
+
+    def _set_export_busy(self, busy: bool) -> None:
+        self._export_busy = busy
+        self._export_btn.configure(state="disabled" if busy else "normal")
+        self._export_cancel_btn.configure(state="normal" if busy else "disabled")
+        if busy:
+            self._export_folder_btn.configure(state="disabled")
+        else:
+            self._export_progress.configure(value=0)
+
+    def _export_format(self) -> str:
+        fmt = str(self._vars["export_format"].get()).strip().lower()
+        if fmt not in EXPORT_FORMATS or (fmt == "mp3" and not self._mp3_ok()):
+            return "wav"
+        return fmt
+
+    def _export_start(self) -> None:
+        if self._export_busy:
+            return
+        text = self._export_text.get("1.0", "end-1c")
+        if not text.strip():
+            messagebox.showinfo("Export", "Type, paste or open some text first.",
+                                parent=self.top)
+            return
+        try:
+            speed = float(str(self._export_speed.get()).strip())
+            if not 0.5 <= speed <= 2.0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Export", "Speed must be a number from 0.5 to 2.0.",
+                                 parent=self.top)
+            return
+        try:
+            bitrate: int | None = snap_bitrate(int(str(self._vars["mp3_bitrate"].get()).strip()))
+        except ValueError:
+            bitrate = None
+        fmt = self._export_format()
+        title = self._export_title
+        chosen = filedialog.asksaveasfilename(
+            parent=self.top, title="Export audio", defaultextension=f".{fmt}",
+            filetypes=[("WAV audio", "*.wav"), ("MP3 audio", "*.mp3")],
+            initialdir=str(self._export_default_folder()),
+            initialfile=f"{title or 'speech'}.{fmt}")
+        if not chosen:
+            return
+        out = Path(chosen)
+        if out.suffix.lower() not in (".wav", ".mp3"):
+            out = out.with_name(f"{out.name}.{fmt}")
+        req = ExportRequest(
+            text=text, out=out, voice=self._export_voice_ids.get(self._export_voice.get()),
+            speed=speed, lang=EXPORT_LANGS.get(self._export_lang.get()), fmt=None,
+            bitrate=bitrate, markdown=self._export_markdown, gain=1.0, overwrite=True,
+            title=title)
+        cancel = self._export_cancel
+        cancel.clear()
+        self._export_result = None
+        self._set_export_busy(True)
+        self._export_status.configure(text="Starting…", foreground="")
+
+        def progress(p: ExportProgress) -> None:
+            def ui() -> None:
+                if p.total:
+                    self._export_progress.configure(value=100.0 * p.done / p.total)
+                if p.paused:
+                    text = "Paused while reading aloud"
+                else:
+                    text = f"Chunk {p.done}/{p.total} · {_clock(p.audio_seconds)} audio"
+                self._export_status.configure(text=text, foreground="")
+            self._post(lambda: self._safe_ui(ui))
+
+        def run() -> None:
+            result: Any = None
+            error: BaseException | None = None
+            try:
+                result = self.hooks.export_audio(req, progress=progress, cancel=cancel)
+            except Exception as e:  # noqa: BLE001
+                error = e
+                if not isinstance(e, (ExportCancelled, ExportBusy)):
+                    log.exception("export failed")
+
+            def finish() -> None:
+                self._set_export_busy(False)
+                if isinstance(error, ExportCancelled):
+                    self._export_status.configure(text="Cancelled", foreground="")
+                elif isinstance(error, ExportBusy):
+                    self._export_status.configure(
+                        text="Another export (from an agent) is running", foreground="#d33")
+                elif error is not None:
+                    msg = str(error) or error.__class__.__name__
+                    self._export_status.configure(text=f"Failed: {msg}", foreground="#d33")
+                    messagebox.showerror("Export failed", msg, parent=self.top)
+                else:
+                    path = Path(result.path)
+                    self._export_result = path
+                    self._export_progress.configure(value=100)
+                    self._export_status.configure(
+                        text=f"Saved {path.name} · {_clock(result.seconds)}", foreground="")
+                    self._export_folder_btn.configure(state="normal")
+            self._post(lambda: self._safe_ui(finish))
+
+        self._spawn(run)
+
+    def _export_cancel_now(self) -> None:
+        self._export_cancel.set()
+        try:
+            self.hooks.cancel_export()
+        except Exception:
+            log.debug("cancel_export failed", exc_info=True)
+
+    def _export_open_folder(self) -> None:
+        path = self._export_result
+        if path is not None:
+            self._safe_call(lambda: self.hooks.open_folder(path.parent))()
+
+    # -- MCP ---------------------------------------------------------------------
+    def _build_mcp(self, f: ttk.Frame) -> None:
+        box = ttk.LabelFrame(f, text="Local MCP server", padding=10)
+        box.pack(fill="x")
+        self._check(box, 0, "Let AI agents use VibeTTS (local MCP server)", "mcp_enabled")
+        self._entry(box, 1, "Port", "mcp_port", 8, hint="1024 .. 65535")
+        self._entry(box, 2, "Maximum characters", "mcp_max_chars", 10,
+                    hint="per tool call, 0 = no limit")
+        self._mcp_status = ttk.Label(box, text="", wraplength=580, justify="left")
+        self._mcp_status.grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Label(box, text=f"{MCP_NOTE} {MCP_TOOLS}", foreground="gray", wraplength=580,
+                  justify="left").grid(row=4, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+        conn = ttk.LabelFrame(f, text="Connect an agent", padding=10)
+        conn.pack(fill="x", pady=(10, 0))
+        ttk.Label(conn, text="Claude Code command").pack(anchor="w")
+        row = ttk.Frame(conn)
+        row.pack(fill="x", pady=(2, 8))
+        self._mcp_cmd = tk.StringVar()
+        ttk.Entry(row, textvariable=self._mcp_cmd, state="readonly", width=64).pack(
+            side="left", fill="x", expand=True)
+        ttk.Button(row, text="Copy", command=lambda: self._copy(self._mcp_cmd.get())).pack(
+            side="left", padx=(6, 0))
+        ttk.Label(conn, text=".mcp.json").pack(anchor="w")
+        self._mcp_json = tk.Text(conn, height=3, wrap="word", width=64)
+        self._mcp_json.pack(fill="x", pady=(2, 4))
+        ttk.Button(conn, text="Copy", command=lambda: self._copy(
+            self._mcp_json.get("1.0", "end-1c"))).pack(anchor="w")
+        self._vars["mcp_port"].trace_add("write", lambda *_: self._safe_ui(self._refresh_mcp))
+        self._vars["mcp_enabled"].trace_add("write", lambda *_: self._safe_ui(self._refresh_mcp))
+        self._refresh_mcp()
+
+    def _copy(self, text: str) -> None:
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+        except tk.TclError:
+            pass
+
+    def _refresh_mcp(self) -> None:
+        url = mcp_url(self._vars["mcp_port"].get())
+        self._mcp_cmd.set(mcp_command(url))
+        self._mcp_json.configure(state="normal")
+        self._mcp_json.delete("1.0", "end")
+        self._mcp_json.insert("1.0", mcp_snippet(url))
+        self._mcp_json.configure(state="disabled")
+        try:
+            st = dict(self.hooks.mcp_status())
+        except Exception:
+            log.debug("MCP status failed", exc_info=True)
+            st = {}
+        wanted = bool(self._vars["mcp_enabled"].get())
+        if st.get("running"):
+            text = f"Running at {st.get('url') or url}"
+        elif st.get("error"):
+            text = f"Error: {st['error']}"
+        elif wanted and not st.get("enabled"):
+            text = "Enabled — save to start"
+        elif st.get("enabled"):
+            text = "Starting…"
+        else:
+            text = "Off"
+        self._mcp_status.configure(text=text)
 
     # -- Kokoro -----------------------------------------------------------------
     def _build_kokoro(self, f: ttk.Frame) -> None:
@@ -1281,6 +1730,8 @@ class SettingsWindow:
             if key in self._vars:
                 self._vars[key].set(value)
         self._load_voices()
+        self._refresh_export()
+        self._refresh_mcp()
         try:
             self._device_combo.configure(values=["", *self.hooks.output_devices()])
         except Exception:
