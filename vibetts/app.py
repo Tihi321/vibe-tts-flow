@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import copy
 import ctypes
+import dataclasses
 import logging
 import os
 import sys
@@ -27,6 +28,8 @@ from .logging_setup import setup_logging
 log = logging.getLogger(__name__)
 
 MISSING_MODEL = "Download the voice model to start reading aloud"
+MISSING_OMNI = "Croatian voice model not found: run scripts/build_omnivoice.py"
+OMNI_DEFAULT_VOICE = "omni_hr:default"
 
 
 def _short(msg: str, limit: int = 60) -> str:
@@ -42,6 +45,72 @@ def models_present(s: SpeechConfig) -> bool:
     return all(p.is_file() for p in model_files(s))
 
 
+def _omni() -> Any:
+    """The OmniVoice module, imported on first use (it is only needed for Croatian)."""
+    from . import omnivoice
+
+    return omnivoice
+
+
+def omni_dir(s: SpeechConfig) -> Path:
+    return resolve_path(s.omnivoice_dir)
+
+
+def omni_present(s: SpeechConfig) -> bool:
+    try:
+        return bool(_omni().models_present(omni_dir(s)))
+    except Exception:
+        log.debug("OmniVoice check failed", exc_info=True)
+        return False
+
+
+def omni_presets(s: SpeechConfig) -> list[str]:
+    """Croatian voice ids (omni_hr:<preset>) when the OmniVoice files are built, else []."""
+    if not omni_present(s):
+        return []
+    try:
+        return list(_omni().list_presets(omni_dir(s)))
+    except Exception:
+        log.exception("could not list Croatian voice presets")
+        return []
+
+
+def voice_ready(s: SpeechConfig, voice: str) -> bool:
+    """Are the model files for the family that speaks `voice` present?"""
+    from .tts import is_omni_voice
+
+    return omni_present(s) if is_omni_voice(voice) else models_present(s)
+
+
+def missing_message(voice: str) -> str:
+    from .tts import is_omni_voice
+
+    return MISSING_OMNI if is_omni_voice(voice) else MISSING_MODEL
+
+
+def voice_language(voice: str) -> str:
+    """Language code for text preparation: Croatian for OmniVoice voices, else English."""
+    from .tts import is_omni_voice
+
+    return "hr" if is_omni_voice(voice) else "en"
+
+
+def choose_voice(s: SpeechConfig, text: str, omni_available: bool) -> tuple[str, bool]:
+    """Voice for one request: `croatian_voice` when auto_language is on and the text looks
+    Croatian, else the normal voice. Returns (voice, fell_back); fell_back is True when the
+    text looks Croatian but the OmniVoice models are missing (the normal voice is kept)."""
+    from .textprep import looks_croatian
+    from .tts import is_omni_voice
+
+    voice = s.voice or "af_heart"
+    if s.auto_language and s.croatian_voice and not is_omni_voice(voice) \
+            and looks_croatian(text):
+        if omni_available:
+            return s.croatian_voice, False
+        return voice, True
+    return voice, False
+
+
 def voices_in_file(path: Path) -> list[str]:
     """Voice names stored in voices-v1.0.bin (an .npz archive) without loading the model."""
     import numpy as np
@@ -52,40 +121,119 @@ def voices_in_file(path: Path) -> list[str]:
         return sorted(v for v in data.files if voice_supported(v))
 
 
+class ClipEngine:
+    """Engine stand-in that 'synthesizes' one ready-made clip (voice preview)."""
+
+    def __init__(self, audio: Any):
+        self.audio = audio
+
+    def voices(self) -> list[str]:
+        return []
+
+    def synth(self, text: str, voice: str, speed: float):
+        return self.audio
+
+
+class RoutingEngine:
+    """Engine protocol over the loaded engines: synth goes to OmniVoice for `omni_` voices,
+    to Kokoro for the rest; voices() merges both lists."""
+
+    def __init__(self, kokoro: Any = None, omni: Any = None):
+        self.kokoro = kokoro
+        self.omni = omni
+
+    def voices(self) -> list[str]:
+        out: list[str] = []
+        for engine in (self.kokoro, self.omni):
+            if engine is not None:
+                out += list(engine.voices())
+        return out
+
+    def synth(self, text: str, voice: str, speed: float):
+        from .tts import is_omni_voice
+
+        if is_omni_voice(voice):
+            if self.omni is None:
+                raise RuntimeError(MISSING_OMNI)
+            return self.omni.synth(text, voice, speed)
+        if self.kokoro is None:
+            raise RuntimeError(MISSING_MODEL)
+        return self.kokoro.synth(text, voice, speed)
+
+
 class EngineHolder:
-    """Loads the Kokoro engine once (lazily or in the background) and reloads it when the
-    model or voices file changes."""
+    """Loads one engine per family (Kokoro, OmniVoice) lazily or in the background and
+    reloads a family when its files / settings change. get() loads the family of
+    `s.voice` and returns a RoutingEngine over everything loaded so far."""
 
     def __init__(self, on_loading=lambda: None):
         self._lock = threading.Lock()
-        self._engine: Any = None
-        self._key: tuple[Path, Path] | None = None
+        self._kokoro: Any = None
+        self._kokoro_key: tuple | None = None
+        self._omni: Any = None
+        self._omni_key: tuple | None = None
         self.on_loading = on_loading
 
     @property
     def loaded(self) -> Any:
-        return self._engine
+        """A RoutingEngine over the loaded families, or None when nothing is loaded."""
+        with self._lock:
+            if self._kokoro is None and self._omni is None:
+                return None
+            return RoutingEngine(self._kokoro, self._omni)
 
     def get(self, s: SpeechConfig, announce: bool = True) -> Any:
+        from .tts import is_omni_voice
+
+        voice = s.voice or "af_heart"
+        with self._lock:
+            if is_omni_voice(voice):
+                self._ensure_omni(s, announce)
+            else:
+                self._ensure_kokoro(s, voice, announce)
+            return RoutingEngine(self._kokoro, self._omni)
+
+    def _ensure_kokoro(self, s: SpeechConfig, voice: str, announce: bool) -> None:
         from .tts import KokoroEngine
 
         key = model_files(s)
+        if self._kokoro is not None and self._kokoro_key == key:
+            return
+        if not all(p.is_file() for p in key):
+            raise RuntimeError(MISSING_MODEL)
+        if announce:
+            self.on_loading()
+        self._kokoro = None
+        engine = KokoroEngine(*key)
+        engine.synth("Ready.", voice, 1.0)  # warm-up: first run is slower
+        self._kokoro, self._kokoro_key = engine, key
+
+    def _ensure_omni(self, s: SpeechConfig, announce: bool) -> None:
+        key = (omni_dir(s), int(s.omnivoice_steps))
+        if self._omni is not None and self._omni_key == key:
+            return
+        if not omni_present(s):
+            raise RuntimeError(MISSING_OMNI)
+        if announce:
+            self.on_loading()
+        self._omni = None
+        from .tts import is_omni_voice
+
+        voice = s.voice if is_omni_voice(s.voice) else (s.croatian_voice or OMNI_DEFAULT_VOICE)
+        engine = _omni().OmniVoiceEngine(key[0], key[1])
+        engine.synth("Spremno.", voice, 1.0)  # warm-up: first run is slower
+        self._omni, self._omni_key = engine, key
+
+    def get_omni(self, s: SpeechConfig, announce: bool = True) -> Any:
+        """The shared OmniVoice engine, loaded on demand whatever voice is configured
+        (used to design / clone voices). Never creates a second engine."""
         with self._lock:
-            if self._engine is not None and self._key == key:
-                return self._engine
-            if not all(p.is_file() for p in key):
-                raise RuntimeError(MISSING_MODEL)
-            if announce:
-                self.on_loading()
-            self._engine = None
-            engine = KokoroEngine(*key)
-            engine.synth("Ready.", s.voice or "af_heart", 1.0)  # warm-up: first run is slower
-            self._engine = engine
-            self._key = key
-            return self._engine
+            self._ensure_omni(s, announce)
+            return self._omni
 
     def preload(self, s: SpeechConfig) -> None:
-        if not models_present(s):
+        """Load the family of the configured voice in the background."""
+        if not voice_ready(s, s.voice or "af_heart"):
             return
 
         def run() -> None:
@@ -117,6 +265,8 @@ class TTSApp:
         self._quit_lock = threading.Lock()
         self._quit_done = False
         self._startup_errors: list[str] = []
+        self._warned_omni_missing = False
+        self._clip_engine: Any = None  # set while a voice preview plays
 
         try:
             chord = parse_chord(cfg.hotkey.read)
@@ -128,7 +278,7 @@ class TTSApp:
         self.overlay = Overlay(cfg.ui)
         self.engine = EngineHolder(on_loading=lambda: self.overlay.show(
             "processing", "Loading voice…"))
-        self.speaker = Speaker(lambda: self.engine.get(self._speak_cfg), SoundDeviceOutput,
+        self.speaker = Speaker(self._engine_for_speaker, SoundDeviceOutput,
                                on_start=self._on_speak_start, on_done=self._on_speak_done)
         self._speak_cfg: SpeechConfig = cfg.speech
         self.listener = HotkeyListener({"read": chord}, self._on_hotkey, self._on_escape)
@@ -182,8 +332,8 @@ class TTSApp:
                 self._instance.watch(lambda: self.open_settings())
             except Exception:
                 log.exception("single-instance watcher failed")
-        if not models_present(self.cfg.speech):
-            self.open_settings("voice")  # the Voice tab shows a Download panel
+        if not voice_ready(self.cfg.speech, self.cfg.speech.voice):
+            self.open_settings("voice")  # the Voice tab shows a Download panel / Croatian status
         else:
             if self.cfg.speech.preload:
                 self.engine.preload(self.cfg.speech)
@@ -236,23 +386,29 @@ class TTSApp:
             if chord is not None and not wait_for_chord_release(chord, 3.0):
                 self._flash("error", "Release the hotkey to read")
                 return
-            if not models_present(self.cfg.speech):
-                self._flash("error", "Error: voice model not downloaded")
-                self.open_settings("voice")
-                return
             sel = self.cfg.selection
             grab = selection.grab_selection(sel.copy_timeout_ms, sel.restore_clipboard,
                                             sel.fallback_to_clipboard)
             if not grab.text:
                 self._flash("ok", "Nothing selected")
                 return
-            chunks = textprep.prepare(grab.text, sel.clean_markdown, sel.max_chars)
+            s = self.cfg.speech
+            voice = self._request_voice(s, grab.text)  # decided once per request
+            if not voice_ready(s, voice):
+                if voice_language(voice) == "hr":
+                    self._flash("error", "Error: Croatian model missing (build_omnivoice.py)")
+                else:
+                    self._flash("error", "Error: voice model not downloaded")
+                self.open_settings("voice")
+                return
+            chunks = textprep.prepare(grab.text, sel.clean_markdown, sel.max_chars,
+                                      voice_language(voice))
             if not chunks:
                 self._flash("ok", "Nothing to read")
                 return
-            log.info("reading %d chars in %d chunks%s", sum(len(c.text) for c in chunks),
-                     len(chunks), " (from clipboard)" if grab.from_clipboard else "")
-            self.speak(chunks, self.cfg.speech)
+            log.info("reading %d chars in %d chunks with %s%s", sum(len(c.text) for c in chunks),
+                     len(chunks), voice, " (from clipboard)" if grab.from_clipboard else "")
+            self.speak(chunks, s, voice)
         except Exception as e:
             log.exception("read selection failed")
             self._flash("error", "Error: " + _short(str(e) or e.__class__.__name__, 53))
@@ -260,15 +416,33 @@ class TTSApp:
             with self._grab_lock:
                 self._grabbing = False
 
+    def _request_voice(self, s: SpeechConfig, text: str) -> str:
+        """Normal voice, or the Croatian one when auto_language is on and `text` looks
+        Croatian. Missing Croatian models fall back to the normal voice (logged once)."""
+        voice, fell_back = choose_voice(s, text, omni_present(s) if s.auto_language else False)
+        if fell_back and not self._warned_omni_missing:
+            self._warned_omni_missing = True
+            log.warning("text looks Croatian but the Croatian model is missing (%s); using %s. "
+                        "Run scripts/build_omnivoice.py to enable it", s.omnivoice_dir, voice)
+        return voice
+
     # -- speaking
-    def speak(self, chunks: list, s: SpeechConfig) -> None:
+    def speak(self, chunks: list, s: SpeechConfig, voice: str | None = None) -> None:
         from .tts import SpeakRequest
 
-        req = SpeakRequest(chunks, s.voice, s.speed, s.sentence_pause, s.volume, s.device)
-        self._speak_cfg = s
+        voice = voice or s.voice
+        self._clip_engine = None
+        req = SpeakRequest(chunks, voice, s.speed, s.sentence_pause, s.volume, s.device)
+        self._speak_cfg = dataclasses.replace(s, voice=voice)
         self._current = req
         self.overlay.show("processing", "Starting…")
         self.speaker.speak(req)
+
+    def _engine_for_speaker(self) -> Any:
+        clip = self._clip_engine
+        if clip is not None:
+            return clip
+        return self.engine.get(self._speak_cfg)
 
     def stop(self) -> None:
         if self.speaker.busy:
@@ -316,6 +490,14 @@ class TTSApp:
                 set_show_on_start=self._set_show_on_start,
                 models_dir=lambda: resolve_path(self.cfg.speech.model).parent,
                 voices=self._voices,
+                omni_present=lambda: omni_present(self.cfg.speech),
+                croatian_voices=lambda: omni_presets(self.cfg.speech),
+                design_clip=self._design_clip,
+                clone_clip=self._clone_clip,
+                save_voice=self._save_voice,
+                delete_voice=self._delete_voice,
+                play_clip=self._play_clip,
+                encoders_present=self._encoders_present,
                 output_devices=list_output_devices,
                 play_test=self._play_test,
                 stop=self.stop,
@@ -344,13 +526,79 @@ class TTSApp:
     def _play_test(self, cfg: Config, text: str) -> None:
         from . import textprep
 
-        chunks = textprep.prepare(text, True, 0)
+        voice = self._request_voice(cfg.speech, text)
+        chunks = textprep.prepare(text, True, 0, voice_language(voice))
         if not chunks:
             return
-        if not models_present(cfg.speech):
-            raise RuntimeError(MISSING_MODEL)
-        threading.Thread(target=self.speak, args=(chunks, cfg.speech), name="vibetts-test",
-                         daemon=True).start()
+        if not voice_ready(cfg.speech, voice):
+            raise RuntimeError(missing_message(voice))
+        threading.Thread(target=self.speak, args=(chunks, cfg.speech, voice),
+                         name="vibetts-test", daemon=True).start()
+
+    # -- custom Croatian voices (called from the settings dialog)
+    def _design_clip(self, instruct: str, seed: int, text: str | None = None) -> Any:
+        """Blocking (call from a worker thread): a voice clip from a description."""
+        engine = self.engine.get_omni(self.cfg.speech)
+        return engine.design_clip(instruct, seed, text)
+
+    def _clone_clip(self, wav_path: Any, ref_text: str) -> Any:
+        """Blocking (call from a worker thread): a voice clip cloned from a recording."""
+        engine = self.engine.get_omni(self.cfg.speech)
+        return engine.clone_clip(Path(wav_path), ref_text)
+
+    def _encoders_present(self) -> bool:
+        try:
+            return bool(_omni().encoders_present(omni_dir(self.cfg.speech)))
+        except Exception:
+            log.debug("encoder check failed", exc_info=True)
+            return False
+
+    def _save_voice(self, name: str, clip: Any, overwrite: bool = False) -> str:
+        """Store `clip` as preset `name`; returns the voice id (omni_hr:<name>). An existing
+        preset is only replaced with overwrite=True (the dialog asks first)."""
+        voice_id = _omni().save_preset(omni_dir(self.cfg.speech), name, clip,
+                                       overwrite=overwrite)
+        self._voices_changed()
+        return voice_id
+
+    def _delete_voice(self, name: str) -> None:
+        """Delete preset `name` (or an omni_hr:<name> id). A deleted active voice falls back
+        to omni_hr:default and the config is saved."""
+        from .tts import omni_preset
+
+        preset = omni_preset(name) if name.startswith("omni_") else name
+        _omni().delete_preset(omni_dir(self.cfg.speech), preset)
+        voice_id = f"omni_hr:{preset}"
+        sp = self.cfg.speech
+        changed = False
+        for field in ("croatian_voice", "voice"):
+            if getattr(sp, field) == voice_id:
+                setattr(sp, field, OMNI_DEFAULT_VOICE)
+                changed = True
+        if changed:
+            self._save()
+        self._voices_changed()
+
+    def _play_clip(self, clip: Any) -> None:
+        """Preview a VoiceClip through the configured output device (stop() ends it)."""
+        from .textprep import Chunk
+        from .tts import SpeakRequest
+
+        s = self.cfg.speech
+        self._clip_engine = ClipEngine(clip.audio)
+        self._current = None  # no overlay callbacks for previews
+        req = SpeakRequest([Chunk("preview", 0.0)], OMNI_DEFAULT_VOICE, 1.0, 0.0, s.volume,
+                           s.device)
+        self.speaker.speak(req)
+
+    def _voices_changed(self) -> None:
+        """Refresh the tray voice menu and the settings Croatian combo."""
+        try:
+            self.tray.update_menu()
+        except Exception:
+            log.debug("tray refresh failed", exc_info=True)
+        if self.settings is not None:
+            self.overlay.call_soon(self.settings.refresh)
 
     def _set_show_on_start(self, value: bool) -> None:
         self.cfg.ui.show_settings_on_start = bool(value)
@@ -376,8 +624,8 @@ class TTSApp:
             log.error("invalid hotkey on reload: %s", e)
             self._flash("error", "Error: " + _short(str(e), 53))
             return str(e)
-        if not models_present(new.speech):
-            return MISSING_MODEL
+        if not voice_ready(new.speech, new.speech.voice):
+            return missing_message(new.speech.voice)
         if new.speech.preload:
             self.engine.preload(new.speech)  # no-op when the same files are already loaded
         self._flash("ok", ok_message)
@@ -403,17 +651,20 @@ class TTSApp:
         self.tray.set_enabled(self.enabled)
 
     def _voices(self) -> list[str]:
-        engine = self.engine.loaded
-        if engine is not None:
-            return engine.voices()
-        path = resolve_path(self.cfg.speech.voices)
-        if not path.is_file():
-            return []
-        try:
-            return voices_in_file(path)
-        except Exception:
-            log.exception("could not read %s", path)
-            return []
+        """Kokoro voices (from the loaded engine, else read from the voices file) plus the
+        Croatian presets when the OmniVoice files are built."""
+        voices: list[str] = []
+        loaded = self.engine.loaded
+        if loaded is not None and loaded.kokoro is not None:
+            voices = list(loaded.kokoro.voices())
+        else:
+            path = resolve_path(self.cfg.speech.voices)
+            if path.is_file():
+                try:
+                    voices = voices_in_file(path)
+                except Exception:
+                    log.exception("could not read %s", path)
+        return voices + omni_presets(self.cfg.speech)
 
     def _set_voice(self, voice: str) -> None:
         self.cfg.speech.voice = voice
@@ -448,20 +699,27 @@ def say(cfg: Config, text: str, wav: str | None = None) -> int:
     import numpy as np
 
     from . import textprep
-    from .tts import SAMPLE_RATE, KokoroEngine, SpeakRequest, Speaker, write_wav
+    from .tts import SAMPLE_RATE, SpeakRequest, Speaker, write_wav
 
     s = cfg.speech
-    if not models_present(s):
-        print(f"error: model files missing ({s.model}, {s.voices}); "
-              "run: python -m vibetts.model_setup", file=sys.stderr)
+    voice, fell_back = choose_voice(s, text, omni_present(s) if s.auto_language else False)
+    if fell_back:
+        print("note: text looks Croatian but the Croatian model is missing; using "
+              f"{voice} (run scripts/build_omnivoice.py)", file=sys.stderr)
+    if not voice_ready(s, voice):
+        if voice_language(voice) == "hr":
+            print(f"error: {MISSING_OMNI} (expected in {s.omnivoice_dir})", file=sys.stderr)
+        else:
+            print(f"error: model files missing ({s.model}, {s.voices}); "
+                  "run: python -m vibetts.model_setup", file=sys.stderr)
         return 1
-    chunks = textprep.prepare(text, cfg.selection.clean_markdown, 0)
+    chunks = textprep.prepare(text, cfg.selection.clean_markdown, 0, voice_language(voice))
     if not chunks:
         print("error: nothing to say", file=sys.stderr)
         return 1
+    s = dataclasses.replace(s, voice=voice)
     t0 = time.perf_counter()
-    engine = KokoroEngine(*model_files(s))
-    engine.synth("Ready.", s.voice, 1.0)  # warm-up, as the tray app does when preloading
+    engine = EngineHolder().get(s, announce=False)  # loads the family and warms it up
     print(f"model loaded in {time.perf_counter() - t0:.2f}s", flush=True)
     if wav:
         parts = []

@@ -24,6 +24,11 @@ hiddenimports = [
     "vibetts.single_instance",
     "vibetts.selection",
     "vibetts.textprep",
+    # Croatian voice (OmniVoice): imported lazily; model files are built locally, not bundled
+    "vibetts.omnivoice",
+    "tokenizers",
+    "soxr",
+    "soxr.soxr_ext",
 ]
 
 a = Analysis(

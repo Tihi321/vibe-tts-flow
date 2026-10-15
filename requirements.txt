@@ -8,4 +8,6 @@ requests
 tomli-w
 sv-ttk
 kokoro-onnx
+tokenizers
+soxr
 pytest

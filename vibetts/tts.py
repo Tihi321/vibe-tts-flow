@@ -31,18 +31,37 @@ LANG_LABELS = {"a": "American English", "b": "British English", "e": "Spanish",
                "f": "French", "h": "Hindi", "i": "Italian", "p": "Portuguese (BR)"}
 
 
+# OmniVoice (Croatian) voices are "omni_hr:<preset>"; the engine itself lives in
+# vibetts.omnivoice (kept out of here so this module stays light to import).
+OMNI_PREFIX = "omni_"
+LANG_LABELS["o"] = "Croatian"  # tray group for the OmniVoice presets
+
+
+def is_omni_voice(voice: str) -> bool:
+    return voice.startswith(OMNI_PREFIX)
+
+
 def voice_lang(voice: str) -> str:
     return VOICE_LANGS.get(voice[:1], "en-us")
 
 
 def voice_supported(voice: str) -> bool:
+    if is_omni_voice(voice):
+        return len(voice) > len(OMNI_PREFIX)
     return len(voice) > 3 and voice[:1] in VOICE_LANGS and voice[2:3] == "_"
 
 
+def omni_preset(voice: str) -> str:
+    """'omni_hr:alma' -> 'alma'; a bare 'omni_hr' is the default preset."""
+    return voice.partition(":")[2] or "default"
+
+
 def voice_label(voice: str) -> str:
-    """'af_heart' -> 'Heart (American English, female)'."""
+    """'af_heart' -> 'Heart (American English, female)'; 'omni_hr:default' -> 'Default (Croatian)'."""
     if not voice_supported(voice):
         return voice
+    if is_omni_voice(voice):
+        return f"{omni_preset(voice).replace('_', ' ').title()} (Croatian)"
     gender = {"f": "female", "m": "male"}.get(voice[1:2], "")
     name = voice[3:].replace("_", " ").title()
     lang = LANG_LABELS.get(voice[:1], "")

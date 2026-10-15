@@ -42,3 +42,15 @@ def test_broken_toml_uses_defaults(tmp_path):
     path = tmp_path / "config.toml"
     path.write_text("[speech\nvoice=", encoding="utf-8")
     assert load_config(path) == Config()
+
+
+def test_croatian_defaults():
+    s = Config().speech
+    assert (s.omnivoice_dir, s.omnivoice_steps) == ("models/omnivoice", 6)
+    assert s.croatian_voice == "omni_hr:default" and s.auto_language is True
+
+
+def test_omnivoice_steps_clamped():
+    assert config_from_dict({"speech": {"omnivoice_steps": 2}}).speech.omnivoice_steps == 4
+    assert config_from_dict({"speech": {"omnivoice_steps": 99}}).speech.omnivoice_steps == 16
+    assert config_from_dict({"speech": {"omnivoice_steps": 10}}).speech.omnivoice_steps == 10

@@ -130,3 +130,13 @@ def test_voice_helpers():
     assert not voice_supported("jf_alpha") and not voice_supported("zm_yunxi")
     assert voice_label("af_heart") == "Heart (American English, female)"
     assert voice_label("bm_george") == "George (British English, male)"
+
+
+def test_omni_voice_helpers():
+    assert voice_supported("omni_hr:default") and voice_supported("omni_hr")
+    assert not voice_supported("omni_")
+    assert voice_label("omni_hr:default") == "Default (Croatian)"
+    assert voice_label("omni_hr:ana_marija") == "Ana Marija (Croatian)"
+    assert voice_label("omni_hr") == "Default (Croatian)"
+    assert voice_label("af_heart") == "Heart (American English, female)"  # unchanged
+    assert not voice_supported("ox_foo")

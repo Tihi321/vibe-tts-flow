@@ -50,6 +50,10 @@ class SpeechConfig:
     volume: float = 1.0          # 0 .. 1
     device: str = ""             # "" = Windows default output, or part of the device name
     preload: bool = True         # load the model at startup so the first read starts at once
+    omnivoice_dir: str = "models/omnivoice"  # Croatian (OmniVoice) files, see scripts/build_omnivoice.py
+    omnivoice_steps: int = 6     # 4 .. 16: fewer = faster, more = better quality
+    croatian_voice: str = "omni_hr:default"  # voice used for text that looks Croatian
+    auto_language: bool = True   # switch to croatian_voice when the selection looks Croatian
 
 
 @dataclass
@@ -141,8 +145,22 @@ def _build(cls: type, data: Any, where: str) -> Any:
     return obj
 
 
+OMNIVOICE_STEPS_RANGE = (4, 16)
+
+
+def _clamp_steps(steps: int) -> int:
+    lo, hi = OMNIVOICE_STEPS_RANGE
+    return max(lo, min(hi, int(steps)))
+
+
 def config_from_dict(d: dict) -> Config:
-    return _build(Config, d, "config")
+    cfg = _build(Config, d, "config")
+    clamped = _clamp_steps(cfg.speech.omnivoice_steps)
+    if clamped != cfg.speech.omnivoice_steps:
+        log.warning("config: speech.omnivoice_steps %d out of range %d..%d; using %d",
+                    cfg.speech.omnivoice_steps, *OMNIVOICE_STEPS_RANGE, clamped)
+        cfg.speech.omnivoice_steps = clamped
+    return cfg
 
 
 def config_to_dict(cfg: Config) -> dict:

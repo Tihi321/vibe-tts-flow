@@ -16,6 +16,12 @@ volume = 1.0                 # 0 .. 1
 device = ""                  # "" = Windows default output; or part of the device name
 preload = true               # load the model at startup so the first read starts at once
 
+# Croatian: OmniVoice model files built locally by scripts/build_omnivoice.py (not downloaded).
+omnivoice_dir = "models/omnivoice"
+omnivoice_steps = 6          # 4 .. 16: fewer steps = faster, more = better quality
+croatian_voice = "omni_hr:default"   # omni_hr:<preset>, presets live in models/omnivoice/voices
+auto_language = true         # selection looks Croatian: read it with croatian_voice instead of voice
+
 [selection]
 copy_timeout_ms = 400        # how long to wait for the app to answer the copy shortcut
 fallback_to_clipboard = true # nothing selected: read the clipboard text instead

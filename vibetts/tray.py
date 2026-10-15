@@ -8,7 +8,7 @@ from typing import Callable
 import pystray
 from PIL import Image, ImageDraw
 
-from .tts import LANG_LABELS
+from .tts import LANG_LABELS, is_omni_voice, omni_preset
 
 log = logging.getLogger(__name__)
 
@@ -100,8 +100,11 @@ class Tray:
             for v in voices:
                 if v[:1] != prefix:
                     continue
-                gender = {"f": "female", "m": "male"}.get(v[1:2], "")
-                text = f"{v[3:].title()} ({gender})" if gender else v
+                if is_omni_voice(v):
+                    text = omni_preset(v).replace("_", " ").title()
+                else:
+                    gender = {"f": "female", "m": "male"}.get(v[1:2], "")
+                    text = f"{v[3:].title()} ({gender})" if gender else v
                 items.append(M(text, self._action(h.set_voice, v), radio=True,
                                checked=self._checked(lambda v=v: h.current_voice() == v)))
             if items:
