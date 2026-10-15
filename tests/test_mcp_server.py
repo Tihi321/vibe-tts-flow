@@ -37,6 +37,16 @@ class FakeApi:
         self.calls.append(("stop", cancel_export))
         return {"stopped": True}
 
+    def delete_voice(self, args):
+        self.calls.append(("delete_voice", args))
+        self._maybe_raise()
+        return {"deleted": "omni:" + args["name"]}
+
+    def synthesize_batch(self, args):
+        self.calls.append(("batch", args))
+        self._maybe_raise()
+        return {"results": []}
+
     def synthesize_to_file(self, args):
         self.calls.append(("synth", args))
         self._maybe_raise()
@@ -78,7 +88,8 @@ def test_initialize_negotiation(server):
 def test_ping_and_list(server):
     assert rpc(server, "ping")["result"] == {}
     tools = rpc(server, "tools/list")["result"]["tools"]
-    assert [t["name"] for t in tools] == ["synthesize_to_file", "speak", "list_voices", "create_voice", "stop"]
+    assert [t["name"] for t in tools] == ["synthesize_to_file", "speak", "list_voices", "create_voice", "delete_voice",
+                                           "synthesize_batch", "stop"]
     assert all(t["inputSchema"]["additionalProperties"] is False for t in tools)
 
 
@@ -290,3 +301,28 @@ def test_stop_rebinds_and_idempotent(server):
     assert server.running is False
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", port))
+
+
+def test_delete_voice_validation(server, api):
+    assert call(server, "delete_voice", {"name": "nova"})["structuredContent"] == {"deleted": "omni:nova"}
+    for args in [{}, {"name": " "}, {"name": 3}, {"name": "default"}, {"name": "omni:default"},
+                 {"name": "a", "x": 1}]:
+        r = call(server, "delete_voice", args)
+        assert r["isError"] is True, args
+    api.raise_exc = FileNotFoundError("No voice named 'zz'.")
+    r = call(server, "delete_voice", {"name": "zz"})
+    assert r["isError"] is True and "No voice named" in r["content"][0]["text"]
+
+
+def test_synthesize_batch_validation(server, api):
+    good = {"text": "Hi.", "output": "C:/x/a.mp3", "voice": "omni:a", "lang": "hr", "speed": 1}
+    r = call(server, "synthesize_batch", {"items": [good], "overwrite": True})
+    assert r["isError"] is False and api.calls[-1][0] == "batch"
+    for args in [
+        {}, {"items": []}, {"items": "x"}, {"items": [3]}, {"items": [{"text": "a", "output": "b", "zz": 1}]},
+        {"items": [good], "overwrite": "yes"}, {"items": [good], "other": 1},
+        {"items": [good] * 501},
+    ]:
+        n = len(api.calls)
+        assert call(server, "synthesize_batch", args)["isError"] is True, args
+        assert len(api.calls) == n
