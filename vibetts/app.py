@@ -7,11 +7,12 @@ import ctypes
 import dataclasses
 import logging
 import os
+import random
 import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from . import __version__
 from .config import (
@@ -20,6 +21,7 @@ from .config import (
     Config,
     SpeechConfig,
     config_path,
+    export_folder,
     is_omni_voice,
     load_config,
     normalize_omni_voice,
@@ -28,7 +30,13 @@ from .config import (
 )
 from .logging_setup import setup_logging
 
+if TYPE_CHECKING:  # pragma: no cover
+    from .export import ExportProgress, ExportRequest, ExportResult
+    from .textprep import Chunk
+
 log = logging.getLogger(__name__)
+
+_MCP_LOCK = threading.RLock()  # serializes _sync_mcp / stop (Tk thread, tray thread, quit)
 
 MISSING_MODEL = "Download the voice model to start reading aloud"
 MISSING_OMNI = "OmniVoice is not installed: install it in Settings > OmniVoice"
@@ -159,6 +167,69 @@ def route_for(s: SpeechConfig, text: str) -> Route:
 def active_voice(s: SpeechConfig) -> str:
     """The voice normal (non-Croatian) text is read with: used for preloading and checks."""
     return route_for(dataclasses.replace(s, auto_language=False), "").voice
+
+
+def plan_speech(s: SpeechConfig, text: str, voice: str | None = None, lang: str | None = None,
+                markdown: bool = True, max_chars: int = 0) -> tuple[list[Chunk], str, str, bool]:
+    """Chunks, voice, language and 'is OmniVoice' of one request (does not check voice_ready).
+
+    Without `voice` the request is routed as configured (route_for); `lang` ('en' / 'hr')
+    then overrides the language. An explicit `voice` is used as is (omni ids normalized);
+    its language is `lang`, else guessed from the text (a Kokoro voice only uses it for
+    the text preparation)."""
+    from . import textprep
+
+    lang = lang if lang in ("en", "hr") else None
+    if voice:
+        if is_omni_voice(voice):
+            voice = normalize_omni_voice(voice)
+        lang = lang or ("hr" if textprep.looks_croatian(text) else "en")
+    elif lang == "hr":
+        if omni_present(s):
+            voice = croatian_voice_of(s)
+        else:
+            voice, lang = kokoro_voice_of(s), "en"  # no OmniVoice: Kokoro reads it
+    elif lang == "en":
+        voice = route_for(dataclasses.replace(s, auto_language=False), text).voice
+    else:
+        route = route_for(s, text)
+        voice, lang = route.voice, route.lang
+    omni = is_omni_voice(voice)
+    chunks = textprep.prepare(text, markdown, max_chars, lang, long_chunks=omni)
+    return chunks, voice, lang, omni
+
+
+def run_export(engine: Any, s: SpeechConfig, req: ExportRequest, folder: Path,
+               progress: Any = None, cancel: Any = None, before_chunk: Any = None,
+               fmt_default: str = "wav", bitrate_default: int = 64) -> ExportResult:
+    """Blocking: synthesize req.text with `engine` and write the audio file (CLI, Settings
+    Export tab and MCP all come through here). Raises ExportCancelled, FileExistsError,
+    ValueError (bad format / empty text) and RuntimeError (voice model missing)."""
+    from . import export
+
+    chunks, voice, lang, _ = plan_speech(s, req.text, req.voice, req.lang, req.markdown)
+    if not chunks:
+        raise ValueError("Nothing to read in this text")
+    speed = req.speed or s.speed
+    if not voice_ready(s, voice):
+        raise RuntimeError(missing_message(voice))
+    fmt = req.fmt
+    if req.out is not None and str(req.out).strip():
+        by_name = export.format_for(req.out, default=fmt or fmt_default)
+        if req.fmt and Path(req.out).suffix and by_name != req.fmt:
+            raise ValueError(f"Format {req.fmt} does not match the file name {Path(req.out).name}")
+        fmt = by_name
+    fmt = fmt or fmt_default
+    if fmt not in export.FORMATS:
+        raise ValueError(f"Unsupported format: {fmt}")
+    if fmt == "mp3" and not export.mp3_available():
+        raise RuntimeError("MP3 export is unavailable: the lameenc package is not installed")
+    path = export.resolve_output(req.out, folder, req.title, fmt, req.overwrite)
+    seconds, size = export.render(
+        chunks, lambda text: engine.synth(text, voice, speed, lang), path, fmt,
+        pause=s.sentence_pause, gain=req.gain, bitrate=req.bitrate or bitrate_default,
+        progress=progress, cancel=cancel, before_chunk=before_chunk)
+    return export.ExportResult(path, fmt, seconds, len(chunks), size, voice, lang)
 
 
 def voices_in_file(path: Path) -> list[str]:
@@ -321,6 +392,11 @@ class TTSApp:
         self._startup_errors: list[str] = []
         self._warned_omni_missing = False
         self._clip_engine: Any = None  # set while a voice preview plays
+        self._export_lock = threading.Lock()  # one export at a time (app, Settings, MCP)
+        self._export_cancel: threading.Event | None = None
+        self._mcp: Any = None  # the running McpServer
+        self._mcp_key: tuple | None = None  # (enabled, port, max_chars) it was started with
+        self._mcp_error: str | None = None
 
         try:
             chord = parse_chord(cfg.hotkey.read)
@@ -357,6 +433,7 @@ class TTSApp:
             is_autostart=autostart.is_enabled,
             set_autostart=self._set_autostart,
             open_settings=lambda: self.open_settings(),
+            open_export=lambda: self.open_settings("export"),
             open_config=self._open_config,
             open_logs=self._open_logs,
             reload_config=self.reload_config,
@@ -399,6 +476,7 @@ class TTSApp:
                 self.engine.preload(self.cfg.speech)
             if self.cfg.ui.show_settings_on_start and not self._start_hidden:
                 self.open_settings()
+        self._sync_mcp()
         for msg in self._startup_errors:
             self._flash("error", "Error: " + _short(msg, 53))
             self.tray.notify("VibeTTS", msg)
@@ -410,7 +488,8 @@ class TTSApp:
                 return
             self._quit_done = True
         log.info("quitting")
-        steps = [self.speaker.stop, self.listener.stop, self.tray.stop]
+        steps = [self.cancel_export, self._stop_mcp, self.speaker.stop, self.listener.stop,
+                 self.tray.stop]
         if self._instance is not None:
             steps.append(self._instance.close)
         steps.append(self.overlay.quit)  # tears down the Tk root and the settings window with it
@@ -494,7 +573,9 @@ class TTSApp:
 
     # -- speaking
     def speak(self, chunks: list, s: SpeechConfig, voice: str | None = None,
-              lang: str | None = None) -> None:
+              lang: str | None = None) -> Any:
+        """Start reading `chunks`; returns the SpeakRequest (its `done` event, `error` and
+        `interrupted` tell how it ended). Safe to call from any thread."""
         from .tts import SpeakRequest
 
         voice = voice or active_voice(s)
@@ -505,6 +586,7 @@ class TTSApp:
         self._current = req
         self.overlay.show("processing", "Starting…")
         self.speaker.speak(req)
+        return req
 
     def _engine_for_speaker(self) -> Any:
         clip = self._clip_engine
@@ -538,6 +620,125 @@ class TTSApp:
                 self.open_settings("omnivoice")
         elif time.monotonic() >= self._flash_until:
             self.overlay.hide()
+
+    # -- export (Settings Export tab, MCP, CLI share run_export)
+    def export_audio(self, req: ExportRequest, progress: Any = None,
+                     cancel: threading.Event | None = None) -> ExportResult:
+        """Blocking (call from a worker thread): write req.text to an audio file. One export
+        at a time (ExportBusy); it pauses while the app reads aloud and honours `cancel`
+        (ExportCancelled) and cancel_export()."""
+        from .export import ExportBusy, ExportProgress
+
+        if not self._export_lock.acquire(blocking=False):
+            raise ExportBusy("Another export is running")
+        cancel = cancel if cancel is not None else threading.Event()
+        self._export_cancel = cancel
+        try:
+            cfg = copy.deepcopy(self.cfg)  # a snapshot: Settings may change while we run
+            s = cfg.speech
+            _, voice, _, _ = plan_speech(s, req.text, req.voice, req.lang, req.markdown)
+            engine = self.engine.get(s, announce=False, voice=voice)
+            last = [ExportProgress(0, 0, 0.0)]
+
+            def on_progress(p: ExportProgress) -> None:
+                last[0] = p
+                if progress is not None:
+                    progress(p)
+
+            log.info("export started: %d chars, voice=%s", len(req.text), voice)
+            result = run_export(
+                engine, s, req, export_folder(cfg), on_progress, cancel,
+                lambda: self._export_yield(last[0], progress, cancel),
+                fmt_default=cfg.export.format, bitrate_default=cfg.export.mp3_bitrate)
+            log.info("export finished: %.1fs audio, %d bytes (%s)", result.seconds,
+                     result.bytes, result.fmt)
+            return result
+        except BaseException as e:
+            log.info("export ended: %s", e.__class__.__name__)
+            raise
+        finally:
+            self._export_cancel = None
+            self._export_lock.release()
+
+    def _export_yield(self, last: ExportProgress, progress: Any,
+                      cancel: threading.Event) -> None:
+        """Called before each chunk: reading aloud has priority, so wait while it plays."""
+        from .export import ExportCancelled
+
+        paused = False
+        while self.speaker.busy:
+            if cancel.is_set():
+                raise ExportCancelled()
+            if not paused:
+                paused = True
+                if progress is not None:
+                    progress(dataclasses.replace(last, paused=True))
+            time.sleep(0.1)
+        if paused and progress is not None:
+            progress(dataclasses.replace(last, paused=False))
+
+    def cancel_export(self) -> None:
+        cancel = self._export_cancel
+        if cancel is not None:
+            cancel.set()
+
+    def _open_folder(self, path: Path) -> None:
+        folder = Path(path)
+        folder.mkdir(parents=True, exist_ok=True)
+        os.startfile(str(folder))  # type: ignore[attr-defined]
+
+    # -- MCP server (agents)
+    def _sync_mcp(self) -> None:
+        """Start, stop or restart the MCP server to match [mcp] (no-op when unchanged)."""
+        from . import mcp_server
+
+        m = self.cfg.mcp
+        key = (True, int(m.port), int(m.max_chars)) if m.enabled else None
+        with _MCP_LOCK:
+            if key == self._mcp_key:
+                if key is None:
+                    self._mcp_error = None
+                return
+            self._stop_mcp_locked()
+            if key is None:
+                self._mcp_error = None
+                return
+            try:
+                try:
+                    options = {k: list(v) for k, v in _omni().INSTRUCT_OPTIONS.items()}
+                except Exception:
+                    log.debug("INSTRUCT_OPTIONS unavailable for the MCP schema", exc_info=True)
+                    options = None
+                server = mcp_server.McpServer(
+                    mcp_server.build_tools(AgentBridge(self), key[2], options), key[1],
+                    version=__version__, instructions=mcp_server.INSTRUCTIONS)
+                server.start()
+            except OSError as e:
+                self._mcp_error = f"Port {key[1]} is busy: {e}"
+                log.error("MCP server did not start: %s", self._mcp_error)
+                self._flash("error", "Error: " + _short(self._mcp_error, 53))
+                return
+            self._mcp, self._mcp_key, self._mcp_error = server, key, None
+
+    def _stop_mcp_locked(self) -> None:
+        server, self._mcp, self._mcp_key = self._mcp, None, None
+        if server is not None:
+            try:
+                server.stop()
+            except Exception:
+                log.exception("stopping the MCP server failed")
+
+    def _stop_mcp(self) -> None:
+        with _MCP_LOCK:
+            self._stop_mcp_locked()
+
+    def mcp_status(self) -> dict:
+        """{'enabled', 'running', 'url', 'error'} for the Settings Agents tab."""
+        server = self._mcp
+        running = bool(server is not None and server.running)
+        url = server.url if server is not None else f"http://127.0.0.1:{self.cfg.mcp.port}/mcp"
+        return {"enabled": bool(self.cfg.mcp.enabled), "running": running, "url": url,
+                "error": self._mcp_error or ""}
 
     # -- overlay helper
     def _flash(self, kind: str, text: str, seconds: float = 1.5) -> None:
@@ -579,10 +780,28 @@ class TTSApp:
                 stop=self.stop,
                 open_logs=self._open_logs,
                 open_config=self._open_config,
+                load_document=self._load_document,
+                export_audio=self.export_audio,
+                cancel_export=self.cancel_export,
+                mp3_available=self._mp3_available,
+                mcp_status=self.mcp_status,
+                open_folder=self._open_folder,
                 version=__version__,
             )
             self.settings = SettingsWindow(self.overlay.root, hooks, self.overlay.call_soon)
         return self.settings
+
+    @staticmethod
+    def _load_document(path: str) -> Any:
+        from . import docload  # lazy: pypdf is only imported for PDFs
+
+        return docload.extract_text(path)
+
+    @staticmethod
+    def _mp3_available() -> bool:
+        from . import export
+
+        return export.mp3_available()
 
     def open_settings(self, tab: str | None = None, banner: str | None = None,
                       download: bool = False) -> None:
@@ -645,6 +864,7 @@ class TTSApp:
         """Blocking: unload the engine and delete the OmniVoice files (voices are kept). An
         OmniVoice engine setting is switched back to Kokoro."""
         self.stop()
+        self.cancel_export()
         self.engine.unload_omni()
         self._setup().uninstall(omni_dir(self.cfg.speech), keep_voices=True)
         if self.cfg.speech.engine == "omnivoice":
@@ -749,6 +969,7 @@ class TTSApp:
 
         self.cfg = new
         self.overlay.cfg = new.ui
+        self._sync_mcp()  # before any early return: MCP settings apply anyway
         try:
             self.listener.set_bindings({"read": parse_chord(new.hotkey.read)})
         except ValueError as e:
@@ -845,16 +1066,158 @@ class TTSApp:
         os.startfile(str(folder))  # type: ignore[attr-defined]
 
 
+# ---------------------------------------------------------------- agents (MCP)
+
+class AgentBridge:
+    """What the MCP tools do inside the app (mcp_server.AgentApi on top of TTSApp). Methods run
+    on the MCP server's request threads."""
+
+    def __init__(self, app: TTSApp):
+        self.app = app
+
+    def _check_voice(self, s: SpeechConfig, voice: str | None) -> None:
+        from .mcp_server import ToolError
+
+        if not voice:
+            return
+        voice = normalize_omni_voice(voice) if is_omni_voice(voice) else voice
+        if not voice_ready(s, voice):
+            raise ToolError(missing_message(voice))
+        if voice not in self.app._voices():
+            raise ToolError(f"Unknown voice '{voice}'. Call list_voices to get the valid ids.")
+
+    def list_voices(self) -> dict:
+        from .tts import voice_label
+
+        s = self.app.cfg.speech
+        info = {r.get("voice"): r for r in omni_preset_info(s)}
+        voices = []
+        for v in self.app._voices():
+            row = {"id": v, "label": voice_label(v),
+                   "engine": "omnivoice" if is_omni_voice(v) else "kokoro"}
+            meta = info.get(v)
+            if meta and is_omni_voice(v):
+                row.update({k: meta.get(k, "") for k in ("kind", "description", "lang")})
+            voices.append(row)
+        return {
+            "voices": voices,
+            "engine": s.engine,
+            "default_voice": active_voice(s),
+            "omnivoice_installed": omni_present(s),
+        }
+
+    def create_voice(self, args: dict) -> dict:
+        from .mcp_server import ToolError
+
+        app = self.app
+        s = app.cfg.speech
+        if not omni_present(s):
+            raise ToolError(MISSING_OMNI)
+        omni = _omni()
+        overwrite = bool(args.get("overwrite", False))
+        try:
+            name = omni.sanitize_name(args.get("name") or "")
+        except ValueError as e:
+            raise ToolError(str(e)) from e
+        if not overwrite and any(r.get("name") == name for r in omni_preset_info(s)):
+            raise ToolError(f"A voice named '{name}' already exists; pass overwrite=true to replace it")
+        seed = args.get("seed")
+        if seed is None:
+            seed = random.SystemRandom().randrange(2**31)
+        lang = args.get("lang") or "en"
+        description = args.get("description") or ""
+        log.info("MCP create_voice: name %s, description %d chars", name, len(description))
+        try:
+            clip = app._design_clip(description, int(seed), None, lang)
+            voice_id = app._save_voice(name, clip, overwrite)
+        except (ValueError, FileExistsError) as e:
+            raise ToolError(str(e)) from e
+        meta = getattr(clip, "meta", None) or {}
+        return {"voice": voice_id, "name": name, "description": meta.get("instruct", description),
+                "seed": int(seed), "lang": lang}
+
+    def speak(self, text: str, voice: str | None, speed: float | None, lang: str | None,
+              wait: bool, timeout: float) -> dict:
+        from .mcp_server import ToolError
+
+        app = self.app
+        if not app.enabled:
+            raise ToolError("VibeTTS is turned off (tray menu > Enabled); "
+                            "ask the user to turn it on")
+        cfg = app.cfg
+        s = cfg.speech
+        self._check_voice(s, voice)
+        chunks, voice, lang, _ = plan_speech(s, text, voice, lang, cfg.selection.clean_markdown,
+                                             cfg.selection.max_chars)
+        if not chunks:
+            raise ToolError("Nothing to read in this text")
+        if not voice_ready(s, voice):
+            raise ToolError(missing_message(voice))
+        if speed:
+            s = dataclasses.replace(s, speed=float(speed))
+        log.info("MCP speak: %d chars with %s", len(text), voice)
+        req = app.speak(chunks, s, voice, lang)
+        done = bool(wait and req is not None and req.done.wait(timeout))
+        error = req.error if done else None
+        interrupted = bool(done and req.interrupted)
+        return {"started": True, "completed": bool(done and not interrupted and not error),
+                "interrupted": interrupted, "error": error, "voice": voice, "lang": lang}
+
+    def stop(self, cancel_export: bool) -> dict:
+        app = self.app
+        app.stop()
+        cancelled = False
+        if cancel_export and app._export_cancel is not None:
+            app.cancel_export()
+            cancelled = True
+        return {"stopped": True, "export_cancelled": cancelled}
+
+    def synthesize_to_file(self, args: dict) -> dict:
+        from . import docload
+        from .export import ExportRequest
+        from .mcp_server import ToolError
+
+        app = self.app
+        title, markdown = "", True
+        if args.get("text") is not None:
+            text = args["text"]
+        else:
+            try:
+                doc = docload.extract_text(args["path"])
+            except docload.DocumentError as e:
+                raise ToolError(str(e)) from e
+            text, title, markdown = doc.text, doc.title, doc.markdown
+            limit = app.cfg.mcp.max_chars
+            if limit > 0 and len(text) > limit:
+                raise ToolError(f"The document has {len(text)} characters; the limit is {limit}")
+        self._check_voice(app.cfg.speech, args.get("voice"))
+        output, fmt = args.get("output"), args.get("format")
+        suffix = Path(output).suffix.lower() if output else ""
+        if fmt and suffix in (".wav", ".mp3") and suffix[1:] != fmt:
+            raise ToolError(f"format '{fmt}' does not match the output file name '{output}'")
+        req = ExportRequest(text, Path(output) if output else None, args.get("voice"),
+                            args.get("speed"), args.get("lang"), fmt, None, markdown,
+                            1.0, bool(args.get("overwrite", False)), title)
+        log.info("MCP export: %d chars", len(text))
+        result = app.export_audio(req)
+        return {"path": str(result.path), "format": result.fmt,
+                "duration_seconds": round(result.seconds, 2), "chunks": result.chunks,
+                "bytes": result.bytes, "voice": result.voice, "lang": result.lang}
+
+
 # ---------------------------------------------------------------- one-shot CLI
 
-def say(cfg: Config, text: str, wav: str | None = None) -> int:
-    """Speak `text` (or write it to a WAV file) without the tray; for testing and scripts."""
-    import numpy as np
-
+def say(cfg: Config, text: str, out: str | None = None, title: str = "",
+        markdown: bool | None = None) -> int:
+    """Speak `text` (or write it to an audio file, WAV/MP3 by extension) without the tray;
+    for testing and scripts."""
     from . import textprep
-    from .tts import SAMPLE_RATE, SpeakRequest, Speaker, write_wav
+    from .export import ExportRequest
+    from .tts import SpeakRequest, Speaker
 
     s = cfg.speech
+    if markdown is None:
+        markdown = cfg.selection.clean_markdown
     route = route_for(s, text)
     voice, lang = route.voice, route.lang
     if route.fell_back:
@@ -867,26 +1230,26 @@ def say(cfg: Config, text: str, wav: str | None = None) -> int:
             print(f"error: model files missing ({s.model}, {s.voices}); "
                   "run: python -m vibetts.model_setup", file=sys.stderr)
         return 1
-    chunks = textprep.prepare(text, cfg.selection.clean_markdown, 0, lang,
-                              long_chunks=route.omni)
+    chunks = textprep.prepare(text, markdown, 0, lang, long_chunks=route.omni)
     if not chunks:
         print("error: nothing to say", file=sys.stderr)
         return 1
     t0 = time.perf_counter()
     engine = EngineHolder().get(s, announce=False, voice=voice)  # loads the engine, warms it up
     print(f"model loaded in {time.perf_counter() - t0:.2f}s", flush=True)
-    if wav:
-        parts = []
+    if out:
+        req = ExportRequest(text, Path(out), voice, None, lang, None, cfg.export.mp3_bitrate,
+                            markdown, s.volume, True, title)
         t0 = time.perf_counter()
-        for c in chunks:
-            audio = engine.synth(c.text, voice, s.speed, lang)
-            gap = np.zeros(int(s.sentence_pause * c.pause_after * SAMPLE_RATE), np.float32)
-            parts += [audio, gap]
-        samples = np.concatenate(parts)
-        write_wav(Path(wav), samples * s.volume)
-        took = time.perf_counter() - t0
-        print(f"wrote {wav}: {len(samples) / SAMPLE_RATE:.2f}s audio in {took:.2f}s "
-              f"({len(samples) / SAMPLE_RATE / took:.1f}x real time)", flush=True)
+        try:
+            result = run_export(engine, s, req, Path.cwd(), fmt_default=cfg.export.format,
+                                bitrate_default=cfg.export.mp3_bitrate)
+        except (ValueError, OSError, RuntimeError) as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        took = max(time.perf_counter() - t0, 1e-6)
+        print(f"wrote {result.path}: {result.seconds:.2f}s audio in {took:.2f}s "
+              f"({result.seconds / took:.1f}x real time)", flush=True)
         return 0
     started = threading.Event()
     errors: list[str] = []
@@ -927,8 +1290,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--hidden", action="store_true",
                         help="start in the tray without opening the settings window")
     parser.add_argument("--say", metavar="TEXT", help="speak TEXT and exit (no tray)")
-    parser.add_argument("--wav", metavar="PATH", help="with --say: write a WAV file instead")
+    parser.add_argument("--doc", metavar="PATH",
+                        help="speak a document (.txt .md .html .docx .epub .pdf) and exit")
+    parser.add_argument("--out", "--wav", dest="out", metavar="PATH",
+                        help="with --say / --doc: write an audio file (.wav or .mp3) instead")
     args = parser.parse_args(argv)
+    if args.say is not None and args.doc is not None:
+        parser.error("use either --say or --doc")
+    if args.out and args.say is None and args.doc is None:
+        parser.error("--out needs --say TEXT or --doc PATH")
     if args.version:
         print(f"vibetts {__version__}")
         return 0
@@ -939,7 +1309,16 @@ def main(argv: list[str] | None = None) -> int:
         log_path = setup_logging(console=args.console)
         log.info("VibeTTS %s starting; log=%s", __version__, log_path)
         if args.say is not None:
-            return say(load_config(), args.say, args.wav)
+            return say(load_config(), args.say, args.out)
+        if args.doc is not None:
+            from . import docload
+
+            try:
+                doc = docload.extract_text(args.doc)
+            except docload.DocumentError as e:
+                print(f"error: {e}", file=sys.stderr)
+                return 1
+            return say(load_config(), doc.text, args.out, doc.title, doc.markdown)
         _set_dpi_aware()
         from .single_instance import SingleInstance
         inst = SingleInstance()

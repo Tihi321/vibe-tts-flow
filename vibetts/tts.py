@@ -153,12 +153,13 @@ def find_output_device(name: str) -> int | None:
 
 
 def write_wav(path: Path, samples: np.ndarray) -> None:
-    pcm = (np.clip(samples, -1.0, 1.0) * 32767).astype("<i2")
+    from .export import pcm16  # lazy: export imports SAMPLE_RATE from this module
+
     with wave.open(str(path), "wb") as w:
         w.setnchannels(1)
         w.setsampwidth(2)
         w.setframerate(SAMPLE_RATE)
-        w.writeframes(pcm.tobytes())
+        w.writeframes(pcm16(samples))
 
 
 # ---------------------------------------------------------------- speaker
@@ -173,6 +174,9 @@ class SpeakRequest:
         self.volume = volume
         self.device = device
         self.lang = lang  # "hr" / "en": language of the text, used by OmniVoice
+        self.done = threading.Event()  # set once playback has ended (any way)
+        self.error: str | None = None  # why it failed (valid once done is set)
+        self.interrupted = False  # stopped / replaced before every chunk was played
 
 
 _END = object()
@@ -291,7 +295,9 @@ class Speaker:
             log.exception("audio playback failed")
             error = str(e) or e.__class__.__name__
         finally:
-            interrupted = stop.is_set() or error is not None
+            stopped = stop.is_set()
+            interrupted = stopped or error is not None
+            req.error, req.interrupted = error, stopped
             stop.set()  # also ends the producer
             if out is not None:
                 try:
@@ -302,6 +308,7 @@ class Speaker:
                     out.close()
                 except Exception:
                     log.debug("closing audio output failed", exc_info=True)
+            req.done.set()
             self._safe(lambda: self.on_done(req, error))
 
     @staticmethod
