@@ -8,7 +8,7 @@ from typing import Callable
 import pystray
 from PIL import Image, ImageDraw
 
-from .tts import LANG_LABELS
+from .tts import LANG_LABELS, OMNI_LABEL, is_omni_voice, omni_preset
 
 log = logging.getLogger(__name__)
 
@@ -29,7 +29,7 @@ class TrayHooks:
     download_model: Callable[[], None]
     voices: Callable[[], list[str]]
     current_voice: Callable[[], str]
-    set_voice: Callable[[str], None]
+    set_voice: Callable[[str], None]  # also makes the voice's engine the active one
     current_speed: Callable[[], float]
     set_speed: Callable[[float], None]
     is_autostart: Callable[[], bool]
@@ -39,6 +39,9 @@ class TrayHooks:
     open_logs: Callable[[], None]
     reload_config: Callable[[], None]
     quit: Callable[[], None]
+    current_engine: Callable[[], str] = lambda: "kokoro"   # "kokoro" | "omnivoice"
+    set_engine: Callable[[str], None] = lambda engine: None
+    omni_available: Callable[[], bool] = lambda: False     # OmniVoice installed?
 
 
 def make_icon(color: str) -> Image.Image:
@@ -95,18 +98,36 @@ class Tray:
         if not voices:
             return None
         groups: list[pystray.MenuItem] = []
+
+        def item(v: str, text: str) -> pystray.MenuItem:
+            return M(text, self._action(h.set_voice, v), radio=True,
+                     checked=self._checked(lambda v=v: h.current_voice() == v))
+
         for prefix, label in LANG_LABELS.items():
             items = []
             for v in voices:
-                if v[:1] != prefix:
+                if is_omni_voice(v) or v[:1] != prefix:
                     continue
                 gender = {"f": "female", "m": "male"}.get(v[1:2], "")
-                text = f"{v[3:].title()} ({gender})" if gender else v
-                items.append(M(text, self._action(h.set_voice, v), radio=True,
-                               checked=self._checked(lambda v=v: h.current_voice() == v)))
+                items.append(item(v, f"{v[3:].title()} ({gender})" if gender else v))
             if items:
                 groups.append(M(label, pystray.Menu(*items)))
+        omni = [item(v, omni_preset(v).replace("_", " ").title())
+                for v in voices if is_omni_voice(v)]
+        if omni:
+            groups.append(M(OMNI_LABEL, pystray.Menu(*omni)))
         return pystray.Menu(*groups)
+
+    def _engine_menu(self) -> pystray.Menu:
+        h = self.hooks
+        M = pystray.MenuItem
+
+        def entry(engine: str, text: str, enabled: Callable[[], bool]) -> pystray.MenuItem:
+            return M(text, self._action(h.set_engine, engine), radio=True,
+                     checked=self._checked(lambda: h.current_engine() == engine),
+                     enabled=lambda item: bool(enabled()))
+        return pystray.Menu(entry("kokoro", "Kokoro", lambda: True),
+                            entry("omnivoice", OMNI_LABEL, h.omni_available))
 
     def _menu_items(self):
         h = self.hooks
@@ -126,6 +147,7 @@ class Tray:
             M("Stop reading", act(h.stop), enabled=lambda item: bool(h.is_speaking())),
             pystray.Menu.SEPARATOR,
         ]
+        items.append(M("Engine", self._engine_menu()))
         if voice_menu is not None:
             items.append(M("Voice", voice_menu))
         items += [

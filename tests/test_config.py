@@ -42,3 +42,53 @@ def test_broken_toml_uses_defaults(tmp_path):
     path = tmp_path / "config.toml"
     path.write_text("[speech\nvoice=", encoding="utf-8")
     assert load_config(path) == Config()
+
+
+def test_croatian_defaults():
+    s = Config().speech
+    assert (s.omnivoice_dir, s.omnivoice_steps) == ("models/omnivoice", 6)
+    assert s.engine == "kokoro" and s.voice == "af_heart"
+    assert s.omni_voice == "omni:default" and s.croatian_voice == "" and s.auto_language is True
+
+
+def test_omnivoice_steps_clamped():
+    assert config_from_dict({"speech": {"omnivoice_steps": 2}}).speech.omnivoice_steps == 4
+    assert config_from_dict({"speech": {"omnivoice_steps": 99}}).speech.omnivoice_steps == 16
+    assert config_from_dict({"speech": {"omnivoice_steps": 10}}).speech.omnivoice_steps == 10
+
+
+def test_migrates_old_omni_voice_in_voice():
+    cfg = config_from_dict({"speech": {"voice": "omni_hr:alma", "croatian_voice": "omni_hr:default"}})
+    s = cfg.speech
+    assert (s.engine, s.omni_voice, s.voice) == ("omnivoice", "omni:alma", "af_heart")
+    assert s.croatian_voice == ""  # the old code ignored it when `voice` was an omni voice
+    bare = config_from_dict({"speech": {"voice": "omni_hr"}}).speech
+    assert (bare.engine, bare.omni_voice) == ("omnivoice", "omni:default")
+
+
+def test_migrates_old_croatian_voice_and_keeps_kokoro():
+    s = config_from_dict({"speech": {"voice": "bf_emma", "croatian_voice": "omni_hr:zora"}}).speech
+    assert (s.engine, s.voice, s.croatian_voice, s.omni_voice) == (
+        "kokoro", "bf_emma", "omni:zora", "omni:default")
+    old_default = config_from_dict({"speech": {"croatian_voice": "omni_hr:default"}}).speech
+    assert old_default.croatian_voice == "omni:default" and old_default.engine == "kokoro"
+
+
+def test_new_config_is_not_touched_and_bad_values_fall_back():
+    s = config_from_dict({"speech": {"engine": "omnivoice", "voice": "bm_george",
+                                     "omni_voice": "omni:alma", "croatian_voice": "omni:zora"}}).speech
+    assert (s.engine, s.voice, s.omni_voice, s.croatian_voice) == (
+        "omnivoice", "bm_george", "omni:alma", "omni:zora")
+    bad = config_from_dict({"speech": {"engine": "magic", "omni_voice": "af_heart",
+                                       "croatian_voice": "af_heart"}}).speech
+    assert (bad.engine, bad.omni_voice, bad.croatian_voice) == ("kokoro", "omni:default", "")
+
+
+def test_migrated_config_round_trips(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text('[speech]\nvoice = "omni_hr:alma"\n', encoding="utf-8")
+    cfg = load_config(path)
+    save_config(cfg, path)
+    again = load_config(path)
+    assert again == cfg and again.speech.engine == "omnivoice"
+    assert "omni_hr" not in path.read_text(encoding="utf-8")

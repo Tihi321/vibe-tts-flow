@@ -90,7 +90,9 @@ def _stream_to(url: str, target: Path, progress: ProgressFn | None,
 
 
 def download(filename: str, dest_dir: Path, progress: ProgressFn | None = None,
-             cancel: threading.Event | None = None, expected_size: int | None = None) -> Path:
+             cancel: threading.Event | None = None, expected_size: int | None = None,
+             url: str | None = None) -> Path:
+    """Fetch `url` (default: the Kokoro release URL of `filename`) to dest_dir/filename."""
     dest_dir = Path(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
     final = dest_dir / filename
@@ -98,7 +100,7 @@ def download(filename: str, dest_dir: Path, progress: ProgressFn | None = None,
         return final
     part = final.with_name(final.name + ".part")
     try:
-        _stream_to(file_url(filename), part, progress, cancel)
+        _stream_to(url or file_url(filename), part, progress, cancel)
         if expected_size and part.stat().st_size != expected_size:
             raise SetupError(f"{filename}: got {part.stat().st_size} bytes, "
                              f"expected {expected_size}")

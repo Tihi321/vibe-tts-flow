@@ -1,4 +1,4 @@
-from vibetts.textprep import FIRST_CHUNK_CHARS, clean_text, prepare, split_chunks
+from vibetts.textprep import FIRST_CHUNK_CHARS, clean_text, looks_croatian, prepare, split_chunks
 
 
 def test_markdown_cleanup():
@@ -79,3 +79,53 @@ def test_max_chars_and_empty():
     assert sum(len(c.text) for c in chunks) <= 50
     assert prepare("   \n\n ") == []
     assert prepare("**") == []
+
+
+def test_url_word_follows_language():
+    text = "Vidi https://example.com/a za više."
+    assert "link" in clean_text(text) and "poveznica" not in clean_text(text)
+    assert "poveznica" in clean_text(text, True, "hr")
+    assert "poveznica" in prepare(text, lang="hr")[0].text
+    assert "link" in prepare(text)[0].text  # default stays English
+
+
+def test_looks_croatian_with_diacritics():
+    assert looks_croatian("Dobar dan, ovo je test čitanja na hrvatskom jeziku.")
+    assert looks_croatian("Žaba šuti đače")
+
+
+def test_looks_croatian_without_diacritics():
+    assert looks_croatian("Ovo je jednostavna recenica koja se cita na hrvatskom jeziku.")
+    assert looks_croatian("Nije sve tako crno kako izgleda, ali nema problema.")
+
+
+def test_looks_croatian_english_is_not():
+    assert not looks_croatian("This is a plain English sentence about nothing in particular.")
+    assert not looks_croatian("I think I am going to see you in the U.S. soon, so I will call.")
+
+
+def test_looks_croatian_mixed_short_english():
+    assert not looks_croatian("Meet me at the Šimić cafe")  # one stray letter, English words
+    assert not looks_croatian("OK, I do")
+    assert not looks_croatian("Yes. I am.")
+
+
+def test_looks_croatian_empty():
+    assert not looks_croatian("")
+    assert not looks_croatian("   \n ")
+    assert not looks_croatian("123 456 !!!")
+
+
+def test_long_chunks_merge_after_the_first():
+    text = "Dobar dan. " + " ".join(f"Ovo je kratka recenica broj {i}." for i in range(8))
+    en, hr = prepare(text), prepare(text, long_chunks=True)
+    assert hr[0].text == en[0].text  # the first chunk stays short: audio starts quickly
+    assert len(hr) < len(en)
+    assert all(len(c.text) <= 260 for c in hr)
+    assert " ".join(c.text for c in hr) == " ".join(c.text for c in en)
+
+
+def test_long_chunks_do_not_depend_on_language():
+    text = "Hello. " + " ".join(f"This is short sentence number {i}." for i in range(8))
+    assert len(prepare(text, long_chunks=True)) < len(prepare(text))
+    assert prepare(text, lang="hr") == prepare(text)  # language only picks the URL word
