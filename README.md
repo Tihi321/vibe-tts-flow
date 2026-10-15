@@ -114,11 +114,15 @@ claude mcp add --transport http vibetts http://127.0.0.1:7723/mcp
 
 The same setting as `.mcp.json`: `{"mcpServers": {"vibetts": {"type": "http", "url": "http://127.0.0.1:7723/mcp"}}}`. Any client that supports the Streamable HTTP transport works. The server only runs while VibeTTS is running.
 
+**Headless (for scripts and agents).** `python -m vibetts --mcp-only [--port N]` serves the same MCP tools with no tray, hotkey or window, with MCP forced on (the port comes from `[mcp] port` unless `--port` is given). Stop it with Ctrl+C. It does not use the single-instance lock, so it cannot run next to the normal app on the same port; `speak` is not available there (use `synthesize_to_file` / `synthesize_batch`).
+
 | Tool | What it does |
 |---|---|
 | `synthesize_to_file` | Turns `text` or a document `path` into a `.wav` / `.mp3` file. Optional: `output`, `format`, `voice`, `speed`, `lang` (`en` / `hr`), `overwrite`. Returns the path, duration and size |
 | `speak` | Reads text aloud on your speakers, like the hotkey, and replaces what is playing. With `wait = true` it returns when it has finished |
-| `list_voices` | Voice ids (Kokoro and OmniVoice presets) and the current defaults |
+| `synthesize_batch` | Many short clips in one call: `items` = `[{text, output, voice?, lang?, speed?}]` (absolute `output` paths ending in `.wav` / `.mp3`), optional `overwrite`. The model is loaded once and stays loaded; up to 500 items; runs in the same one-at-a-time export queue (it pauses while the app reads aloud). Returns one `{output, duration_s, ok, error}` per item; a failing item does not stop the others |
+| `list_voices` | Voice ids (Kokoro and OmniVoice presets) and the current defaults. OmniVoice presets also list `kind`, `description` and sample `lang` |
+| `delete_voice` | Deletes an OmniVoice preset by `name` (or `omni:<name>`); `default` cannot be deleted |
 | `create_voice` | Designs a new OmniVoice voice from a `description` (e.g. `female, young adult, low pitch`) and saves it as `omni:<name>`; optional `seed`, `lang` (sample language), `overwrite`. Needs OmniVoice |
 | `stop` | Stops reading; `cancel_export = true` also cancels a running export |
 

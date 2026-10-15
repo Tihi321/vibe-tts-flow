@@ -21,7 +21,8 @@ INSTRUCTIONS = (
     "Use synthesize_to_file to turn text or a document (.txt/.md/.html/.docx/.epub/.pdf) into a WAV or MP3 "
     "file (24 kHz mono). Use speak to read text aloud on the user's speakers; use it sparingly because it is "
     "audible to the user. Call list_voices first to get valid voice ids; create_voice designs a new "
-    "OmniVoice voice from a short description. Use stop to interrupt playback or cancel a running export."
+    "OmniVoice voice from a short description (delete_voice removes one); synthesize_batch writes many "
+    "short clips in one call. Use stop to interrupt playback or cancel a running export."
 )
 
 
@@ -49,6 +50,10 @@ class AgentApi(Protocol):
     def synthesize_to_file(self, args: dict) -> dict: ...
 
     def create_voice(self, args: dict) -> dict: ...
+
+    def delete_voice(self, args: dict) -> dict: ...
+
+    def synthesize_batch(self, args: dict) -> dict: ...
 
 
 def _error(id_: Any, code: int, message: str) -> dict:
@@ -330,6 +335,7 @@ DEFAULT_VOICE_OPTIONS: dict[str, list[str]] = {
     "style": ["whisper"],
 }
 MAX_SEED = 2**31 - 1
+MAX_BATCH_ITEMS = 500
 
 
 def build_tools(api: AgentApi, max_chars: int,
@@ -407,6 +413,46 @@ def build_tools(api: AgentApi, max_chars: int,
                 raise ToolError(str(e)) from e
             raise
 
+    def delete_voice(args: dict) -> dict:
+        _check_unknown(args, {"name"})
+        name = args.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise ToolError("'name' must be a non-empty string")
+        if name.strip().lower() in ("default", "omni:default"):
+            raise ToolError("The 'default' voice cannot be deleted")
+        try:
+            return api.delete_voice(dict(args))
+        except ToolError:
+            raise
+        except Exception as e:
+            if isinstance(e, _PASSTHROUGH_ERRORS):
+                raise ToolError(str(e)) from e
+            raise
+
+    def synthesize_batch(args: dict) -> dict:
+        _check_unknown(args, {"items", "overwrite"})
+        items = args.get("items")
+        if not isinstance(items, list) or not items:
+            raise ToolError("'items' must be a non-empty array")
+        if len(items) > MAX_BATCH_ITEMS:
+            raise ToolError(f"Too many items ({len(items)}); the limit is {MAX_BATCH_ITEMS} per call")
+        allowed = {"text", "output", "voice", "lang", "speed"}
+        for i, it in enumerate(items):
+            if not isinstance(it, dict):
+                raise ToolError(f"items[{i}] must be an object")
+            extra = sorted(set(it) - allowed)
+            if extra:
+                raise ToolError(f"items[{i}]: unknown field(s): {', '.join(extra)}")
+        _check_bool(args, "overwrite", False)
+        try:
+            return api.synthesize_batch(dict(args))
+        except ToolError:
+            raise
+        except Exception as e:
+            if type(e).__name__ == "ExportBusy" or isinstance(e, _PASSTHROUGH_ERRORS):
+                raise ToolError(str(e)) from e
+            raise
+
     def stop(args: dict) -> dict:
         _check_unknown(args, {"cancel_export"})
         return api.stop(_check_bool(args, "cancel_export", False))
@@ -476,6 +522,46 @@ def build_tools(api: AgentApi, max_chars: int,
             }, ["name"]),
             create_voice,
             {"title": "Create a voice from a description", "readOnlyHint": False, "destructiveHint": False,
+             "idempotentHint": False, "openWorldHint": False},
+        ),
+        Tool(
+            "delete_voice",
+            "Delete an OmniVoice voice preset created with create_voice. The 'default' voice cannot "
+            "be deleted. Accepts the bare name or the omni:<name> id.",
+            schema({
+                "name": {"type": "string", "description": "Voice name or omni:<name> id."},
+            }, ["name"]),
+            delete_voice,
+            {"title": "Delete a voice", "readOnlyHint": False, "destructiveHint": True,
+             "idempotentHint": False, "openWorldHint": False},
+        ),
+        Tool(
+            "synthesize_batch",
+            "Convert many short texts to audio files in one call (WAV or MP3 by file extension). The "
+            "voice model is loaded once, so this is much faster than repeated synthesize_to_file calls. "
+            f"Up to {MAX_BATCH_ITEMS} items; each item is limited by the text size limit. Runs in the "
+            "same one-at-a-time export queue and returns one result per item "
+            "({output, duration_s, ok, error}); a failing item does not stop the others.",
+            schema({
+                "items": {
+                    "type": "array", "minItems": 1, "maxItems": MAX_BATCH_ITEMS,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "text": {"type": "string", "description": "Text to convert." + limit},
+                            "output": {"type": "string", "description": "Absolute output path ending in .wav or .mp3; the folder must exist."},
+                            "voice": voice_p,
+                            "lang": lang_p,
+                            "speed": speed_p,
+                        },
+                        "required": ["text", "output"],
+                        "additionalProperties": False,
+                    },
+                },
+                "overwrite": {"type": "boolean", "default": False, "description": "Replace output files that already exist (default false; existing files then fail that item)."},
+            }, ["items"]),
+            synthesize_batch,
+            {"title": "Synthesize many clips to files", "readOnlyHint": False, "destructiveHint": False,
              "idempotentHint": False, "openWorldHint": False},
         ),
         Tool(

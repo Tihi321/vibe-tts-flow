@@ -1060,7 +1060,8 @@ def test_sync_mcp_start_noop_restart_stop(mapp):
     a._sync_mcp()
     (first,) = FakeMcpServer.instances
     assert first.started and first.port == 7800 and first.kw["version"]
-    assert {t.name for t in first.tools} == {"synthesize_to_file", "speak", "list_voices", "create_voice", "stop"}
+    assert {t.name for t in first.tools} == {"synthesize_to_file", "speak", "list_voices", "create_voice", "delete_voice",
+                                           "synthesize_batch", "stop"}
     assert a.mcp_status() == {"enabled": True, "running": True,
                               "url": "http://127.0.0.1:7800/mcp", "error": ""}
     a._sync_mcp()  # unchanged: nothing happens
@@ -1248,3 +1249,164 @@ def test_say_never_prints_the_text(cli, tmp_path, capsys):
     app.say(cli, secret, str(tmp_path / "s.wav"))
     captured = capsys.readouterr()
     assert "Confidential" not in captured.out + captured.err
+
+
+# ---------------------------------------------------------------- batch, delete_voice, headless
+
+def test_bridge_synthesize_batch(bridge, tmp_path):
+    b, a = bridge
+    out_dir = tmp_path / "clips"
+    out_dir.mkdir()
+    items = [
+        {"text": "Hello there.", "output": str(out_dir / "a.wav")},
+        {"text": "Second line.", "output": str(out_dir / "b.wav"), "voice": "bf_emma", "speed": 1.2},
+        {"text": "", "output": str(out_dir / "c.wav")},                      # empty text
+        {"text": "Rel.", "output": "rel.wav"},                               # not absolute
+        {"text": "Bad.", "output": str(out_dir / "d.ogg")},                  # bad extension
+        {"text": "Hi.", "output": str(out_dir / "e.wav"), "lang": "de"},    # bad lang
+        {"text": "Hi.", "output": str(out_dir / "f.wav"), "voice": "zz_nobody"},
+        {"text": "Hi.", "output": str(tmp_path / "nodir" / "g.wav")},        # folder missing
+    ]
+    out = b.synthesize_batch({"items": items})
+    r = out["results"]
+    assert [x["ok"] for x in r] == [True, True, False, False, False, False, False, False]
+    assert r[0]["output"] == str(out_dir / "a.wav") and r[0]["duration_s"] >= 0
+    assert (out_dir / "a.wav").exists() and (out_dir / "b.wav").exists()
+    assert "non-empty" in r[2]["error"] and "absolute" in r[3]["error"]
+    assert ".wav and .mp3" in r[4]["error"] and "'lang'" in r[5]["error"]
+    assert "Unknown voice" in r[6]["error"] and "does not exist" in r[7]["error"]
+    assert out["ok_count"] == 2 and out["failed_count"] == 6
+    assert not a._export_lock.locked() and a._export_cancel is None
+    # existing files fail unless overwrite is set
+    again = b.synthesize_batch({"items": items[:1]})
+    assert again["results"][0]["ok"] is False and "already exists" in again["results"][0]["error"]
+    assert b.synthesize_batch({"items": items[:1], "overwrite": True})["ok_count"] == 1
+
+
+def test_bridge_synthesize_batch_text_limit_and_busy(bridge, tmp_path):
+    from vibetts.mcp_server import ToolError
+    from vibetts.export import ExportBusy
+
+    b, a = bridge
+    a.cfg.mcp.max_chars = 10
+    items = [{"text": "x" * 11, "output": str(tmp_path / "long.wav")},
+             {"text": "short", "output": str(tmp_path / "ok.wav")}]
+    r = b.synthesize_batch({"items": items})["results"]
+    assert "too long" in r[0]["error"] and r[1]["ok"]
+    a._export_lock.acquire()
+    with pytest.raises(ExportBusy):
+        b.synthesize_batch({"items": [{"text": "hi", "output": str(tmp_path / "z.wav")}]})
+    assert a._export_lock.locked()
+
+
+def test_export_batch_cancel_marks_rest(eapp, tmp_path):
+    from vibetts.export import ExportRequest
+
+    cancel = threading.Event()
+    reqs = [ExportRequest("One.", tmp_path / "1.wav", overwrite=True),
+            ExportRequest("Two.", tmp_path / "2.wav", overwrite=True)]
+    seen = []
+
+    def progress(done, total):
+        seen.append((done, total))
+        cancel.set()
+
+    rows = eapp.export_batch(reqs, progress, cancel)
+    assert rows[0]["ok"] and rows[1] == {"output": str(tmp_path / "2.wav"), "duration_s": 0.0,
+                                         "ok": False, "error": "cancelled"}
+    assert seen == [(1, 2), (2, 2)] and not eapp._export_lock.locked()
+
+
+def test_bridge_delete_voice(bridge, fakes):
+    from vibetts.mcp_server import ToolError
+
+    b, a = bridge
+    _, omni = fakes
+    deleted = []
+
+    def delete_preset(model_dir, name):
+        if name == "default":
+            raise ValueError("The 'default' voice cannot be deleted.")
+        if name == "ghost":
+            raise FileNotFoundError("No voice named 'ghost'.")
+        deleted.append(name)
+
+    omni.delete_preset = delete_preset
+    assert b.delete_voice({"name": "alma"}) == {"deleted": "omni:alma"}
+    assert b.delete_voice({"name": "omni:alma"}) == {"deleted": "omni:alma"}
+    assert deleted == ["alma", "alma"]
+    with pytest.raises(ToolError, match="cannot be deleted"):
+        b.delete_voice({"name": "default"})
+    with pytest.raises(ToolError, match="No voice named"):
+        b.delete_voice({"name": "ghost"})
+    omni.present = False
+    with pytest.raises(ToolError, match="not installed"):
+        b.delete_voice({"name": "alma"})
+
+
+def test_headless_app_serves_exports_and_refuses_speech(fakes, tmp_path):
+    s, _ = fakes
+    cfg = Config(speech=dataclasses.replace(s, sentence_pause=0.0))
+    cfg.export.folder = str(tmp_path / "exports")
+    cfg.export.format = "wav"
+    h = app.HeadlessApp(cfg)
+    h._voices = lambda: ["af_heart", "omni:default"]
+    b = app.AgentBridge(h)
+    assert b.list_voices()["voices"][0]["id"] == "af_heart"
+    out = b.synthesize_batch({"items": [{"text": "Hello there.", "output": str(tmp_path / "h.wav")}]})
+    assert out["ok_count"] == 1
+    with pytest.raises(RuntimeError, match="headless"):
+        b.speak("Hello.", None, None, None, False, 1.0)
+    assert b.stop(False) == {"stopped": True, "export_cancelled": False}
+
+
+def test_cli_mcp_only_forces_mcp_on_and_uses_port(cli, monkeypatch):
+    seen = {}
+
+    def fake_run(cfg, port=None):
+        seen["cfg"], seen["port"] = cfg, port
+        return 0
+
+    monkeypatch.setattr(app, "run_mcp_only", fake_run)
+    assert app.main(["--mcp-only", "--port", "7799"]) == 0
+    assert seen["port"] == 7799 and seen["cfg"] is cli
+
+
+def test_cli_mcp_only_argument_conflicts(cli):
+    with pytest.raises(SystemExit):
+        app.main(["--port", "7799"])
+    with pytest.raises(SystemExit):
+        app.main(["--mcp-only", "--say", "x"])
+
+
+def test_run_mcp_only_serves_until_interrupted(cli, monkeypatch, capsys):
+    import vibetts.mcp_server as ms
+
+    started = {}
+
+    class FakeServer:
+        port, url, running = 7701, "http://127.0.0.1:7701/mcp", True
+
+        def __init__(self, tools, port, **kw):
+            started["names"] = [t.name for t in tools]
+            started["port"] = port
+
+        def start(self):
+            started["started"] = True
+
+        def stop(self):
+            started["stopped"] = True
+
+    monkeypatch.setattr(ms, "McpServer", FakeServer)
+
+    class Boom(threading.Event):
+        def wait(self, timeout=None):
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(app.threading, "Event", Boom)
+    cli.mcp.enabled = False
+    assert app.run_mcp_only(cli, 7701) == 0
+    assert cli.mcp.enabled is True and started["port"] == 7701
+    assert "synthesize_batch" in started["names"] and started["stopped"]
+    assert "7701" in capsys.readouterr().out
+    assert app.run_mcp_only(cli, 80) == 2

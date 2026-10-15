@@ -660,6 +660,56 @@ class TTSApp:
             self._export_cancel = None
             self._export_lock.release()
 
+    def export_batch(self, reqs: list[ExportRequest], progress: Any = None,
+                     cancel: threading.Event | None = None) -> list[dict]:
+        """Blocking (call from a worker thread): write many short clips under ONE export slot
+        (ExportBusy when another export runs). The model is loaded once and stays loaded.
+        Returns one {'output', 'duration_s', 'ok', 'error'} per request, in order; a failing
+        item does not stop the rest. After a cancel the remaining items report 'cancelled'.
+        progress(done, total) is called after each item."""
+        from .export import ExportBusy, ExportCancelled, ExportProgress
+
+        if not self._export_lock.acquire(blocking=False):
+            raise ExportBusy("Another export is running")
+        cancel = cancel if cancel is not None else threading.Event()
+        self._export_cancel = cancel
+        results: list[dict] = []
+        try:
+            cfg = copy.deepcopy(self.cfg)
+            s = cfg.speech
+            idle = ExportProgress(0, 0, 0.0)
+            total = len(reqs)
+            for i, req in enumerate(reqs):
+                row: dict = {"output": str(req.out), "duration_s": 0.0, "ok": False, "error": None}
+                if cancel.is_set():
+                    row["error"] = "cancelled"
+                else:
+                    try:
+                        _, voice, _, _ = plan_speech(s, req.text, req.voice, req.lang, req.markdown)
+                        engine = self.engine.get(s, announce=False, voice=voice)
+                        result = run_export(
+                            engine, s, req, export_folder(cfg), None, cancel,
+                            lambda: self._export_yield(idle, None, cancel),
+                            fmt_default=cfg.export.format, bitrate_default=cfg.export.mp3_bitrate)
+                        row.update(output=str(result.path), duration_s=round(result.seconds, 2),
+                                   ok=True)
+                    except ExportCancelled:
+                        row["error"] = "cancelled"
+                    except (ValueError, OSError, RuntimeError) as e:
+                        row["error"] = str(e)
+                    except Exception as e:
+                        log.exception("batch item %d failed", i + 1)
+                        row["error"] = f"{type(e).__name__}: {e}"
+                results.append(row)
+                log.info("batch export %d/%d: %s (%.1fs)", i + 1, total,
+                         "ok" if row["ok"] else "failed", row["duration_s"])
+                if progress is not None:
+                    progress(i + 1, total)
+            return results
+        finally:
+            self._export_cancel = None
+            self._export_lock.release()
+
     def _export_yield(self, last: ExportProgress, progress: Any,
                       cancel: threading.Event) -> None:
         """Called before each chunk: reading aloud has priority, so wait while it plays."""
@@ -1136,6 +1186,76 @@ class AgentBridge:
         return {"voice": voice_id, "name": name, "description": meta.get("instruct", description),
                 "seed": int(seed), "lang": lang}
 
+    def delete_voice(self, args: dict) -> dict:
+        from .mcp_server import ToolError
+
+        app = self.app
+        if not omni_present(app.cfg.speech):
+            raise ToolError(MISSING_OMNI)
+        raw = str(args.get("name") or "").strip()
+        name = raw.partition(":")[2] if is_omni_voice(raw) else raw
+        if not name:
+            raise ToolError("'name' must be a voice name or an omni:<name> id")
+        try:
+            app._delete_voice(name)
+        except (ValueError, FileNotFoundError) as e:
+            raise ToolError(str(e)) from e
+        log.info("MCP delete_voice: %s", name)
+        return {"deleted": f"omni:{name}"}
+
+    def synthesize_batch(self, args: dict) -> dict:
+        from .export import ExportRequest, format_for
+        from .mcp_server import ToolError
+
+        app = self.app
+        items = args["items"]
+        overwrite = bool(args.get("overwrite", False))
+        limit = app.cfg.mcp.max_chars
+        results: list[dict | None] = [None] * len(items)
+        reqs: list[ExportRequest] = []
+        slots: list[int] = []
+        for i, it in enumerate(items):
+            out = it.get("output")
+            err = None
+            try:
+                if not isinstance(out, str) or not Path(out).is_absolute():
+                    raise ValueError("'output' must be an absolute path")
+                fmt = format_for(out)  # .wav / .mp3 only
+                text = it.get("text")
+                if not isinstance(text, str) or not text.strip():
+                    raise ValueError("'text' must be a non-empty string")
+                if limit > 0 and len(text) > limit:
+                    raise ValueError(f"text is too long ({len(text)} characters); the limit is {limit}")
+                voice, lang, speed = it.get("voice"), it.get("lang"), it.get("speed")
+                if voice is not None and not isinstance(voice, str):
+                    raise ValueError("'voice' must be a string")
+                if lang not in (None, "en", "hr"):
+                    raise ValueError("'lang' must be 'en' or 'hr'")
+                if speed is not None and (isinstance(speed, bool) or not isinstance(speed, (int, float))
+                                          or not 0.5 <= speed <= 2):
+                    raise ValueError("'speed' must be a number between 0.5 and 2")
+                try:
+                    self._check_voice(app.cfg.speech, voice)
+                except ToolError as e:
+                    raise ValueError(str(e)) from e
+            except ValueError as e:
+                err = str(e)
+            if err is not None:
+                results[i] = {"output": out if isinstance(out, str) else "", "duration_s": 0.0,
+                              "ok": False, "error": err}
+                continue
+            reqs.append(ExportRequest(text, Path(out), voice or None, speed, lang, fmt, None, True,
+                                      1.0, overwrite, ""))
+            slots.append(i)
+        log.info("MCP synthesize_batch: %d items (%d valid)", len(items), len(reqs))
+        if reqs:
+            for slot, row in zip(slots, app.export_batch(reqs)):
+                results[slot] = row
+        done = [r for r in results if r is not None]
+        return {"results": done, "ok_count": sum(1 for r in done if r["ok"]),
+                "failed_count": sum(1 for r in done if not r["ok"]),
+                "total_duration_s": round(sum(r["duration_s"] for r in done), 2)}
+
     def speak(self, text: str, voice: str | None, speed: float | None, lang: str | None,
               wait: bool, timeout: float) -> dict:
         from .mcp_server import ToolError
@@ -1203,6 +1323,86 @@ class AgentBridge:
         return {"path": str(result.path), "format": result.fmt,
                 "duration_seconds": round(result.seconds, 2), "chunks": result.chunks,
                 "bytes": result.bytes, "voice": result.voice, "lang": result.lang}
+
+
+# ---------------------------------------------------------------- headless MCP (agents)
+
+class _NoSpeaker:
+    busy = False
+
+    def stop(self, wait: float = 0.0) -> None:
+        pass
+
+
+class HeadlessApp:
+    """The agent-facing part of TTSApp (voices, exports, voice presets) without the tray,
+    hotkey, overlay or Settings window; what `--mcp-only` serves."""
+
+    _voices = TTSApp._voices
+    export_audio = TTSApp.export_audio
+    export_batch = TTSApp.export_batch
+    _export_yield = TTSApp._export_yield
+    cancel_export = TTSApp.cancel_export
+    _design_clip = TTSApp._design_clip
+    _save_voice = TTSApp._save_voice
+    _delete_voice = TTSApp._delete_voice
+    _save = TTSApp._save
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.enabled = True
+        self.engine = EngineHolder()
+        self.speaker = _NoSpeaker()
+        self._export_lock = threading.Lock()
+        self._export_cancel: threading.Event | None = None
+
+    def _voices_changed(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+    def speak(self, *args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("Speaking aloud is not available in headless (--mcp-only) mode; "
+                           "use synthesize_to_file or synthesize_batch")
+
+
+def run_mcp_only(cfg: Config, port: int | None = None) -> int:
+    """Serve the MCP tools without any UI until interrupted (Ctrl+C). MCP is forced on; the
+    configured [mcp] port is used unless `port` is given."""
+    from . import mcp_server
+
+    m = cfg.mcp
+    m.enabled = True
+    if port is not None:
+        if not 1024 <= port <= 65535:
+            print("error: --port must be between 1024 and 65535", file=sys.stderr)
+            return 2
+        m.port = port
+    try:
+        options = {k: list(v) for k, v in _omni().INSTRUCT_OPTIONS.items()}
+    except Exception:
+        log.debug("INSTRUCT_OPTIONS unavailable for the MCP schema", exc_info=True)
+        options = None
+    server = mcp_server.McpServer(
+        mcp_server.build_tools(AgentBridge(HeadlessApp(cfg)), int(m.max_chars), options),
+        int(m.port), version=__version__, instructions=mcp_server.INSTRUCTIONS)
+    try:
+        server.start()
+    except OSError as e:
+        print(f"error: port {m.port} is busy (is VibeTTS already running?): {e}", file=sys.stderr)
+        return 1
+    print(f"VibeTTS MCP server (headless) listening on {server.url}; Ctrl+C to stop", flush=True)
+    stop = threading.Event()
+    try:
+        while not stop.wait(0.5):
+            if not server.running:
+                return 1
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.stop()
+    return 0
 
 
 # ---------------------------------------------------------------- one-shot CLI
@@ -1294,7 +1494,16 @@ def main(argv: list[str] | None = None) -> int:
                         help="speak a document (.txt .md .html .docx .epub .pdf) and exit")
     parser.add_argument("--out", "--wav", dest="out", metavar="PATH",
                         help="with --say / --doc: write an audio file (.wav or .mp3) instead")
+    parser.add_argument("--mcp-only", action="store_true",
+                        help="headless: serve the MCP tools for agents (no tray, hotkey or UI; "
+                             "MCP is forced on) until Ctrl+C")
+    parser.add_argument("--port", type=int, metavar="N",
+                        help="with --mcp-only: MCP port (default: [mcp] port)")
     args = parser.parse_args(argv)
+    if args.port is not None and not args.mcp_only:
+        parser.error("--port needs --mcp-only")
+    if args.mcp_only and (args.say is not None or args.doc is not None):
+        parser.error("--mcp-only cannot be combined with --say or --doc")
     if args.say is not None and args.doc is not None:
         parser.error("use either --say or --doc")
     if args.out and args.say is None and args.doc is None:
@@ -1308,6 +1517,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         log_path = setup_logging(console=args.console)
         log.info("VibeTTS %s starting; log=%s", __version__, log_path)
+        if args.mcp_only:
+            return run_mcp_only(load_config(), args.port)
         if args.say is not None:
             return say(load_config(), args.say, args.out)
         if args.doc is not None:
