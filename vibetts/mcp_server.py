@@ -11,18 +11,20 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Protocol
 
+from .config import SUPERTONIC_LANGUAGES
+
 log = logging.getLogger(__name__)
 
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")  # newest first
 
 INSTRUCTIONS = (
-    "VibeTTS is a local text-to-speech app (Kokoro voices for English; OmniVoice, when installed, "
-    "for other languages such as Croatian). "
-    "Use synthesize_to_file to turn text or a document (.txt/.md/.html/.docx/.epub/.pdf) into a WAV or MP3 "
-    "file (24 kHz mono). Use speak to read text aloud on the user's speakers; use it sparingly because it is "
-    "audible to the user. Call list_voices first to get valid voice ids; create_voice designs a new "
-    "OmniVoice voice from a short description (delete_voice removes one); synthesize_batch writes many "
-    "short clips in one call. Use stop to interrupt playback or cancel a running export."
+    "VibeTTS is a local text-to-speech app: Kokoro (English) and Supertonic 3 (31 languages, when "
+    "installed). Use synthesize_to_file to turn text or a document (.txt/.md/.html/.docx/.epub/.pdf) into a "
+    "WAV or MP3 file (44.1 kHz mono). Use speak to read text aloud on the user's speakers; use it sparingly "
+    "because it is audible to the user. Call list_voices first to get valid voice ids and language codes; "
+    "pass 'lang' to read in a specific language (omitted: English text uses the English voice, anything "
+    "else the other-language voice). synthesize_batch writes many short clips in one call. Use stop to "
+    "interrupt playback or cancel a running export."
 )
 
 
@@ -42,16 +44,12 @@ class Tool:
 class AgentApi(Protocol):
     def list_voices(self) -> dict: ...
 
-    def speak(self, text: str, voice: str | None, speed: float | None, lang: str | None,
-              wait: bool, timeout: float) -> dict: ...
+    def speak(self, text: str, voice: str | None, speed: float | None, wait: bool,
+              timeout: float, lang: str | None = None) -> dict: ...
 
     def stop(self, cancel_export: bool) -> dict: ...
 
     def synthesize_to_file(self, args: dict) -> dict: ...
-
-    def create_voice(self, args: dict) -> dict: ...
-
-    def delete_voice(self, args: dict) -> dict: ...
 
     def synthesize_batch(self, args: dict) -> dict: ...
 
@@ -328,22 +326,13 @@ def _check_bool(args: dict, key: str, default: bool) -> bool:
     return v
 
 
-DEFAULT_VOICE_OPTIONS: dict[str, list[str]] = {
-    "gender": ["male", "female"],
-    "age": ["child", "teenager", "young adult", "middle-aged", "elderly"],
-    "pitch": ["very low pitch", "low pitch", "moderate pitch", "high pitch", "very high pitch"],
-    "style": ["whisper"],
-}
-MAX_SEED = 2**31 - 1
 MAX_BATCH_ITEMS = 500
 
 
-def build_tools(api: AgentApi, max_chars: int,
-                voice_options: dict[str, list[str]] | None = None) -> list[Tool]:
-    options = voice_options or DEFAULT_VOICE_OPTIONS
-    vocab = "; ".join(f"{k} ({', '.join(v)})" for k, v in options.items())
+def build_tools(api: AgentApi, max_chars: int) -> list[Tool]:
     def synthesize(args: dict) -> dict:
-        _check_unknown(args, {"text", "path", "output", "format", "voice", "speed", "lang", "overwrite"})
+        _check_unknown(args, {"text", "path", "output", "format", "voice", "lang", "speed",
+                              "overwrite"})
         has_text, has_path = args.get("text") is not None, args.get("path") is not None
         if has_text == has_path:
             raise ToolError("Provide exactly one of 'text' or 'path'")
@@ -353,9 +342,9 @@ def build_tools(api: AgentApi, max_chars: int,
             _opt_str(args, "path")
         _opt_str(args, "output")
         _opt_str(args, "voice")
+        _check_enum(args, "lang", SUPERTONIC_LANGUAGES)
         _check_speed(args)
         _check_enum(args, "format", ("wav", "mp3"))
-        _check_enum(args, "lang", ("en", "hr"))
         _check_bool(args, "overwrite", False)
         try:
             return api.synthesize_to_file(dict(args))
@@ -369,17 +358,17 @@ def build_tools(api: AgentApi, max_chars: int,
             raise
 
     def speak(args: dict) -> dict:
-        _check_unknown(args, {"text", "voice", "speed", "lang", "wait", "timeout_seconds"})
+        _check_unknown(args, {"text", "voice", "lang", "speed", "wait", "timeout_seconds"})
         text = _check_text(args.get("text"), max_chars)
         voice = _opt_str(args, "voice")
+        lang = _check_enum(args, "lang", SUPERTONIC_LANGUAGES)
         speed = _check_speed(args)
-        lang = _check_enum(args, "lang", ("en", "hr"))
         wait = _check_bool(args, "wait", False)
         timeout = args.get("timeout_seconds", 120)
         if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 < timeout <= 600:
             raise ToolError("'timeout_seconds' must be a number greater than 0 and at most 600")
         try:
-            return api.speak(text, voice, speed, lang, wait, float(timeout))
+            return api.speak(text, voice, speed, wait, float(timeout), lang=lang)
         except ToolError:
             raise
         except Exception as e:
@@ -389,45 +378,6 @@ def build_tools(api: AgentApi, max_chars: int,
 
     def list_voices(args: dict) -> dict:
         return api.list_voices()
-
-    def create_voice(args: dict) -> dict:
-        _check_unknown(args, {"name", "description", "seed", "lang", "overwrite"})
-        name = args.get("name")
-        if not isinstance(name, str) or not name.strip():
-            raise ToolError("'name' must be a non-empty string")
-        if len(name) > 64:
-            raise ToolError("'name' is too long (at most 64 characters)")
-        _opt_str(args, "description")
-        seed = args.get("seed")
-        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)
-                                 or not 0 <= seed <= MAX_SEED):
-            raise ToolError(f"'seed' must be an integer between 0 and {MAX_SEED}")
-        _check_enum(args, "lang", ("en", "hr"))
-        _check_bool(args, "overwrite", False)
-        try:
-            return api.create_voice(dict(args))
-        except ToolError:
-            raise
-        except Exception as e:
-            if type(e).__name__ == "ExportBusy" or isinstance(e, _PASSTHROUGH_ERRORS):
-                raise ToolError(str(e)) from e
-            raise
-
-    def delete_voice(args: dict) -> dict:
-        _check_unknown(args, {"name"})
-        name = args.get("name")
-        if not isinstance(name, str) or not name.strip():
-            raise ToolError("'name' must be a non-empty string")
-        if name.strip().lower() in ("default", "omni:default"):
-            raise ToolError("The 'default' voice cannot be deleted")
-        try:
-            return api.delete_voice(dict(args))
-        except ToolError:
-            raise
-        except Exception as e:
-            if isinstance(e, _PASSTHROUGH_ERRORS):
-                raise ToolError(str(e)) from e
-            raise
 
     def synthesize_batch(args: dict) -> dict:
         _check_unknown(args, {"items", "overwrite"})
@@ -443,6 +393,8 @@ def build_tools(api: AgentApi, max_chars: int,
             extra = sorted(set(it) - allowed)
             if extra:
                 raise ToolError(f"items[{i}]: unknown field(s): {', '.join(extra)}")
+            if it.get("lang") is not None and it["lang"] not in SUPERTONIC_LANGUAGES:
+                raise ToolError(f"items[{i}]: 'lang' must be one of: {', '.join(SUPERTONIC_LANGUAGES)}")
         _check_bool(args, "overwrite", False)
         try:
             return api.synthesize_batch(dict(args))
@@ -460,15 +412,15 @@ def build_tools(api: AgentApi, max_chars: int,
     def schema(props: dict, required: list[str] | None = None) -> dict:
         return {"type": "object", "properties": props, "required": required or [], "additionalProperties": False}
 
-    voice_p = {"type": "string", "description": "Voice id; call list_voices for valid values. Defaults to the app's current voice."}
+    voice_p = {"type": "string", "description": "Voice id: a Kokoro English voice (af_heart) or a Supertonic voice (supertonic:F1); call list_voices for valid values. Defaults to the voice of the language profile that matches the text."}
+    lang_p = {"type": "string", "enum": list(SUPERTONIC_LANGUAGES), "description": "Language of the text (ISO code, e.g. en, hr, de). Default: detected (English text uses the English voice, anything else the app's other-language voice). Kokoro voices read English only."}
     speed_p = {"type": "number", "minimum": 0.5, "maximum": 2, "description": "Speech speed multiplier, 0.5 to 2 (default 1)."}
-    lang_p = {"type": "string", "enum": ["en", "hr"], "description": "Language: 'en' (English) or 'hr' (Croatian). Defaults to the app's setting."}
     limit = f" At most {max_chars} characters." if max_chars > 0 else ""
 
     return [
         Tool(
             "synthesize_to_file",
-            "Convert text or a document to a speech audio file (24 kHz mono WAV or MP3) using local TTS. "
+            "Convert text or a document to a speech audio file (44.1 kHz mono WAV or MP3) using local TTS. "
             "Provide exactly one of 'text' or 'path'. Runs to completion and returns the output path, "
             "duration and size. Only one export can run at a time; long documents can take a while.",
             schema({
@@ -477,8 +429,8 @@ def build_tools(api: AgentApi, max_chars: int,
                 "output": {"type": "string", "description": "Absolute output path, or just a file name to save in the user's VibeTTS export folder; .wav or .mp3. Defaults to an auto-generated name in the export folder."},
                 "format": {"type": "string", "enum": ["wav", "mp3"], "description": "Audio format (default from the output extension, else wav)."},
                 "voice": voice_p,
-                "speed": speed_p,
                 "lang": lang_p,
+                "speed": speed_p,
                 "overwrite": {"type": "boolean", "default": False, "description": "Replace the output file if it already exists (default false)."},
             }),
             synthesize,
@@ -492,8 +444,8 @@ def build_tools(api: AgentApi, max_chars: int,
             schema({
                 "text": {"type": "string", "description": "Text to speak." + limit},
                 "voice": voice_p,
-                "speed": speed_p,
                 "lang": lang_p,
+                "speed": speed_p,
                 "wait": {"type": "boolean", "default": False, "description": "Return when speech has finished instead of when it starts (default false)."},
                 "timeout_seconds": {"type": "number", "default": 120, "maximum": 600, "description": "Maximum seconds to wait when wait=true (default 120, max 600)."},
             }, ["text"]),
@@ -502,38 +454,11 @@ def build_tools(api: AgentApi, max_chars: int,
         ),
         Tool(
             "list_voices",
-            "List the available voices (ids, languages) and the app's current defaults. Call this to get valid voice ids.",
+            "List the available voices (id, label, engine, languages), the language codes, the app's English and "
+            "other-language profiles, the language mode and whether Supertonic is installed. Call this to get valid voice ids.",
             schema({}),
             list_voices,
             {"title": "List voices", "readOnlyHint": True, "openWorldHint": False},
-        ),
-        Tool(
-            "create_voice",
-            "Design a new OmniVoice voice from a short description (gender, age, pitch, style) and save it "
-            "as a preset; then use its id with speak or synthesize_to_file. Needs OmniVoice installed "
-            "(see list_voices: omnivoice_installed). Takes about 5-10 seconds. With overwrite=true it "
-            "replaces an existing voice of the same name.",
-            schema({
-                "name": {"type": "string", "maxLength": 64, "description": "Name for the new voice (letters, digits, - and _; up to 32 characters; 'default' is reserved). The voice id becomes omni:<name>."},
-                "description": {"type": "string", "description": f"Comma-separated items, at most one per category: {vocab}. Empty = a random voice."},
-                "seed": {"type": "integer", "minimum": 0, "maximum": MAX_SEED, "description": "Picks which voice you get for the description; omit for a random one (returned in the result)."},
-                "lang": {"type": "string", "enum": ["en", "hr"], "default": "en", "description": "Language of the short sample clip the voice is made from (default en)."},
-                "overwrite": {"type": "boolean", "default": False, "description": "Replace an existing voice with the same name (default false)."},
-            }, ["name"]),
-            create_voice,
-            {"title": "Create a voice from a description", "readOnlyHint": False, "destructiveHint": False,
-             "idempotentHint": False, "openWorldHint": False},
-        ),
-        Tool(
-            "delete_voice",
-            "Delete an OmniVoice voice preset created with create_voice. The 'default' voice cannot "
-            "be deleted. Accepts the bare name or the omni:<name> id.",
-            schema({
-                "name": {"type": "string", "description": "Voice name or omni:<name> id."},
-            }, ["name"]),
-            delete_voice,
-            {"title": "Delete a voice", "readOnlyHint": False, "destructiveHint": True,
-             "idempotentHint": False, "openWorldHint": False},
         ),
         Tool(
             "synthesize_batch",

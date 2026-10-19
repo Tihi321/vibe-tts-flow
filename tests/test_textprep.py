@@ -1,4 +1,7 @@
-from vibetts.textprep import FIRST_CHUNK_CHARS, clean_text, looks_croatian, prepare, split_chunks
+import pytest
+
+from vibetts.textprep import (FIRST_CHUNK_CHARS, clean_text, looks_english, prepare,
+                              split_chunks)
 
 
 def test_markdown_cleanup():
@@ -81,51 +84,61 @@ def test_max_chars_and_empty():
     assert prepare("**") == []
 
 
-def test_url_word_follows_language():
-    text = "Vidi https://example.com/a za više."
-    assert "link" in clean_text(text) and "poveznica" not in clean_text(text)
-    assert "poveznica" in clean_text(text, True, "hr")
-    assert "poveznica" in prepare(text, lang="hr")[0].text
-    assert "link" in prepare(text)[0].text  # default stays English
+def test_url_is_read_as_link():
+    text = "See https://example.com/a for more."
+    assert clean_text(text) == "See link for more."
+    assert "link" in prepare(text)[0].text
 
 
-def test_looks_croatian_with_diacritics():
-    assert looks_croatian("Dobar dan, ovo je test čitanja na hrvatskom jeziku.")
-    assert looks_croatian("Žaba šuti đače")
+# ---------------------------------------------------------------- looks_english
+
+ENGLISH = [
+    "This is a simple test of the text to speech system, and it should be read in English.",
+    "I want to go to the store and buy some milk, but it is closed today.",
+    "It is what it is.",
+    "Please send the report to Željko Čović before the meeting tomorrow.",  # a Croatian name
+    "We met with Dr. Šimić and Mrs. Kovačević at the conference, and they were very kind.",
+    "The café near the station serves what you would expect from a naïve résumé.",
+    "Run the build script and check the output logs for errors.",
+    "Hello there",  # short: counts as English
+    "OK",
+    "",
+    "12345 67 89",
+    "Visit https://example.com/page for more information about the project.",
+]
+
+NOT_ENGLISH = {
+    "croatian": "Ovo je jednostavan test sustava za pretvaranje teksta u govor, čitat će na hrvatskom jeziku.",
+    "croatian no diacritics": "Ovo je jednostavan test sustava za pretvaranje teksta u govor koji cita hrvatski tekst.",
+    "croatian short": "Što radiš danas?",
+    "slovenian": "To je preprost preizkus sistema za pretvorbo besedila v govor, ki bere slovensko besedilo.",
+    "slovenian diacritics": "Danes je lep dan in šli bomo na sprehod v gozd, ker je toplo.",
+    "german": "Das ist ein einfacher Test des Systems, der den deutschen Text vorliest, weil es schön ist.",
+    "spanish": "Este es un sencillo test del sistema que lee el texto en español para todos los usuarios.",
+    "russian": "Это простой тест системы преобразования текста в речь на русском языке.",
+    "ukrainian": "Це простий тест системи перетворення тексту в мовлення українською мовою.",
+    "greek": "Αυτή είναι μια απλή δοκιμή του συστήματος που διαβάζει κείμενο.",
+    "hindi": "यह पाठ को वाक में बदलने वाली प्रणाली का एक सरल परीक्षण है।",
+    "japanese": "これはテキストを音声に変換するシステムの簡単なテストです。",
+    "russian short": "Привет, мир",
+}
 
 
-def test_looks_croatian_without_diacritics():
-    assert looks_croatian("Ovo je jednostavna recenica koja se cita na hrvatskom jeziku.")
-    assert looks_croatian("Nije sve tako crno kako izgleda, ali nema problema.")
+@pytest.mark.parametrize("text", ENGLISH)
+def test_looks_english(text):
+    assert looks_english(text) is True, text
 
 
-def test_looks_croatian_english_is_not():
-    assert not looks_croatian("This is a plain English sentence about nothing in particular.")
-    assert not looks_croatian("I think I am going to see you in the U.S. soon, so I will call.")
+@pytest.mark.parametrize("name", list(NOT_ENGLISH))
+def test_does_not_look_english(name):
+    assert looks_english(NOT_ENGLISH[name]) is False, name
 
 
-def test_looks_croatian_mixed_short_english():
-    assert not looks_croatian("Meet me at the Šimić cafe")  # one stray letter, English words
-    assert not looks_croatian("OK, I do")
-    assert not looks_croatian("Yes. I am.")
+def test_looks_english_mostly_foreign_script_with_english_name():
+    assert looks_english("Привет, Anna!") is False
+    assert looks_english("Reading the word привет is easy for the team.") is True  # one foreign word
 
 
-def test_looks_croatian_empty():
-    assert not looks_croatian("")
-    assert not looks_croatian("   \n ")
-    assert not looks_croatian("123 456 !!!")
-
-
-def test_long_chunks_merge_after_the_first():
-    text = "Dobar dan. " + " ".join(f"Ovo je kratka recenica broj {i}." for i in range(8))
-    en, hr = prepare(text), prepare(text, long_chunks=True)
-    assert hr[0].text == en[0].text  # the first chunk stays short: audio starts quickly
-    assert len(hr) < len(en)
-    assert all(len(c.text) <= 260 for c in hr)
-    assert " ".join(c.text for c in hr) == " ".join(c.text for c in en)
-
-
-def test_long_chunks_do_not_depend_on_language():
-    text = "Hello. " + " ".join(f"This is short sentence number {i}." for i in range(8))
-    assert len(prepare(text, long_chunks=True)) < len(prepare(text))
-    assert prepare(text, lang="hr") == prepare(text)  # language only picks the URL word
+def test_looks_english_ignores_markup_and_case():
+    assert looks_english("# THE TITLE\n\n- the first item and the second item") is True
+    assert looks_english("**Ovo** je _tekst_ koji je pisan na hrvatskom jeziku, bez engleskog.") is False

@@ -1,4 +1,4 @@
-"""Download the Kokoro model and voice files (also a CLI: python -m vibetts.model_setup)."""
+"""Download the Kokoro and Supertonic model files (also a CLI: python -m vibetts.model_setup)."""
 from __future__ import annotations
 
 import argparse
@@ -11,6 +11,7 @@ from typing import Callable
 import requests
 
 from vibetts.config import ROOT
+from vibetts.supertonic import MODEL_FILES, REPO, REVISION
 
 BASE_URL = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/"
 
@@ -21,6 +22,7 @@ MODELS: dict[str, tuple[str, int]] = {
 }
 VOICES: tuple[str, int] = ("voices-v1.0.bin", 28_214_398)
 DEFAULT_MODEL = "int8"
+SUPERTONIC_BASE_URL = f"https://huggingface.co/{REPO}/resolve/{REVISION}/"
 USER_AGENT = "vibetts-setup"
 _CHUNK = 256 * 1024
 
@@ -123,6 +125,60 @@ def download_named(name: str, dest_dir: Path, progress: ProgressFn | None = None
     return download(filename, dest_dir, progress, cancel, size)
 
 
+# ---------------------------------------------------------------- Supertonic
+
+def supertonic_files() -> tuple[tuple[str, int], ...]:
+    return MODEL_FILES
+
+
+def supertonic_missing(dest_dir: Path) -> list[str]:
+    """Relative paths of the Supertonic files that are not installed (or have the wrong size)."""
+    return [rel for rel, size in MODEL_FILES if not is_installed(Path(dest_dir) / rel, size)]
+
+
+def download_supertonic(dest_dir: Path, progress: ProgressFn | None = None,
+                        cancel: threading.Event | None = None) -> None:
+    """Fetch the missing Supertonic files; progress covers all of them together."""
+    dest_dir = Path(dest_dir)
+    missing = set(supertonic_missing(dest_dir))
+    todo = [(rel, size) for rel, size in MODEL_FILES if rel in missing]
+    total = sum(size for _, size in todo)
+    base = 0
+    if progress:
+        progress(0, total)
+    for rel, size in todo:
+        if cancel is not None and cancel.is_set():
+            raise DownloadCancelled()
+        offset = base
+
+        def part_progress(done: int, _total: int | None, offset: int = offset) -> None:
+            if progress:
+                progress(offset + done, total)
+
+        target = dest_dir / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        download(target.name, target.parent, part_progress, cancel, size,
+                 url=SUPERTONIC_BASE_URL + rel)
+        base += size
+
+
+def delete_supertonic(dest_dir: Path) -> None:
+    """Remove the Supertonic files and any subfolders left empty."""
+    dest_dir = Path(dest_dir)
+    for rel, _ in MODEL_FILES:
+        for path in (dest_dir / rel, (dest_dir / rel).with_name(Path(rel).name + ".part")):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+    for sub in sorted({(dest_dir / rel).parent for rel, _ in MODEL_FILES}, reverse=True):
+        if sub != dest_dir:
+            try:
+                sub.rmdir()
+            except OSError:
+                pass
+
+
 # ---------------------------------------------------------------- CLI
 
 def _cli_progress(label: str) -> ProgressFn:
@@ -140,10 +196,23 @@ def _cli_progress(label: str) -> ProgressFn:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m vibetts.model_setup",
-                                 description="Download the Kokoro model and voices.")
+                                 description="Download the Kokoro or Supertonic model files.")
     ap.add_argument("--model", default=DEFAULT_MODEL, choices=list(MODELS))
-    ap.add_argument("--dest", default=None, help="target folder (default: <app>/models)")
+    ap.add_argument("--supertonic", action="store_true",
+                    help="download the Supertonic 3 files instead of Kokoro")
+    ap.add_argument("--dest", default=None,
+                    help="target folder (default: <app>/models, or models/supertonic-3)")
     args = ap.parse_args(argv)
+    if args.supertonic:
+        dest = Path(args.dest) if args.dest else ROOT / "models" / "supertonic-3"
+        try:
+            print(f"supertonic-3: {len(supertonic_missing(dest))} file(s) to download...", flush=True)
+            download_supertonic(dest, _cli_progress("supertonic-3"))
+            print(f"  {dest}", flush=True)
+        except (SetupError, DownloadCancelled) as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        return 0
     dest = Path(args.dest) if args.dest else ROOT / "models"
     try:
         for name in (args.model, "voices"):

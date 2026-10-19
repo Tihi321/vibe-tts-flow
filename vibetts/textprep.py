@@ -12,11 +12,6 @@ FIRST_CHUNK_CHARS = 100   # split the first sentence at a comma when it is longe
 MAX_CHUNK_CHARS = 400     # split any sentence longer than this
 MERGE_BELOW_CHARS = 40    # glue very short sentences ("Hi.", "OK.") to the next one...
 MERGE_MAX_CHARS = 100     # ...as long as the result stays short
-# OmniVoice pays a fixed cost per chunk for the voice preset prefix (whatever the language), so
-# after the first chunk it gets longer chunks; otherwise short sentences synthesize slower than
-# they play and leave gaps.
-LONG_MERGE_BELOW_CHARS = 140
-LONG_MERGE_MAX_CHARS = 260
 
 _URL = re.compile(r"\b(?:https?://|www\.)[^\s<>()\[\]]+", re.IGNORECASE)
 _MD_IMAGE = re.compile(r"!\[([^\]]*)\]\([^)]*\)")
@@ -30,9 +25,6 @@ _EMPHASIS = re.compile(r"(\*\*|\*|~~)(?=\S)(.+?)(?<=\S)\1")
 _UNDERSCORE_EMPHASIS = re.compile(r"(?<!\w)(__|_)(?=\S)(.+?)(?<=\S)\1(?!\w)")  # not snake_case
 _TABLE_SEP = re.compile(r"^[ \t]*\|?[ \t]*:?-{3,}:?[ \t]*(\|[ \t]*:?-{3,}:?[ \t]*)*\|?[ \t]*\n?",
                         re.MULTILINE)  # also eats its newline: no paragraph break mid-table
-# word spoken in place of a web address, per language code
-URL_WORDS = {"en": "link", "hr": "poveznica"}
-
 _HTML_TAG = re.compile(r"</?[a-zA-Z][^>]*>")
 
 # sentence end: . ! ? … (plus closing quotes/brackets) followed by whitespace
@@ -41,7 +33,7 @@ _CLAUSE_END = re.compile(r"(?<=[,;:—–])\s+")
 _SPEAKABLE = re.compile(r"\w")
 
 
-def clean_text(text: str, markdown: bool = True, lang: str = "en") -> str:
+def clean_text(text: str, markdown: bool = True) -> str:
     """Normalise whitespace; with `markdown`, drop markup that sounds bad when spoken."""
     text = text.replace("\r\n", "\n").replace("\r", "\n").replace(" ", " ")
     text = text.replace("\t", " ")
@@ -49,7 +41,7 @@ def clean_text(text: str, markdown: bool = True, lang: str = "en") -> str:
         text = _FENCE.sub("", text)
         text = _MD_IMAGE.sub(r"\1", text)
         text = _MD_LINK.sub(r"\1", text)
-        text = _URL.sub(URL_WORDS.get(lang, "link"), text)
+        text = _URL.sub("link", text)
         text = _HTML_TAG.sub("", text)
         text = _TABLE_SEP.sub("", text)
         text = _RULE.sub("", text)
@@ -112,12 +104,8 @@ def _split_long(sentence: str, limit: int, words: bool = True) -> list[str]:
     return result
 
 
-def split_chunks(text: str, merge_below: int = MERGE_BELOW_CHARS,
-                 merge_max: int = MERGE_MAX_CHARS) -> list[Chunk]:
-    """Split cleaned text into speakable chunks (sentences; line breaks also end one).
-
-    merge_below / merge_max apply after the first chunk; the first one always uses the
-    short defaults so audio starts quickly."""
+def split_chunks(text: str) -> list[Chunk]:
+    """Split cleaned text into speakable chunks (sentences; line breaks also end one)."""
     chunks: list[Chunk] = []
     paragraphs = [p for p in text.split("\n\n") if p.strip()]
     for pi, para in enumerate(paragraphs):
@@ -128,10 +116,8 @@ def split_chunks(text: str, merge_below: int = MERGE_BELOW_CHARS,
             sentences.extend(s.strip() for s in _SENTENCE_END.split(line) if _SPEAKABLE.search(s))
         merged: list[str] = []
         for s in sentences:
-            first = not chunks and len(merged) == 1
-            below, cap = (MERGE_BELOW_CHARS, MERGE_MAX_CHARS) if first else \
-                (merge_below, merge_max)
-            if merged and len(merged[-1]) < below and len(merged[-1]) + 1 + len(s) <= cap:
+            if (merged and len(merged[-1]) < MERGE_BELOW_CHARS
+                    and len(merged[-1]) + 1 + len(s) <= MERGE_MAX_CHARS):
                 merged[-1] = f"{merged[-1]} {s}"
             else:
                 merged.append(s)
@@ -158,52 +144,62 @@ def split_chunks(text: str, merge_below: int = MERGE_BELOW_CHARS,
     return chunks
 
 
-def prepare(text: str, markdown: bool = True, max_chars: int = 0,
-            lang: str = "en", long_chunks: bool = False) -> list[Chunk]:
-    """Clean and split `text`. `lang` picks the word spoken for URLs; `long_chunks` (set for
-    OmniVoice requests, whatever the language) merges short sentences into longer chunks."""
-    text = clean_text(text, markdown, lang)
+def prepare(text: str, markdown: bool = True, max_chars: int = 0) -> list[Chunk]:
+    """Clean and split `text`."""
+    text = clean_text(text, markdown)
     if max_chars and len(text) > max_chars:
         cut = text.rfind(" ", 0, max_chars)
         text = text[: cut if cut > 0 else max_chars]
-    if long_chunks:
-        return split_chunks(text, LONG_MERGE_BELOW_CHARS, LONG_MERGE_MAX_CHARS)
     return split_chunks(text)
+
 
 
 # ---------------------------------------------------------------- language guess
 
-_CROATIAN_LETTERS = re.compile("[čćđšžČĆĐŠŽ]")
-_WORD = re.compile(r"[^\W\d_]+")
-# Common Croatian function words that are not also common English words. One-letter
-# words ("i", "u", "a") are left out on purpose: "I" is everywhere in English.
-_CROATIAN_WORDS = frozenset((
-    "je", "da", "se", "na", "što", "sto", "nije", "ali", "kako", "ovo", "ova", "ovaj",
-    "su", "će", "ce", "smo", "ste", "ima", "kao", "ili", "ne", "nisu", "jer",
-    "već", "vec", "samo", "još", "jos", "bio", "bila", "bilo", "mogu", "može", "moze",
-    "koji", "koja", "koje", "kojim", "ovdje", "sve", "svi", "za", "od", "iz", "ću",
-    "hvala", "molim", "dobar", "dobro", "ovom", "tom", "tko", "gdje", "kada",
-    "zato", "ako", "vas", "oni", "njih", "taj",
-))
-_CROATIAN_MIN_HITS = 2
-_CROATIAN_MIN_RATIO = 0.25
+# English function words that are rare in the other 30 Supertonic languages (no "a", "i", "to",
+# "on", "do", "so", "he", "me", "no", "as", "an", "in", "was": those are common words elsewhere)
+_EN_WORDS = frozenset("""
+the and of is are were been be it its for with at by this that these those from or but not
+have has had you your he she we they my his her our their would could should can what which who
+there here if then than very just about into when also because while where how why more some
+all any one only other over such will don't it's i'm that's can't isn't i've you're we're
+they're didn't doesn't won't there's what's let's
+""".split())
+_WORD = re.compile(r"[^\W\d_]+(?:['’][^\W\d_]+)?")
+EN_SHORT_WORDS = 4  # fewer words than this are too little to judge: counts as English
 
 
-def looks_croatian(text: str) -> bool:
-    """Cheap guess: Croatian diacritics, or enough common Croatian function words.
+def _letter_kind(ch: str) -> int:
+    """0 plain Latin (a-z), 1 Latin with a diacritic, 2 any other script."""
+    o = ord(ch)
+    if o < 0x80:
+        return 0
+    if 0xC0 <= o < 0x250 or 0x1E00 <= o < 0x1F00:
+        return 1
+    return 2
 
-    Meant for deciding which voice reads a selection; short or ambiguous text gives
-    False so the normal voice is kept."""
-    if not text or not text.strip():
+
+def looks_english(text: str) -> bool:
+    """Cheap guess whether `text` is English (anything else gets the other-language voice).
+
+    Not English: a good share of letters outside the Latin script (Cyrillic, Greek, Arabic,
+    Hindi, CJK ...), or Latin text with non-English diacritics (č ć đ š ž ä ö ü é ñ ...) and
+    few common English function words, or (without diacritics, so Croatian typed without
+    them, Spanish ...) a long enough text with almost none. Short or ambiguous text counts
+    as English, as does English text with a foreign name in it."""
+    letters = [c for c in text if c.isalpha()]
+    if not letters:
+        return True
+    kinds = [_letter_kind(c) for c in letters]
+    other_script, accented = kinds.count(2), kinds.count(1)
+    if other_script >= 2 and other_script / len(letters) > 0.25:
         return False
-    words = [w.lower() for w in _WORD.findall(text)]
-    if not words:
-        return False
-    hits = sum(1 for w in words if w in _CROATIAN_WORDS)
-    accented = sum(1 for w in words if _CROATIAN_LETTERS.search(w))
+    words = [w.lower().replace("’", "'") for w in _WORD.findall(text)]
+    if len(words) < EN_SHORT_WORDS:
+        return not (accented >= 2 and not any(w in _EN_WORDS for w in words))
+    ratio = sum(1 for w in words if w in _EN_WORDS) / len(words)
+    if ratio >= 0.25:
+        return True
     if accented:
-        # one name like "Šimić" in English text is not enough: need a Croatian function
-        # word next to it, or mostly accented words
-        if hits >= 1 or accented / len(words) >= 0.3:
-            return True
-    return hits >= _CROATIAN_MIN_HITS and hits / len(words) >= _CROATIAN_MIN_RATIO
+        return ratio >= 0.15
+    return len(words) < 6 or ratio >= 0.06

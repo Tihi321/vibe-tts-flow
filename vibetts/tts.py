@@ -1,4 +1,4 @@
-"""Kokoro speech engine and a streaming speaker.
+"""Kokoro speech engine and a streaming speaker (all audio is 44.1 kHz).
 
 The speaker generates one chunk ahead on a worker thread while the previous chunk
 plays, so audio starts after the first (short) chunk and never waits afterwards:
@@ -16,52 +16,41 @@ from typing import Any, Callable, Protocol
 
 import numpy as np
 
-from .config import is_omni_voice, normalize_omni_voice  # noqa: F401  (re-exported)
+from .config import SUPERTONIC_PREFIX, is_supertonic_voice
 from .textprep import Chunk
 
 log = logging.getLogger(__name__)
 
-SAMPLE_RATE = 24000
-BLOCK_FRAMES = 2400  # 100 ms: how quickly Stop takes effect
+SAMPLE_RATE = 44100   # every output: Supertonic natively, Kokoro resampled up from 24 kHz
+KOKORO_RATE = 24000
+BLOCK_FRAMES = 4410   # 100 ms: how quickly Stop takes effect
 
-# voice name prefix -> espeak language. Japanese (j) and Chinese (z) voices need extra
-# phonemizer packages that are not bundled, so they are not offered.
-VOICE_LANGS = {"a": "en-us", "b": "en-gb", "e": "es", "f": "fr-fr", "h": "hi", "i": "it",
-               "p": "pt-br"}
-LANG_LABELS = {"a": "American English", "b": "British English", "e": "Spanish",
-               "f": "French", "h": "Hindi", "i": "Italian", "p": "Portuguese (BR)"}
-
-
-# OmniVoice voices are "omni:<preset>" (legacy: "omni_hr:<preset>"); the engine itself lives in
-# vibetts.omnivoice (kept out of here so this module stays light to import).
-OMNI_LABEL = "OmniVoice"
-OMNI_LANG_NAMES = {"hr": "Croatian", "en": "English"}
+# Kokoro voice name prefix -> espeak language. Kokoro only reads English here (other
+# languages go to Supertonic), so only the American and British voices are offered.
+VOICE_LANGS = {"a": "en-us", "b": "en-gb"}
+LANG_LABELS = {"a": "American English", "b": "British English"}
 
 
 def voice_lang(voice: str) -> str:
     return VOICE_LANGS.get(voice[:1], "en-us")
 
 
-def voice_supported(voice: str) -> bool:
-    if is_omni_voice(voice):
-        head, sep, name = voice.partition(":")
-        if sep:
-            return bool(name) and head != "omni_"
-        return head == "omni" or len(head) > len("omni_")  # bare 'omni' / 'omni_hr'
+def kokoro_voice_supported(voice: str) -> bool:
     return len(voice) > 3 and voice[:1] in VOICE_LANGS and voice[2:3] == "_"
 
 
-def omni_preset(voice: str) -> str:
-    """'omni:alma' (or legacy 'omni_hr:alma') -> 'alma'; a bare 'omni' is the default preset."""
-    return voice.partition(":")[2] or "default"
+def voice_supported(voice: str) -> bool:
+    """A Kokoro English voice id (af_heart) or a Supertonic one (supertonic:F1)."""
+    return kokoro_voice_supported(voice) or is_supertonic_voice(voice)
 
 
 def voice_label(voice: str) -> str:
-    """'af_heart' -> 'Heart (American English, female)'; 'omni:ana_marija' -> 'Ana Marija (OmniVoice)'."""
-    if not voice_supported(voice):
+    """'af_heart' -> 'Heart (American English, female)'; 'supertonic:F1' -> 'F1 (Supertonic, female)'."""
+    if is_supertonic_voice(voice):
+        name = voice[len(SUPERTONIC_PREFIX):]
+        return f"{name} (Supertonic, {'female' if name[:1] == 'F' else 'male'})"
+    if not kokoro_voice_supported(voice):
         return voice
-    if is_omni_voice(voice):
-        return f"{omni_preset(voice).replace('_', ' ').title()} ({OMNI_LABEL})"
     gender = {"f": "female", "m": "male"}.get(voice[1:2], "")
     name = voice[3:].replace("_", " ").title()
     lang = LANG_LABELS.get(voice[:1], "")
@@ -87,15 +76,23 @@ class KokoroEngine:
         log.info("loaded %s in %.2fs", Path(model_path).name, time.perf_counter() - t0)
 
     def voices(self) -> list[str]:
-        return [v for v in self._kokoro.get_voices() if voice_supported(v)]
+        return [v for v in self._kokoro.get_voices() if kokoro_voice_supported(v)]
 
-    def synth(self, text: str, voice: str, speed: float,
-              lang: str | None = None) -> np.ndarray:
-        """`lang` is the request language for OmniVoice; Kokoro picks it from the voice."""
+    def synth(self, text: str, voice: str, speed: float, lang: str | None = None) -> np.ndarray:
+        """44.1 kHz mono audio (`lang` is ignored: Kokoro reads English here)."""
         with self._lock:
-            samples, _ = self._kokoro.create(text, voice=voice, speed=speed,
-                                             lang=voice_lang(voice))
-        return np.asarray(samples, dtype=np.float32)
+            samples, rate = self._kokoro.create(text, voice=voice, speed=speed,
+                                                lang=voice_lang(voice))
+        return resample(np.asarray(samples, dtype=np.float32), int(rate or KOKORO_RATE))
+
+
+def resample(samples: np.ndarray, rate: int, target: int = SAMPLE_RATE) -> np.ndarray:
+    """`samples` at `rate` Hz -> `target` Hz (soxr, high quality)."""
+    if rate == target or len(samples) == 0:
+        return samples.astype(np.float32, copy=False)
+    import soxr  # lazy: only Kokoro needs it
+
+    return np.asarray(soxr.resample(samples, rate, target, quality="HQ"), dtype=np.float32)
 
 
 # ---------------------------------------------------------------- audio output
@@ -169,11 +166,11 @@ class SpeakRequest:
                  volume: float = 1.0, device: str = "", lang: str | None = None):
         self.chunks = chunks
         self.voice = voice
+        self.lang = lang  # Supertonic language code (None = English); Kokoro ignores it
         self.speed = speed
         self.pause = pause
         self.volume = volume
         self.device = device
-        self.lang = lang  # "hr" / "en": language of the text, used by OmniVoice
         self.done = threading.Event()  # set once playback has ended (any way)
         self.error: str | None = None  # why it failed (valid once done is set)
         self.interrupted = False  # stopped / replaced before every chunk was played

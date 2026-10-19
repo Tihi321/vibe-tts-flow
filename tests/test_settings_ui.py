@@ -1,18 +1,18 @@
 import copy
-import re
 import tkinter as tk
 from pathlib import Path
 
 import pytest
 
-from vibetts import model_setup, settings_ui
-from vibetts.config import Config
+from vibetts import settings_ui
+from vibetts import model_setup
+from vibetts.config import (MP3_BITRATES, SUPERTONIC_LANGUAGE_NAMES, SUPERTONIC_LANGUAGES,
+                            SUPERTONIC_VOICES, Config)
 from vibetts.docload import Document, DocumentError
 from vibetts.export import (ExportBusy, ExportCancelled, ExportProgress, ExportRequest,
                             ExportResult)
-from vibetts.settings_ui import (ANY, ENCODERS_MISSING, SAME_VOICE, TABS, SettingsHooks,
-                                 SettingsWindow, VoiceCreator, build_instruct,
-                                 config_from_form, form_from_config, model_choice)
+from vibetts.settings_ui import (TABS, SettingsHooks, SettingsWindow, config_from_form,
+                                 form_from_config, model_choice)
 
 
 def test_round_trip_default():
@@ -58,8 +58,12 @@ def test_voice_display_string_parsed():
 @pytest.mark.parametrize("key,value", [
     ("hotkey_read", "ctrl+bogus"), ("speed", "3"), ("speed", "0.1"), ("volume", "1.5"),
     ("sentence_pause", "-1"), ("copy_timeout_ms", "10"), ("max_chars", "-1"),
-    ("pill_position", "left"), ("voice", ""), ("model", "bogus"), ("engine", "bogus"),
-    ("omnivoice_steps", "3"), ("omnivoice_steps", "17"), ("omnivoice_steps", "x"),
+    ("pill_position", "left"), ("voice", ""), ("model", "bogus"),
+    ("voice", "supertonic:F1"), ("english_engine", "piper"),
+    ("english_supertonic_voice", "F9"), ("other_voice", "Z1"),
+    ("other_language", "en"), ("other_language", "Klingon"), ("other_language", ""),
+    ("language_mode", "always"), ("supertonic_steps", "3"), ("supertonic_steps", "17"),
+    ("supertonic_steps", "x"),
 ])
 def test_invalid_values(key, value):
     form = form_from_config(Config())
@@ -68,164 +72,78 @@ def test_invalid_values(key, value):
         config_from_form(Config(), form)
 
 
-def test_omnivoice_fields_round_trip():
+def test_supertonic_keys_round_trip():
     cfg = Config()
-    cfg.speech.engine = "omnivoice"
-    cfg.speech.omnivoice_steps = 12
-    cfg.speech.omni_voice = "omni:alma"
-    cfg.speech.croatian_voice = "omni:zora"
-    cfg.speech.auto_language = False
-    assert config_from_form(cfg, form_from_config(cfg)) == cfg
+    form = form_from_config(cfg)
+    assert (form["english_engine"], form["english_supertonic_voice"], form["other_language"],
+            form["other_voice"], form["language_mode"], form["supertonic_steps"]) == (
+        "kokoro", "F1", "hr", "F1", "auto", "8")
+    cfg.speech.english_engine = "supertonic"
+    cfg.speech.english_supertonic_voice = "M3"
+    cfg.speech.other_language = "de"
+    cfg.speech.other_voice = "F5"
+    cfg.speech.language_mode = "other"
+    cfg.speech.supertonic_steps = 12
+    assert config_from_form(Config(), form_from_config(cfg)) == cfg
 
 
-def test_voice_display_strings_parsed():
+def test_supertonic_form_accepts_names_and_prefixed_voices():
     form = form_from_config(Config())
-    form["omni_voice"] = "omni:alma  Alma (OmniVoice)"
-    form["croatian_voice"] = "omni_hr:zora  Zora (OmniVoice)"  # legacy id is normalised
-    form["omnivoice_steps"] = "16"
-    cfg = config_from_form(Config(), form)
-    assert cfg.speech.omni_voice == "omni:alma"
-    assert cfg.speech.croatian_voice == "omni:zora"
-    assert cfg.speech.omnivoice_steps == 16
+    form.update(other_language="German", other_voice="supertonic:M2  M2 (Supertonic, male)",
+                english_supertonic_voice="supertonic:F4")
+    s = config_from_form(Config(), form).speech
+    assert (s.other_language, s.other_voice, s.english_supertonic_voice) == ("de", "M2", "F4")
 
 
-def test_croatian_same_as_omni_voice_is_empty():
-    form = form_from_config(Config())
-    form["croatian_voice"] = SAME_VOICE
-    assert config_from_form(Config(), form).speech.croatian_voice == ""
-    form["croatian_voice"] = ""
-    assert config_from_form(Config(), form).speech.croatian_voice == ""
-    form["omni_voice"] = ""  # nothing picked: the default preset
-    assert config_from_form(Config(), form).speech.omni_voice == "omni:default"
-
-
-# ---------------------------------------------------------------- voice creator
-
-OPTIONS = {
-    "gender": ["male", "female"],
-    "age": ["child", "teenager", "young adult", "middle-aged", "elderly"],
-    "pitch": ["very low pitch", "low pitch", "moderate pitch", "high pitch", "very high pitch"],
-    "style": ["whisper"],
-}
-
-
-class FakeOmni:
-    INSTRUCT_OPTIONS = OPTIONS
-
-    @staticmethod
-    def sanitize_name(s):
-        name = re.sub(r"[^a-z0-9_-]+", "_", s.strip().lower())[:32].strip("_")
-        if not name:
-            raise ValueError("Name needs letters or digits")
-        if name == "default":
-            raise ValueError("the name default is reserved")
-        return name
-
-
-INFO = {"default": {"name": "default", "voice": "omni:default", "kind": "default",
-                    "description": "", "lang": "hr"},
-        "alma": {"name": "alma", "voice": "omni:alma", "kind": "description",
-                 "description": "female, young adult", "lang": "en"}}
-
-
-class FakeInstaller:
-    """Stand-in for the omnivoice_setup behind the install hooks."""
-
-    def __init__(self, rec):
-        self.rec = rec
-        self.error = None
-        self.cancel_after = None
-        self.progress_calls = []
-
-    def install(self, include_encoders, progress, cancel):
-        self.rec.calls.append(("install", include_encoders))
-        progress("Downloading model.safetensors 1.2 / 2.4 GB", 1_200_000_000, 2_400_000_000)
-        progress("Converting 120 / 197", 120, 197)
-        if self.cancel_after:
-            cancel.set()
-            raise model_setup.DownloadCancelled()
-        if self.error:
-            raise self.error
-        self.rec.installed = True
-        self.rec.encoders = bool(include_encoders)
-
-    def uninstall(self):
-        self.rec.calls.append("uninstall")
-        self.rec.installed = False
-        self.rec.encoders = False
-        if self.rec.config.speech.engine == "omnivoice":
-            self.rec.config.speech.engine = "kokoro"
+def test_invalid_messages_are_readable():
+    for key, value, text in (("supertonic_steps", "3", "Quality steps must be at least 4"),
+                             ("supertonic_steps", "17", "Quality steps must be at most 16"),
+                             ("english_engine", "x", "English engine must be one of"),
+                             ("other_voice", "Z1", "Other language voice must be one of"),
+                             ("language_mode", "x", "Language must be one of")):
+        form = form_from_config(Config())
+        form[key] = value
+        with pytest.raises(ValueError, match=text):
+            config_from_form(Config(), form)
 
 
 class Recorder:
     def __init__(self):
-        self.calls, self.saved, self.deleted, self.played, self.applied = [], [], [], [], []
-        self.presets = ["default", "alma"]
-        self.installed = True
-        self.encoders = True
-        self.error = None
+        self.calls, self.applied = [], []
         self.config = Config()
-        self.installer = FakeInstaller(self)
         self.mp3 = True
         self.mcp = {"enabled": False, "running": False, "url": "", "error": ""}
         self.doc = Document("Hello there.", True, "notes")
         self.exports, self.export_error = [], None
+        self.st_dir = Path("st-models")
+        self.st_present = False
+        self.st_changed = 0
+        self.voice_list = ["af_heart", "bf_emma"]
 
     def hooks(self):
-        def design(instruct, seed, text=None, lang=None):
-            if self.error:
-                raise self.error
-            self.calls.append(("design", instruct, seed, text, lang))
-            return {"clip": "d", "instruct": instruct}
-
-        def clone(wav, text):
-            self.calls.append(("clone", wav, text))
-            return {"clip": "c"}
-
-        def save(name, clip, overwrite=False):
-            self.saved.append((name, clip))
-            self.presets.append(name)
-            return f"omni:{name}"
-
         def apply(cfg):
-            self.applied.append((cfg.speech.omni_voice, cfg.speech.croatian_voice))
+            self.applied.append(cfg)
             self.config = copy.deepcopy(cfg)
             return None
-
-        def delete(name):
-            self.deleted.append(name)
-            self.presets.remove(name)
-            sp = self.config.speech
-            if sp.omni_voice == f"omni:{name}":
-                sp.omni_voice = "omni:default"
-            if sp.croatian_voice == f"omni:{name}":
-                sp.croatian_voice = ""
 
         return SettingsHooks(
             get_config=lambda: copy.deepcopy(self.config), apply=apply,
             is_autostart=lambda: False, set_autostart=lambda v: None,
             set_show_on_start=lambda v: None, models_dir=lambda: Path("."),
-            voices=lambda: ["af_heart", "bf_emma"] + [f"omni:{n}" for n in self.presets],
+            voices=lambda: list(self.voice_list),
             output_devices=lambda: [], play_test=lambda c, t: None,
             stop=lambda: self.calls.append("stop"), open_logs=lambda: None,
             open_config=lambda: None, version="t",
-            omni_present=lambda: self.installed,
-            omni_voices=lambda: [f"omni:{n}" for n in self.presets] if self.installed else [],
-            omni_voice_info=lambda: [INFO.get(n, {"name": n, "kind": "random", "lang": "",
-                                                  "description": ""}) for n in self.presets],
-            omni_status=lambda: {"installed": self.installed, "encoders": self.encoders,
-                                 "bytes_on_disk": 1_300_000_000 if self.installed else 0},
-            omni_download_bytes=lambda inc: 2_900_000_000 + (654_000_000 if inc else 0),
-            omni_install=self.installer.install, omni_uninstall=self.installer.uninstall,
-            play_preset=lambda name: self.played.append(("preset", name)),
-            design_clip=design, clone_clip=clone, save_voice=save, delete_voice=delete,
-            play_clip=lambda clip: self.played.append(clip),
-            encoders_present=lambda: self.encoders,
             load_document=self._load_document, export_audio=self._export_audio,
             cancel_export=lambda: self.calls.append("cancel_export"),
             mp3_available=lambda: self.mp3,
             mcp_status=lambda: dict(self.mcp),
-            open_folder=lambda p: self.calls.append(("open_folder", p)))
+            open_folder=lambda p: self.calls.append(("open_folder", p)),
+            supertonic_dir=lambda: self.st_dir, supertonic_present=lambda: self.st_present,
+            supertonic_changed=self._st_changed)
+
+    def _st_changed(self):
+        self.st_changed += 1
 
     def _load_document(self, path):
         self.calls.append(("load", path))
@@ -240,7 +158,7 @@ class Recorder:
         if self.export_error:
             raise self.export_error
         return ExportResult(path=req.out, fmt="mp3", seconds=192.0, chunks=10, bytes=1,
-                            voice="af_heart", lang="en")
+                            voice="af_heart", lang=req.lang)
 
 
 @pytest.fixture(scope="module")
@@ -256,17 +174,10 @@ def _shared_root():
 
 
 @pytest.fixture
-def tk_root(_shared_root, monkeypatch):
-    monkeypatch.setattr(settings_ui, "_omni", lambda: FakeOmni)
+def tk_root(_shared_root):
     yield _shared_root
     for child in _shared_root.winfo_children():
         child.destroy()
-
-
-def make_creator(root, rec, on_saved=None, spawn=lambda fn: fn()):
-    c = VoiceCreator(root, rec.hooks(), lambda fn: fn(), on_saved or (lambda v, u: None), spawn)
-    c.pack()
-    return c
 
 
 def make_window(root, rec, spawn=lambda fn: fn()):
@@ -278,388 +189,283 @@ def make_window(root, rec, spawn=lambda fn: fn()):
     return win
 
 
-def test_build_instruct():
-    assert build_instruct({}, OPTIONS) == ""
-    assert build_instruct({k: ANY for k in OPTIONS}, OPTIONS) == ""
-    sel = {"pitch": "low pitch", "gender": "female", "age": "young adult", "style": ANY}
-    assert build_instruct(sel, OPTIONS) == "female, young adult, low pitch"  # option order
-    assert build_instruct({"style": "whisper"}, OPTIONS) == "whisper"
-
-
-def test_instruct_options_fallback(monkeypatch):
-    monkeypatch.setattr(settings_ui, "_omni", lambda: object())  # no INSTRUCT_OPTIONS yet
-    assert list(settings_ui.instruct_options()) == ["gender", "age", "pitch", "style"]
-
-
-def test_creator_assembles_instruct_and_language(tk_root):
-    rec = Recorder()
-    d = make_creator(tk_root, rec)
-    assert all(v.get() == ANY for v in d.option_vars.values())
-    assert list(d.option_combos["gender"].cget("values"))[0] == ANY
-    assert d.lang_var.get() == "Croatian"  # default sample language
-    d.generate()  # all (any): plain random voice
-    assert rec.calls[-1] == ("design", "", 0, None, "hr")
-    d.option_vars["gender"].set("female")
-    d.option_vars["age"].set("young adult")
-    d.option_vars["pitch"].set("low pitch")
-    d.seed_var.set("42")
-    d.lang_var.set("English")
-    d.generate()
-    assert rec.calls[-1] == ("design", "female, young adult, low pitch", 42, None, "en")
-    assert d.button_state("play_design") == "normal" and d.button_state("save_design") == "normal"
-
-
-def test_try_another_picks_new_seed_and_generates(tk_root, monkeypatch):
-    rec = Recorder()
-    monkeypatch.setattr(settings_ui.random, "randint", lambda a, b: 777)
-    d = make_creator(tk_root, rec)
-    d.try_another()
-    assert d.seed_var.get() == "777" and rec.calls[-1][2] == 777
-
-
-def test_creator_busy_state_and_inline_errors(tk_root):
-    rec = Recorder()
-    pending = []
-    d = make_creator(tk_root, rec, spawn=pending.append)
-    d.generate()
-    assert "Generating" in d.message.cget("text")
-    assert d.button_state("generate") == "disabled" and d.button_state("try") == "disabled"
-    pending.pop()()  # worker finishes
-    assert d.button_state("generate") == "normal" and d.button_state("save_design") == "normal"
-    rec.error = ValueError("unknown item 'femle'; did you mean 'female'?")
-    d.generate()
-    pending.pop()()
-    assert "did you mean" in d.message.cget("text")
-    assert d.button_state("save_design") == "disabled"  # failed generation clears the clip
-
-
-def test_save_validates_sanitizes_and_resets(tk_root):
-    rec = Recorder()
-    saved = []
-    d = make_creator(tk_root, rec, on_saved=lambda v, u: saved.append((v, u)))
-    d.generate()
-    assert d.save() is False and "Enter a name" in d.message.cget("text")
-    d.name_var.set("default")
-    assert d.save() is False and "reserved" in d.message.cget("text")
-    d.name_var.set("Ana Maria!")
-    assert d.save() is False  # shows the cleaned name first
-    assert d.name_var.get() == "ana_maria" and "ana_maria" in d.message.cget("text")
-    assert rec.saved == []
-    assert d.save() is True
-    assert rec.saved == [("ana_maria", {"clip": "d", "instruct": ""})]
-    assert saved == [("omni:ana_maria", True)]  # "Use as OmniVoice voice" defaults on
-    assert d.name_var.get() == "" and d.button_state("save_design") == "disabled"  # reusable
-
-
-def test_save_existing_name_needs_replace_confirmation(tk_root, monkeypatch):
-    rec = Recorder()
-    answers = iter([False, True])
-    monkeypatch.setattr(settings_ui.messagebox, "askyesno", lambda *a, **k: next(answers))
-    d = make_creator(tk_root, rec)
-    d.generate()
-    d.name_var.set("alma")
-    d.use_var.set(False)
-    assert d.save() is False and rec.saved == []
-    assert d.save() is True and rec.saved[0][0] == "alma"
-
-
-def test_clone_tab_requires_wav_and_transcript(tk_root):
-    rec = Recorder()
-    d = make_creator(tk_root, rec)
-    assert d.button_state("create") == "normal"
-    d.create()
-    assert "WAV" in d.message.cget("text")
-    d.wav_var.set("C:/x/me.wav")
-    d.create()
-    assert "transcript" in d.message.cget("text").lower() and rec.calls == []
-    d.transcript.insert("1.0", "Dobar dan svima.")
-    d.create()
-    assert rec.calls[-1] == ("clone", Path("C:/x/me.wav"), "Dobar dan svima.")
-    assert d.button_state("save_clone") == "normal"
-
-
-def test_encoders_missing_disables_cloning(tk_root):
-    rec = Recorder()
-    rec.encoders = False
-    d = make_creator(tk_root, rec)
-    assert d.encoders_label.cget("text") == ENCODERS_MISSING
-    assert d.button_state("create") == "disabled"
-    d.wav_var.set("x.wav")
-    d.transcript.insert("1.0", "tekst")
-    d.create()
-    assert rec.calls == []
-    d.set_availability(True, True)  # cloning got installed
-    assert d.button_state("create") == "normal" and d.encoders_label.cget("text") == ""
-
-
-def test_creator_disabled_until_installed(tk_root):
-    rec = Recorder()
-    d = make_creator(tk_root, rec)
-    d.set_availability(False, False)
-    assert d.button_state("generate") == "disabled" and d.button_state("try") == "disabled"
-    d.generate()
-    assert rec.calls == []
-    d.set_availability(True, True)
-    assert d.button_state("generate") == "normal"
-
-
-def test_play_goes_through_hook(tk_root):
-    rec = Recorder()
-    d = make_creator(tk_root, rec)
-    d.play("design")
-    assert rec.played == []  # nothing generated yet
-    d.generate()
-    d.play("design")
-    assert rec.played == [{"clip": "d", "instruct": ""}]
-
-
 # ---------------------------------------------------------------- settings window
 
 def state(widget):
     return str(widget.cget("state"))
 
 
-def test_tabs_and_engine_radio(tk_root):
-    assert TABS == ("general", "voice", "export", "kokoro", "omnivoice", "mcp", "about")
-    rec = Recorder()
-    win = make_window(tk_root, rec)
+def test_tabs(tk_root):
+    assert TABS == ("general", "voice", "export", "kokoro", "supertonic", "mcp", "about")
+    win = make_window(tk_root, Recorder())
     assert [win._nb.tab(i, "text") for i in range(len(TABS))] == [
-        "General", "Voice", "Export", "Kokoro", "OmniVoice", "Agents (MCP)", "About"]
-    assert win._vars["engine"].get() == "kokoro"
-    assert state(win._engine_radios["omnivoice"]) == "normal"
-    assert win._engine_hint.cget("text") == ""
-    # the voice combo follows the engine
-    assert win._kokoro_row.winfo_manager() == "pack"
-    assert win._omni_row.winfo_manager() == ""
-    win._vars["engine"].set("omnivoice")
-    assert win._omni_row.winfo_manager() == "pack" and win._kokoro_row.winfo_manager() == ""
-    assert win._collect()["engine"] == "omnivoice"
+        "General", "Voice", "Export", "Kokoro", "Supertonic", "Agents (MCP)", "About"]
 
 
-def test_engine_radio_disabled_until_installed(tk_root):
-    rec = Recorder()
-    rec.installed, rec.encoders = False, False
-    rec.presets = []
-    win = make_window(tk_root, rec)
-    assert state(win._engine_radios["omnivoice"]) == "disabled"
-    assert "OmniVoice tab" in win._engine_hint.cget("text")
-    assert state(win._engine_radios["kokoro"]) == "normal"
-    assert "not installed" in win._omni_status.cget("text").lower()
-    assert state(win._omni_install_btn) == "normal"
-    assert state(win._omni_uninstall_btn) == "disabled"
-    assert all(state(b) == "disabled" for b in win._voice_btns.values())
-    assert win._creator.button_state("generate") == "disabled"
-
-
-def test_kokoro_and_omni_voice_combos(tk_root):
-    rec = Recorder()
-    win = make_window(tk_root, rec)
-    kokoro = list(win._voice_combo.cget("values"))
-    omni = list(win._omni_voice_combo.cget("values"))
-    assert all(v.startswith(("af_", "bf_")) for v in kokoro)
-    assert [v.split(" ")[0] for v in omni] == ["omni:default", "omni:alma"]
-    croatian = list(win._croatian_combo.cget("values"))
-    assert croatian[0] == SAME_VOICE and len(croatian) == 3
-    assert win._vars["croatian_voice"].get() == SAME_VOICE
-    assert win._collect()["croatian_voice"] == ""
-    assert win._collect()["omni_voice"] == "omni:default"
+def test_voice_combo(tk_root):
+    win = make_window(tk_root, Recorder())
+    values = list(win._voice_combo.cget("values"))
+    assert [v.split(" ")[0] for v in values] == ["af_heart", "bf_emma"]
+    assert win._vars["voice"].get().startswith("af_heart  Heart")
+    assert win._collect()["voice"] == "af_heart"
     assert not win._is_dirty()
 
 
-def test_voices_tree_rows_and_buttons(tk_root, monkeypatch):
+def test_voice_combos_per_engine(tk_root):
+    rec = Recorder()
+    rec.voice_list = ["af_heart", "supertonic:F1", "bf_emma", "supertonic:M1"]
+    win = make_window(tk_root, rec)
+    # Kokoro combo lists only the Kokoro English voices
+    assert [v.split(" ")[0] for v in win._voice_combo.cget("values")] == ["af_heart", "bf_emma"]
+    assert list(win._en_st_combo.cget("values")) == list(SUPERTONIC_VOICES)
+    assert win._voice_combo.winfo_manager() == "grid"
+    assert win._en_st_combo.winfo_manager() == ""
+    win._vars["english_engine"].set("supertonic")
+    assert win._en_st_combo.winfo_manager() == "grid"
+    assert win._voice_combo.winfo_manager() == ""
+    assert list(win._other_voice_combo.cget("values")) == list(SUPERTONIC_VOICES)
+    assert list(win._other_combo.cget("values")) == sorted(
+        n for c, n in SUPERTONIC_LANGUAGE_NAMES.items() if c != "en")
+    assert len(win._other_combo.cget("values")) == 30
+
+
+def test_language_combo_labels_and_mapping(tk_root):
     rec = Recorder()
     win = make_window(tk_root, rec)
-    tree = win._voices_tree
-    assert list(tree.get_children()) == ["default", "alma"]
-    assert tree.item("alma", "values") == ("alma", "description", "female, young adult",
-                                            "English")
-    assert tree.item("default", "values")[1] == "default"
-    assert all(state(b) == "disabled" for b in win._voice_btns.values())  # no selection
-    tree.selection_set("default")
-    win._update_voice_buttons()
-    assert state(win._voice_btns["play"]) == "normal"
-    assert state(win._voice_btns["delete"]) == "disabled"  # 'default' stays
-    tree.selection_set("alma")
-    win._update_voice_buttons()
-    assert state(win._voice_btns["delete"]) == "normal"
-    win._play_voice()
-    assert rec.played == [("preset", "alma")]
-    win._use_selected()  # persisted straight away
-    assert rec.applied[-1] == ("omni:alma", "")
-    assert win._vars["omni_voice"].get().startswith("omni:alma")
-    win._use_selected_croatian()
-    assert rec.applied[-1] == ("omni:alma", "omni:alma")
-    assert win._vars["croatian_voice"].get().startswith("omni:alma")
+    assert win._vars["other_language"].get() == "Croatian"
+    assert list(win._language_combo.cget("values")) == [
+        "Auto (detect English)", "Always English", "Always Croatian"]
+    assert win._vars["language_mode"].get() == "Auto (detect English)"
+    win._vars["language_mode"].set("Always English")
+    assert win._collect()["language_mode"] == "english"
+    win._vars["language_mode"].set("Always Croatian")
+    assert win._collect()["language_mode"] == "other"
+    # the third label follows the other language, and the selected mode stays "other"
+    win._vars["other_language"].set("German")
+    assert list(win._language_combo.cget("values"))[2] == "Always German"
+    assert win._vars["language_mode"].get() == "Always German"
+    assert win._collect()["language_mode"] == "other" and win._collect()["other_language"] == "de"
+    assert win.save() is True
+    sp = rec.applied[-1].speech
+    assert (sp.language_mode, sp.other_language) == ("other", "de")
+    win._vars["language_mode"].set("Auto (detect English)")
+    win._vars["other_language"].set("French")
+    assert win._vars["language_mode"].get() == "Auto (detect English)"
+
+
+def test_new_keys_save_and_dirty(tk_root):
+    rec = Recorder()
+    win = make_window(tk_root, rec)
     assert not win._is_dirty()
-    monkeypatch.setattr(settings_ui.messagebox, "askyesno", lambda *a, **k: True)
-    win._delete_voice()
-    assert rec.deleted == ["alma"]
-    assert "alma" not in tree.get_children()
-    assert win._vars["omni_voice"].get().startswith("omni:default")  # fell back
-    assert win._vars["croatian_voice"].get() == SAME_VOICE
+    win._vars["english_engine"].set("supertonic")
+    assert win._is_dirty()
+    win._vars["english_supertonic_voice"].set("M4")
+    win._vars["other_voice"].set("F3")
+    win._vars["supertonic_steps"].set("12")
+    assert win.save() is True
+    sp = rec.config.speech
+    assert (sp.english_engine, sp.english_supertonic_voice, sp.other_voice,
+            sp.supertonic_steps) == ("supertonic", "M4", "F3", 12)
+    assert not win._is_dirty()
 
 
-def test_creator_save_uses_voice_and_refreshes_list(tk_root):
+def test_supertonic_hint_follows_presence(tk_root):
     rec = Recorder()
     win = make_window(tk_root, rec)
-    c = win._creator
-    c.generate()
-    c.name_var.set("zora")
-    assert c.save() is True
-    assert rec.applied[-1] == ("omni:zora", "")  # "use" persists through apply()
-    assert "zora" in win._voices_tree.get_children()
-    assert win._vars["omni_voice"].get().startswith("omni:zora")
-
-
-def test_install_flow_with_fake_installer(tk_root):
-    rec = Recorder()
-    rec.installed, rec.encoders, rec.presets = False, False, []
-    pending = []
-    win = make_window(tk_root, rec, spawn=pending.append)
-    assert "3.6 GB" in win._omni_install_btn.cget("text")
-    win._omni_cloning.set(False)
-    win._update_omni_buttons()
-    assert "2.9 GB" in win._omni_install_btn.cget("text")
-    win._omni_install()
-    assert state(win._omni_install_btn) == "disabled" and state(win._omni_cancel_btn) == "normal"
-    assert state(win._omni_uninstall_btn) == "disabled"
-    pending.pop()()  # the worker runs the fake installer
-    assert rec.calls[-1] == ("install", False)
-    assert state(win._omni_cancel_btn) == "disabled"
-    assert win._omni_status.cget("text").startswith("OmniVoice is installed")
-    assert state(win._engine_radios["omnivoice"]) == "normal"
-    assert state(win._omni_uninstall_btn) == "normal"
-    assert win._omni_install_btn.cget("text").startswith("Add voice cloning")  # encoders missing
-    assert win._creator.button_state("create") == "disabled"
-    rec.presets = ["default"]
+    assert "Supertonic tab" in win._supertonic_hint.cget("text")
+    # the Supertonic choices stay selectable
+    assert state(win._en_st_combo) == "readonly" and state(win._other_combo) == "readonly"
+    rec.st_present = True
     win.refresh()
-    assert list(win._voices_tree.get_children()) == ["default"]
+    assert win._supertonic_hint.cget("text") == ""
 
 
-def test_install_reports_progress_phases(tk_root):
+def test_refresh_follows_new_keys_unless_edited(tk_root):
     rec = Recorder()
-    rec.installed, rec.encoders, rec.presets = False, False, []
-    phases, bars = [], []
-    win = make_window(tk_root, rec, spawn=lambda fn: fn())
-    real = win._omni_phase.configure
-
-    def spy(**kw):
-        if "text" in kw:
-            phases.append(kw["text"])
-        real(**kw)
-    win._omni_phase.configure = spy
-    real_bar = win._omni_progress.configure
-    win._omni_progress.configure = lambda **kw: (bars.append(kw.get("value")), real_bar(**kw))
-    win._omni_install()
-    assert "Downloading model.safetensors 1.2 / 2.4 GB" in phases
-    assert "Converting 120 / 197" in phases
-    assert any(b and abs(b - 50.0) < 0.1 for b in bars)  # 1.2 / 2.4 GB
-
-
-def test_install_cancel(tk_root, monkeypatch):
-    rec = Recorder()
-    rec.installed, rec.encoders, rec.presets = False, False, []
-    rec.installer.cancel_after = True
-    errors = []
-    monkeypatch.setattr(settings_ui.messagebox, "showerror", lambda *a, **k: errors.append(a))
     win = make_window(tk_root, rec)
-    win._omni_install()
-    assert errors == []  # a cancel is not an error
-    assert "cancelled" in win._omni_phase.cget("text").lower()
-    assert state(win._omni_install_btn) == "normal" and not win._omni_busy
-    assert not rec.installed
-
-
-def test_install_error_is_shown_and_ui_recovers(tk_root, monkeypatch):
-    rec = Recorder()
-    rec.installed, rec.encoders, rec.presets = False, False, []
-    rec.installer.error = model_setup.SetupError("Could not connect to huggingface.co")
-    errors = []
-    monkeypatch.setattr(settings_ui.messagebox, "showerror", lambda *a, **k: errors.append(a))
-    win = make_window(tk_root, rec)
-    win._omni_install()
-    assert errors and "huggingface.co" in errors[0][1]
-    assert "Failed" in win._omni_phase.cget("text")
-    assert state(win._omni_install_btn) == "normal" and not win._omni_busy
-
-
-def test_cancel_button_sets_event(tk_root):
-    rec = Recorder()
-    rec.installed, rec.encoders, rec.presets = False, False, []
-    pending = []
-    win = make_window(tk_root, rec, spawn=pending.append)
-    win._omni_install()
-    assert not win._omni_cancel.is_set()
-    win._omni_cancel_btn.invoke()
-    assert win._omni_cancel.is_set()
-    rec.installer.cancel_after = True
-    pending.pop()()
-    assert not win._omni_busy
-
-
-def test_uninstall_flow_switches_engine_back(tk_root, monkeypatch):
-    rec = Recorder()
-    rec.config.speech.engine = "omnivoice"
-    monkeypatch.setattr(settings_ui.messagebox, "askyesno", lambda *a, **k: True)
-    win = make_window(tk_root, rec)
-    assert win._vars["engine"].get() == "omnivoice"
-    win._omni_uninstall()
-    assert rec.calls[-2:] == ["stop", "uninstall"]
-    assert win._vars["engine"].get() == "kokoro"
-    assert state(win._engine_radios["omnivoice"]) == "disabled"
-    assert state(win._omni_install_btn) == "normal"
-    assert all(state(b) == "disabled" for b in win._voice_btns.values())
+    rec.config.speech.english_engine = "supertonic"  # tray changes
+    rec.config.speech.other_language = "fr"
+    rec.config.speech.language_mode = "other"
+    win.refresh()
+    assert win._vars["english_engine"].get() == "supertonic"
+    assert win._vars["other_language"].get() == "French"
+    assert win._vars["language_mode"].get() == "Always French"
     assert not win._is_dirty()
-
-
-def test_uninstall_declined_does_nothing(tk_root, monkeypatch):
-    rec = Recorder()
-    monkeypatch.setattr(settings_ui.messagebox, "askyesno", lambda *a, **k: False)
-    win = make_window(tk_root, rec)
-    win._omni_uninstall()
-    assert "uninstall" not in rec.calls and rec.installed
+    win._vars["other_voice"].set("M2")  # the user edits it
+    rec.config.speech.other_voice = "F5"
+    win.refresh()
+    assert win._vars["other_voice"].get() == "M2" and win._is_dirty()
 
 
 def test_refresh_follows_tray_changes_unless_edited(tk_root):
     rec = Recorder()
     win = make_window(tk_root, rec)
-    rec.config.speech.engine = "omnivoice"  # changed from the tray
+    rec.config.speech.voice = "bf_emma"  # changed from the tray
     win.refresh()
-    assert win._vars["engine"].get() == "omnivoice" and not win._is_dirty()
-    win._vars["engine"].set("kokoro")  # the user edits it
-    rec.config.speech.engine = "kokoro"
+    assert win._vars["voice"].get().startswith("bf_emma") and not win._is_dirty()
+    win._vars["voice"].set("af_heart")  # the user edits it
     rec.config.speech.voice = "bf_emma"
     win.refresh()
-    assert win._vars["voice"].get().startswith("bf_emma")  # untouched field follows
+    assert win._vars["voice"].get().startswith("af_heart")  # the edit is kept
 
 
-def test_save_round_trips_engine(tk_root):
+def test_save_round_trips_voice(tk_root):
     rec = Recorder()
-    applied = []
-    hooks = rec.hooks()
-    hooks.apply = lambda cfg: applied.append(cfg) or None
-    win = SettingsWindow(tk_root, hooks, lambda fn: fn(), lambda fn: fn())
-    try:
-        win.show("voice")
-    except tk.TclError:
-        pytest.skip("settings window cannot be built headless")
-    win._vars["engine"].set("omnivoice")
-    win._vars["omni_voice"].set("omni:alma  Alma (OmniVoice)")
-    win._vars["croatian_voice"].set("omni:alma  Alma (OmniVoice)")
+    win = make_window(tk_root, rec)
+    win._vars["voice"].set("bf_emma  Emma (British English, female)")
     assert win.save() is True
-    sp = applied[-1].speech
-    assert (sp.engine, sp.omni_voice, sp.croatian_voice) == ("omnivoice", "omni:alma",
-                                                             "omni:alma")
+    assert rec.applied[-1].speech.voice == "bf_emma"
+    assert not win._is_dirty()
 
 
 def test_window_fits_a_1080p_screen(tk_root):
+    win = make_window(tk_root, Recorder())
+    for tab in ("voice", "export", "supertonic"):
+        win._nb.select(TABS.index(tab))
+        win.top.update_idletasks()
+        assert win.top.winfo_reqheight() <= 1080 - 90
+
+# ---------------------------------------------------------------- supertonic tab
+
+class FakeSupertonic:
+    """Stands in for the model_setup Supertonic functions (slice A may not have them yet)."""
+
+    def __init__(self, monkeypatch, installed=False):
+        self.installed = installed
+        self.downloads, self.deletes = [], []
+        self.error = None
+        self.progress = [(50_000_000, 400_000_000), (400_000_000, 400_000_000)]
+        monkeypatch.setattr(model_setup, "supertonic_missing",
+                            lambda d: [] if self.installed else ["onnx/vocoder.onnx"],
+                            raising=False)
+        monkeypatch.setattr(model_setup, "download_supertonic", self.download, raising=False)
+        monkeypatch.setattr(model_setup, "delete_supertonic", self.delete, raising=False)
+
+    def download(self, dest, progress=None, cancel=None):
+        self.downloads.append(dest)
+        for done, total in self.progress:
+            if progress:
+                progress(done, total)
+        if self.error:
+            raise self.error
+        self.installed = True
+
+    def delete(self, dest):
+        self.deletes.append(dest)
+        self.installed = False
+
+
+def st_win(tk_root, monkeypatch, installed=False, spawn=lambda fn: fn(), tmp_path=None):
+    fake = FakeSupertonic(monkeypatch, installed)
     rec = Recorder()
-    win = make_window(tk_root, rec)
-    win.top.update_idletasks()
-    assert win.top.winfo_reqheight() <= 1080 - 90
-    win._nb.select(TABS.index("omnivoice"))
-    win.top.update_idletasks()
-    assert win.top.winfo_reqheight() <= 1080 - 90
+    if tmp_path is not None:
+        rec.st_dir = tmp_path
+    win = SettingsWindow(tk_root, rec.hooks(), lambda fn: fn(), spawn)
+    try:
+        win.show("supertonic")
+    except tk.TclError:
+        pytest.skip("settings window cannot be built headless")
+    return fake, rec, win
+
+
+def test_supertonic_tab_status_not_installed_and_installed(tk_root, monkeypatch, tmp_path):
+    fake, rec, win = st_win(tk_root, monkeypatch, tmp_path=tmp_path)
+    assert win._nb.index(win._nb.select()) == TABS.index("supertonic")
+    assert win._st_status.cget("text") == "Not installed"
+    assert state(win._st_dl_btn) == "normal" and state(win._st_del_btn) == "disabled"
+    assert "OpenRAIL-M" in settings_ui.SUPERTONIC_NOTE
+    (tmp_path / "a.bin").write_bytes(b"x" * 2_000_000)
+    fake.installed = True
+    win.refresh()
+    assert win._st_status.cget("text") == "Installed (2 MB on disk)"
+    assert state(win._st_dl_btn) == "disabled" and state(win._st_del_btn) == "normal"
+
+
+def test_supertonic_download_success(tk_root, monkeypatch, tmp_path):
+    fake, rec, win = st_win(tk_root, monkeypatch, tmp_path=tmp_path)
+    labels = []
+    real = win._st_progress_label.configure
+    win._st_progress_label.configure = lambda **kw: (labels.append(kw.get("text")), real(**kw))
+    win._st_dl_btn.invoke()
+    assert fake.downloads == [tmp_path]
+    assert "Downloading Supertonic: 50 / 400 MB" in labels
+    assert rec.st_changed == 1
+    assert not win._st_busy and state(win._st_cancel_btn) == "disabled"
+    assert win._st_status.cget("text").startswith("Installed")
+
+
+def test_show_with_download_on_supertonic_tab_fetches_supertonic(tk_root, monkeypatch, tmp_path):
+    fake, rec, win = st_win(tk_root, monkeypatch, tmp_path=tmp_path)
+    kokoro = []
+    monkeypatch.setattr(win, "_download_missing", lambda: kokoro.append(1))
+    win.show("supertonic", download=True)
+    assert fake.downloads == [tmp_path] and kokoro == []
+    assert TABS[win._nb.index(win._nb.select())] == "supertonic"
+
+
+def test_supertonic_download_cancelled_and_failed(tk_root, monkeypatch, tmp_path):
+    errors = []
+    monkeypatch.setattr(settings_ui.messagebox, "showerror", lambda *a, **k: errors.append(a))
+    fake, rec, win = st_win(tk_root, monkeypatch, tmp_path=tmp_path)
+    fake.error = model_setup.DownloadCancelled()
+    win._st_dl_btn.invoke()
+    assert rec.st_changed == 0 and errors == [] and not win._st_busy
+    assert win._status.cget("text") == "Download cancelled."
+    fake.error = model_setup.SetupError("no network")
+    win._st_dl_btn.invoke()
+    assert rec.st_changed == 0 and errors and "no network" in errors[0][1]
+    assert state(win._st_dl_btn) == "normal"
+
+
+def test_supertonic_cancel_button_sets_event(tk_root, monkeypatch, tmp_path):
+    pending = []
+    fake, rec, win = st_win(tk_root, monkeypatch, spawn=pending.append, tmp_path=tmp_path)
+    win._st_dl_btn.invoke()
+    assert win._st_busy and state(win._st_cancel_btn) == "normal"
+    assert state(win._st_dl_btn) == "disabled" and state(win._st_del_btn) == "disabled"
+    win._st_dl_btn.invoke()  # ignored while busy
+    assert len(pending) == 1
+    win._st_cancel_btn.invoke()
+    assert win._st_cancel.is_set()
+    pending.pop()()
+    assert not win._st_busy
+
+
+def test_supertonic_delete_confirms(tk_root, monkeypatch, tmp_path):
+    fake, rec, win = st_win(tk_root, monkeypatch, installed=True, tmp_path=tmp_path)
+    monkeypatch.setattr(settings_ui.messagebox, "askyesno", lambda *a, **k: False)
+    win._st_del_btn.invoke()
+    assert fake.deletes == [] and rec.st_changed == 0
+    monkeypatch.setattr(settings_ui.messagebox, "askyesno", lambda *a, **k: True)
+    win._st_del_btn.invoke()
+    assert fake.deletes == [tmp_path] and rec.st_changed == 1 and "stop" in rec.calls
+    assert win._st_status.cget("text") == "Not installed"
+    assert "Supertonic tab" in win._supertonic_hint.cget("text")
+
+
+def test_supertonic_steps_slider_and_entry(tk_root, monkeypatch, tmp_path):
+    fake, rec, win = st_win(tk_root, monkeypatch, tmp_path=tmp_path)
+    assert win._vars["supertonic_steps"].get() == "8"
+    win._st_scale.set(12)
+    assert win._vars["supertonic_steps"].get() == "12"
+    win._vars["supertonic_steps"].set("5")
+    assert round(float(win._st_scale.get())) == 5
+    assert win._is_dirty()
+    assert win.save() is True and rec.config.speech.supertonic_steps == 5
+    monkeypatch.setattr(settings_ui.messagebox, "showerror", lambda *a, **k: None)
+    win._vars["supertonic_steps"].set("99")
+    assert win.save() is False
+
+
+def test_supertonic_hooks_defaults():
+    hooks = Recorder().hooks()
+    h = SettingsHooks(get_config=hooks.get_config, apply=hooks.apply, is_autostart=lambda: False,
+                      set_autostart=lambda v: None, set_show_on_start=lambda v: None,
+                      models_dir=lambda: Path("."), voices=lambda: [], output_devices=lambda: [],
+                      play_test=lambda c, t: None, stop=lambda: None, open_logs=lambda: None,
+                      open_config=lambda: None)
+    assert h.supertonic_present() is False and h.supertonic_changed() is None
+    assert h.supertonic_dir().parts[-2:] == ("models", "supertonic-3")
 
 
 # ---------------------------------------------------------------- export / mcp tabs
@@ -737,16 +543,16 @@ def test_export_runs_hook_with_request(tk_root, monkeypatch, tmp_path):
     out = tmp_path / "x.mp3"
     rec, win = export_win(tk_root, monkeypatch, save_to=out)
     win._export_set_text("Some text to read.")
-    win._export_lang.set("Croatian")
     win._export_speed.set("1.25")
     win._vars["mp3_bitrate"].set("96")
     win._export_start()
     assert len(rec.exports) == 1
     req = rec.exports[0]
     assert isinstance(req, ExportRequest)
-    assert (req.text, req.out, req.voice, req.lang, req.bitrate, req.speed) == (
-        "Some text to read.", out, None, "hr", 96, 1.25)
+    assert (req.text, req.out, req.voice, req.bitrate, req.speed) == (
+        "Some text to read.", out, None, 96, 1.25)
     assert req.fmt is None and req.overwrite is True and req.markdown is True
+    assert req.lang is None
     assert win._export_status.cget("text") == "Saved x.mp3 \u00b7 3:12"
     assert state(win._export_btn) == "normal" and state(win._export_cancel_btn) == "disabled"
     assert state(win._export_folder_btn) == "normal"
@@ -764,6 +570,35 @@ def test_export_voice_choice_and_missing_extension(tk_root, monkeypatch, tmp_pat
     win._export_start()
     req = rec.exports[0]
     assert req.voice == "bf_emma" and req.out == tmp_path / "speech.wav"
+
+
+def test_export_language_combo_and_mapping(tk_root, monkeypatch, tmp_path):
+    rec, win = export_win(tk_root, monkeypatch, save_to=tmp_path / "a.wav")
+    values = list(win._export_lang_combo.cget("values"))
+    assert values[:2] == ["Auto", "English"] and len(values) == 32
+    assert win._export_lang.get() == "Auto"
+    win._export_set_text("Hi")
+    for label, lang in (("Auto", None), ("English", "en"), ("Croatian", "hr"),
+                        ("Korean", "ko")):
+        win._export_lang.set(label)
+        win._export_start()
+        assert rec.exports[-1].lang == lang
+    assert {win._export_lang_codes[v] for v in values[2:]} == set(SUPERTONIC_LANGUAGES) - {"en"}
+    assert not win._is_dirty()  # transient export control
+
+
+def test_export_voice_lists_supertonic_voices(tk_root, monkeypatch, tmp_path):
+    rec = Recorder()
+    rec.voice_list = ["af_heart", "supertonic:F1", "supertonic:M5"]
+    win = make_window(tk_root, rec)
+    ids = win._export_voice_ids
+    assert ids[settings_ui.AUTO_VOICE] is None
+    assert [v for v in ids.values() if v] == ["af_heart", "supertonic:F1", "supertonic:M5"]
+
+
+def test_export_bitrates_come_from_config(tk_root):
+    win = make_window(tk_root, Recorder())
+    assert list(win._export_bitrate.cget("values")) == [str(b) for b in MP3_BITRATES]
 
 
 def spy_status(win):
