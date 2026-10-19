@@ -49,7 +49,7 @@ Not run: manual GUI QA (hotkey on English and Croatian selections, tray Language
 ### Follow-ups / known limitations
 
 - `looks_english` misreads English jargon with no function words ("deploy kubernetes cluster now") as not English; Tray > Language > English fixes it.
-- VN Studio used OmniVoice voice design (`create_voice`) and must move to the 10 Supertonic voices + `lang`.
+- VN Studio used OmniVoice voice design (`create_voice`) and must move to the 10 Supertonic voices + `lang`: see `mcp-changes.md` (MCP API changes and a file-by-file VN Studio migration).
 - The Supertone GitHub repo is archived; the model revision is pinned.
 - The installed exe at `D:\Programs\VibeTTS` needs a rebuild.
 
