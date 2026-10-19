@@ -152,3 +152,54 @@ def prepare(text: str, markdown: bool = True, max_chars: int = 0) -> list[Chunk]
         text = text[: cut if cut > 0 else max_chars]
     return split_chunks(text)
 
+
+
+# ---------------------------------------------------------------- language guess
+
+# English function words that are rare in the other 30 Supertonic languages (no "a", "i", "to",
+# "on", "do", "so", "he", "me", "no", "as", "an", "in", "was": those are common words elsewhere)
+_EN_WORDS = frozenset("""
+the and of is are were been be it its for with at by this that these those from or but not
+have has had you your he she we they my his her our their would could should can what which who
+there here if then than very just about into when also because while where how why more some
+all any one only other over such will don't it's i'm that's can't isn't i've you're we're
+they're didn't doesn't won't there's what's let's
+""".split())
+_WORD = re.compile(r"[^\W\d_]+(?:['’][^\W\d_]+)?")
+EN_SHORT_WORDS = 4  # fewer words than this are too little to judge: counts as English
+
+
+def _letter_kind(ch: str) -> int:
+    """0 plain Latin (a-z), 1 Latin with a diacritic, 2 any other script."""
+    o = ord(ch)
+    if o < 0x80:
+        return 0
+    if 0xC0 <= o < 0x250 or 0x1E00 <= o < 0x1F00:
+        return 1
+    return 2
+
+
+def looks_english(text: str) -> bool:
+    """Cheap guess whether `text` is English (anything else gets the other-language voice).
+
+    Not English: a good share of letters outside the Latin script (Cyrillic, Greek, Arabic,
+    Hindi, CJK ...), or Latin text with non-English diacritics (č ć đ š ž ä ö ü é ñ ...) and
+    few common English function words, or (without diacritics, so Croatian typed without
+    them, Spanish ...) a long enough text with almost none. Short or ambiguous text counts
+    as English, as does English text with a foreign name in it."""
+    letters = [c for c in text if c.isalpha()]
+    if not letters:
+        return True
+    kinds = [_letter_kind(c) for c in letters]
+    other_script, accented = kinds.count(2), kinds.count(1)
+    if other_script >= 2 and other_script / len(letters) > 0.25:
+        return False
+    words = [w.lower().replace("’", "'") for w in _WORD.findall(text)]
+    if len(words) < EN_SHORT_WORDS:
+        return not (accented >= 2 and not any(w in _EN_WORDS for w in words))
+    ratio = sum(1 for w in words if w in _EN_WORDS) / len(words)
+    if ratio >= 0.25:
+        return True
+    if accented:
+        return ratio >= 0.15
+    return len(words) < 6 or ratio >= 0.06

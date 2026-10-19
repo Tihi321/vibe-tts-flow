@@ -3,8 +3,8 @@ import time
 import numpy as np
 
 from vibetts.textprep import Chunk
-from vibetts.tts import (SAMPLE_RATE, SpeakRequest, Speaker, voice_label, voice_lang,
-                         voice_supported)
+from vibetts.tts import (BLOCK_FRAMES, KOKORO_RATE, SAMPLE_RATE, SpeakRequest, Speaker,
+                         voice_label, voice_lang, voice_supported)
 
 
 class FakeEngine:
@@ -12,12 +12,14 @@ class FakeEngine:
         self.delay = delay
         self.fail_on = fail_on
         self.calls = []
+        self.langs = []
 
     def voices(self):
         return ["af_heart"]
 
-    def synth(self, text, voice, speed):
+    def synth(self, text, voice, speed, lang=None):
         self.calls.append((text, voice, speed))
+        self.langs.append(lang)
         if text == self.fail_on:
             raise RuntimeError("boom")
         time.sleep(self.delay)
@@ -54,10 +56,31 @@ def make(engine, events):
                    on_done=lambda req, err: events.append(("done", req, err)))
 
 
-def req(texts, pause=0.1, volume=1.0, device="spk"):
+def req(texts, pause=0.1, volume=1.0, device="spk", lang=None):
     chunks = [Chunk(t, 1.0) for t in texts]
     chunks[-1].pause_after = 0.0
-    return SpeakRequest(chunks, "af_heart", 1.1, pause, volume, device)
+    return SpeakRequest(chunks, "af_heart", 1.1, pause, volume, device, lang)
+
+
+def test_pipeline_is_44k():
+    assert SAMPLE_RATE == 44100 and KOKORO_RATE == 24000 and BLOCK_FRAMES == 4410
+    assert BLOCK_FRAMES * 10 == SAMPLE_RATE  # 100 ms blocks
+
+
+def test_lang_reaches_the_engine():
+    engine = FakeEngine()
+    make(engine, []).speak_and_wait(req(["one", "two"], lang="hr"), timeout=5)
+    assert engine.langs == ["hr", "hr"]
+    engine = FakeEngine()
+    make(engine, []).speak_and_wait(req(["one"]), timeout=5)
+    assert engine.langs == [None] and SpeakRequest([], "af_heart", 1.0, 0.0).lang is None
+
+
+def test_output_blocks_are_100ms():
+    events = []
+    sp = make(FakeEngine(), events)
+    sp.speak_and_wait(req(["one"], pause=0.0), timeout=5)
+    assert {len(b) for b in FakeOutput.instances[0].frames} == {int(0.05 * SAMPLE_RATE)}
 
 
 def test_plays_all_chunks_with_gaps_and_volume():
@@ -126,15 +149,28 @@ def test_new_request_replaces_old():
 def test_voice_helpers():
     assert voice_lang("af_heart") == "en-us"
     assert voice_lang("bm_george") == "en-gb"
-    assert voice_supported("af_heart") and voice_supported("ff_siwis")
+    assert voice_supported("af_heart") and voice_supported("bm_george")
+    # Kokoro reads English only: the other languages go to Supertonic
+    assert not voice_supported("ff_siwis") and not voice_supported("ef_dora")
     assert not voice_supported("jf_alpha") and not voice_supported("zm_yunxi")
     assert voice_label("af_heart") == "Heart (American English, female)"
     assert voice_label("bm_george") == "George (British English, male)"
 
 
+def test_supertonic_voice_ids_and_labels():
+    from vibetts.tts import LANG_LABELS, VOICE_LANGS
+
+    assert voice_supported("supertonic:F1") and voice_supported("supertonic:M5")
+    assert not voice_supported("supertonic:F6") and not voice_supported("supertonic:")
+    assert voice_label("supertonic:F1") == "F1 (Supertonic, female)"
+    assert voice_label("supertonic:M3") == "M3 (Supertonic, male)"
+    assert sorted(VOICE_LANGS) == sorted(LANG_LABELS) == ["a", "b"]
+
+
 def test_unsupported_voice_ids():
     assert not voice_supported("ox_foo") and not voice_supported("omni:default")
     assert voice_label("omni:default") == "omni:default"  # unknown ids are shown as is
+    assert voice_label("supertonic:Z9") == "supertonic:Z9"
 
 
 def test_kokoro_uses_the_voice_language(monkeypatch):
@@ -156,6 +192,56 @@ def test_kokoro_uses_the_voice_language(monkeypatch):
     monkeypatch.setitem(sys.modules, "kokoro_onnx", types.SimpleNamespace(Kokoro=K))
     KokoroEngine("m", "v").synth("Hello", "bf_emma", 1.0)
     assert seen == {"voice": "bf_emma", "lang": "en-gb"}
+    KokoroEngine("m", "v").synth("Hello", "af_heart", 1.0, "hr")  # lang is ignored
+    assert seen == {"voice": "af_heart", "lang": "en-us"}
+
+
+def _fake_kokoro(monkeypatch, samples):
+    import sys
+    import types
+
+    class K:
+        def __init__(self, *a):
+            pass
+
+        def create(self, text, voice, speed, lang):
+            return samples, 24000
+
+        def get_voices(self):
+            return ["af_heart", "ff_siwis", "bf_emma"]
+
+    monkeypatch.setitem(sys.modules, "kokoro_onnx", types.SimpleNamespace(Kokoro=K))
+
+
+def test_kokoro_resamples_to_44k(monkeypatch):
+    pytest = __import__("pytest")
+    pytest.importorskip("soxr")
+    from vibetts.tts import KokoroEngine
+
+    tone = np.sin(2 * np.pi * 440 * np.arange(24000) / 24000).astype(np.float32)  # 1 s
+    _fake_kokoro(monkeypatch, tone)
+    out = KokoroEngine("m", "v").synth("Hello", "af_heart", 1.0)
+    assert out.dtype == np.float32 and out.ndim == 1
+    assert abs(len(out) - SAMPLE_RATE) <= 2  # 24000 -> 44100 samples per second
+    assert 0.9 < np.abs(out[2000:-2000]).max() < 1.1  # the level is kept
+    # the pitch is kept: the dominant frequency is still 440 Hz
+    spectrum = np.abs(np.fft.rfft(out))
+    assert abs(np.argmax(spectrum) * SAMPLE_RATE / len(out) - 440) < 2
+
+
+def test_kokoro_voices_are_english_only(monkeypatch):
+    from vibetts.tts import KokoroEngine
+
+    _fake_kokoro(monkeypatch, np.zeros(4, np.float32))
+    assert KokoroEngine("m", "v").voices() == ["af_heart", "bf_emma"]
+
+
+def test_resample_edge_cases():
+    from vibetts.tts import resample
+
+    same = np.ones(5, np.float32)
+    assert resample(same, SAMPLE_RATE).tolist() == same.tolist()
+    assert len(resample(np.zeros(0, np.float32), KOKORO_RATE)) == 0
 
 
 # ---------------------------------------------------------------- request completion state
@@ -212,5 +298,5 @@ def test_write_wav_roundtrip(tmp_path):
     path = tmp_path / "a.wav"
     write_wav(path, np.array([0.0, 0.5, -2.0], np.float32))
     with wave.open(str(path)) as w:
-        assert w.getnframes() == 3 and w.getframerate() == SAMPLE_RATE
+        assert w.getnframes() == 3 and w.getframerate() == SAMPLE_RATE == 44100
         assert np.frombuffer(w.readframes(3), "<i2").tolist() == [0, 16383, -32767]

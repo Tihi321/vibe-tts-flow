@@ -1,8 +1,10 @@
 import tomllib
 from pathlib import Path
 
-from vibetts.config import (Config, config_from_dict, export_folder, load_config, resolve_path,
-                            save_config)
+import pytest
+
+from vibetts.config import (MP3_BITRATES, SUPERTONIC_LANGUAGES, Config, config_from_dict,
+                            export_folder, load_config, resolve_path, save_config, snap_bitrate)
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -47,8 +49,65 @@ def test_broken_toml_uses_defaults(tmp_path):
 
 def test_unknown_voice_falls_back():
     assert config_from_dict({"speech": {"voice": "bm_george"}}).speech.voice == "bm_george"
-    for bad in ("", "omni:alma", "heart"):
+    # only English Kokoro voices (a* / b*) are valid for `voice`
+    for bad in ("", "omni:alma", "heart", "ff_siwis", "ef_dora", "jf_alpha", "supertonic:F1"):
         assert config_from_dict({"speech": {"voice": bad}}).speech.voice == "af_heart"
+
+
+def test_profile_defaults():
+    s = Config().speech
+    assert (s.english_engine, s.voice, s.english_supertonic_voice) == ("kokoro", "af_heart", "F1")
+    assert (s.other_language, s.other_voice, s.language_mode) == ("hr", "F1", "auto")
+    assert (s.supertonic_dir, s.supertonic_steps) == ("models/supertonic-3", 8)
+
+
+def test_profile_values_round_trip(tmp_path):
+    cfg = Config()
+    s = cfg.speech
+    s.english_engine, s.english_supertonic_voice = "supertonic", "M3"
+    s.other_language, s.other_voice, s.language_mode = "de", "F5", "other"
+    s.supertonic_dir, s.supertonic_steps = "D:/models/st", 12
+    path = tmp_path / "config.toml"
+    save_config(cfg, path)
+    assert load_config(path) == cfg
+
+
+@pytest.mark.parametrize("key,bad", [
+    ("english_engine", "omnivoice"), ("english_engine", ""),
+    ("language_mode", "croatian"), ("language_mode", "AUTO"),
+    ("other_language", "xx"), ("other_language", "en"), ("other_language", ""),
+    ("english_supertonic_voice", "F6"), ("english_supertonic_voice", "supertonic:F1"),
+    ("other_voice", "X1"), ("other_voice", "f1"),
+])
+def test_invalid_profile_values_fall_back(key, bad):
+    default = getattr(Config().speech, key)
+    assert getattr(config_from_dict({"speech": {key: bad}}).speech, key) == default
+
+
+def test_valid_profile_values_are_kept():
+    s = config_from_dict({"speech": {"english_engine": "supertonic", "language_mode": "english",
+                                     "other_language": "sl", "english_supertonic_voice": "M5",
+                                     "other_voice": "M1"}}).speech
+    assert (s.english_engine, s.language_mode, s.other_language) == ("supertonic", "english", "sl")
+    assert (s.english_supertonic_voice, s.other_voice) == ("M5", "M1")
+    for code in SUPERTONIC_LANGUAGES:
+        if code != "en":
+            assert config_from_dict({"speech": {"other_language": code}}).speech.other_language == code
+
+
+def test_supertonic_steps_clamped():
+    for given, want in [(1, 4), (4, 4), (8, 8), (16, 16), (40, 16), (-3, 4)]:
+        assert config_from_dict({"speech": {"supertonic_steps": given}}).speech.supertonic_steps == want
+    assert config_from_dict({"speech": {"supertonic_steps": "many"}}).speech.supertonic_steps == 8
+
+
+def test_mp3_bitrates_are_mpeg1():
+    assert MP3_BITRATES == (32, 48, 64, 96, 128, 160, 192, 256, 320)
+    assert config_from_dict({"export": {"mp3_bitrate": 320}}).export.mp3_bitrate == 320
+    assert config_from_dict({"export": {"mp3_bitrate": 192}}).export.mp3_bitrate == 192
+    assert config_from_dict({"export": {"mp3_bitrate": 1000}}).export.mp3_bitrate == 320
+    assert config_from_dict({"export": {"mp3_bitrate": 230}}).export.mp3_bitrate == 256
+    assert snap_bitrate(64) == 64 and snap_bitrate(1) == 32
 
 
 def test_old_keys_are_dropped_on_save(tmp_path):
@@ -59,7 +118,8 @@ def test_old_keys_are_dropped_on_save(tmp_path):
     assert cfg.speech.voice == "bf_emma"
     save_config(cfg, path)
     text = path.read_text(encoding="utf-8")
-    assert "engine" not in text and "auto_language" not in text
+    assert "[speech]\nengine =" not in text and "\nengine =" not in text
+    assert "auto_language" not in text
 
 
 def test_export_mcp_defaults():

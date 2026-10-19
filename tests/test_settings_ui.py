@@ -5,7 +5,9 @@ from pathlib import Path
 import pytest
 
 from vibetts import settings_ui
-from vibetts.config import Config
+from vibetts import model_setup
+from vibetts.config import (MP3_BITRATES, SUPERTONIC_LANGUAGE_NAMES, SUPERTONIC_LANGUAGES,
+                            SUPERTONIC_VOICES, Config)
 from vibetts.docload import Document, DocumentError
 from vibetts.export import (ExportBusy, ExportCancelled, ExportProgress, ExportRequest,
                             ExportResult)
@@ -57,12 +59,52 @@ def test_voice_display_string_parsed():
     ("hotkey_read", "ctrl+bogus"), ("speed", "3"), ("speed", "0.1"), ("volume", "1.5"),
     ("sentence_pause", "-1"), ("copy_timeout_ms", "10"), ("max_chars", "-1"),
     ("pill_position", "left"), ("voice", ""), ("model", "bogus"),
+    ("voice", "supertonic:F1"), ("english_engine", "piper"),
+    ("english_supertonic_voice", "F9"), ("other_voice", "Z1"),
+    ("other_language", "en"), ("other_language", "Klingon"), ("other_language", ""),
+    ("language_mode", "always"), ("supertonic_steps", "3"), ("supertonic_steps", "17"),
+    ("supertonic_steps", "x"),
 ])
 def test_invalid_values(key, value):
     form = form_from_config(Config())
     form[key] = value
     with pytest.raises(ValueError):
         config_from_form(Config(), form)
+
+
+def test_supertonic_keys_round_trip():
+    cfg = Config()
+    form = form_from_config(cfg)
+    assert (form["english_engine"], form["english_supertonic_voice"], form["other_language"],
+            form["other_voice"], form["language_mode"], form["supertonic_steps"]) == (
+        "kokoro", "F1", "hr", "F1", "auto", "8")
+    cfg.speech.english_engine = "supertonic"
+    cfg.speech.english_supertonic_voice = "M3"
+    cfg.speech.other_language = "de"
+    cfg.speech.other_voice = "F5"
+    cfg.speech.language_mode = "other"
+    cfg.speech.supertonic_steps = 12
+    assert config_from_form(Config(), form_from_config(cfg)) == cfg
+
+
+def test_supertonic_form_accepts_names_and_prefixed_voices():
+    form = form_from_config(Config())
+    form.update(other_language="German", other_voice="supertonic:M2  M2 (Supertonic, male)",
+                english_supertonic_voice="supertonic:F4")
+    s = config_from_form(Config(), form).speech
+    assert (s.other_language, s.other_voice, s.english_supertonic_voice) == ("de", "M2", "F4")
+
+
+def test_invalid_messages_are_readable():
+    for key, value, text in (("supertonic_steps", "3", "Quality steps must be at least 4"),
+                             ("supertonic_steps", "17", "Quality steps must be at most 16"),
+                             ("english_engine", "x", "English engine must be one of"),
+                             ("other_voice", "Z1", "Other language voice must be one of"),
+                             ("language_mode", "x", "Language must be one of")):
+        form = form_from_config(Config())
+        form[key] = value
+        with pytest.raises(ValueError, match=text):
+            config_from_form(Config(), form)
 
 
 class Recorder:
@@ -73,6 +115,10 @@ class Recorder:
         self.mcp = {"enabled": False, "running": False, "url": "", "error": ""}
         self.doc = Document("Hello there.", True, "notes")
         self.exports, self.export_error = [], None
+        self.st_dir = Path("st-models")
+        self.st_present = False
+        self.st_changed = 0
+        self.voice_list = ["af_heart", "bf_emma"]
 
     def hooks(self):
         def apply(cfg):
@@ -84,7 +130,7 @@ class Recorder:
             get_config=lambda: copy.deepcopy(self.config), apply=apply,
             is_autostart=lambda: False, set_autostart=lambda v: None,
             set_show_on_start=lambda v: None, models_dir=lambda: Path("."),
-            voices=lambda: ["af_heart", "bf_emma"],
+            voices=lambda: list(self.voice_list),
             output_devices=lambda: [], play_test=lambda c, t: None,
             stop=lambda: self.calls.append("stop"), open_logs=lambda: None,
             open_config=lambda: None, version="t",
@@ -92,7 +138,12 @@ class Recorder:
             cancel_export=lambda: self.calls.append("cancel_export"),
             mp3_available=lambda: self.mp3,
             mcp_status=lambda: dict(self.mcp),
-            open_folder=lambda p: self.calls.append(("open_folder", p)))
+            open_folder=lambda p: self.calls.append(("open_folder", p)),
+            supertonic_dir=lambda: self.st_dir, supertonic_present=lambda: self.st_present,
+            supertonic_changed=self._st_changed)
+
+    def _st_changed(self):
+        self.st_changed += 1
 
     def _load_document(self, path):
         self.calls.append(("load", path))
@@ -107,7 +158,7 @@ class Recorder:
         if self.export_error:
             raise self.export_error
         return ExportResult(path=req.out, fmt="mp3", seconds=192.0, chunks=10, bytes=1,
-                            voice="af_heart")
+                            voice="af_heart", lang=req.lang)
 
 
 @pytest.fixture(scope="module")
@@ -145,10 +196,10 @@ def state(widget):
 
 
 def test_tabs(tk_root):
-    assert TABS == ("general", "voice", "export", "kokoro", "mcp", "about")
+    assert TABS == ("general", "voice", "export", "kokoro", "supertonic", "mcp", "about")
     win = make_window(tk_root, Recorder())
     assert [win._nb.tab(i, "text") for i in range(len(TABS))] == [
-        "General", "Voice", "Export", "Kokoro", "Agents (MCP)", "About"]
+        "General", "Voice", "Export", "Kokoro", "Supertonic", "Agents (MCP)", "About"]
 
 
 def test_voice_combo(tk_root):
@@ -158,6 +209,92 @@ def test_voice_combo(tk_root):
     assert win._vars["voice"].get().startswith("af_heart  Heart")
     assert win._collect()["voice"] == "af_heart"
     assert not win._is_dirty()
+
+
+def test_voice_combos_per_engine(tk_root):
+    rec = Recorder()
+    rec.voice_list = ["af_heart", "supertonic:F1", "bf_emma", "supertonic:M1"]
+    win = make_window(tk_root, rec)
+    # Kokoro combo lists only the Kokoro English voices
+    assert [v.split(" ")[0] for v in win._voice_combo.cget("values")] == ["af_heart", "bf_emma"]
+    assert list(win._en_st_combo.cget("values")) == list(SUPERTONIC_VOICES)
+    assert win._voice_combo.winfo_manager() == "grid"
+    assert win._en_st_combo.winfo_manager() == ""
+    win._vars["english_engine"].set("supertonic")
+    assert win._en_st_combo.winfo_manager() == "grid"
+    assert win._voice_combo.winfo_manager() == ""
+    assert list(win._other_voice_combo.cget("values")) == list(SUPERTONIC_VOICES)
+    assert list(win._other_combo.cget("values")) == sorted(
+        n for c, n in SUPERTONIC_LANGUAGE_NAMES.items() if c != "en")
+    assert len(win._other_combo.cget("values")) == 30
+
+
+def test_language_combo_labels_and_mapping(tk_root):
+    rec = Recorder()
+    win = make_window(tk_root, rec)
+    assert win._vars["other_language"].get() == "Croatian"
+    assert list(win._language_combo.cget("values")) == [
+        "Auto (detect English)", "Always English", "Always Croatian"]
+    assert win._vars["language_mode"].get() == "Auto (detect English)"
+    win._vars["language_mode"].set("Always English")
+    assert win._collect()["language_mode"] == "english"
+    win._vars["language_mode"].set("Always Croatian")
+    assert win._collect()["language_mode"] == "other"
+    # the third label follows the other language, and the selected mode stays "other"
+    win._vars["other_language"].set("German")
+    assert list(win._language_combo.cget("values"))[2] == "Always German"
+    assert win._vars["language_mode"].get() == "Always German"
+    assert win._collect()["language_mode"] == "other" and win._collect()["other_language"] == "de"
+    assert win.save() is True
+    sp = rec.applied[-1].speech
+    assert (sp.language_mode, sp.other_language) == ("other", "de")
+    win._vars["language_mode"].set("Auto (detect English)")
+    win._vars["other_language"].set("French")
+    assert win._vars["language_mode"].get() == "Auto (detect English)"
+
+
+def test_new_keys_save_and_dirty(tk_root):
+    rec = Recorder()
+    win = make_window(tk_root, rec)
+    assert not win._is_dirty()
+    win._vars["english_engine"].set("supertonic")
+    assert win._is_dirty()
+    win._vars["english_supertonic_voice"].set("M4")
+    win._vars["other_voice"].set("F3")
+    win._vars["supertonic_steps"].set("12")
+    assert win.save() is True
+    sp = rec.config.speech
+    assert (sp.english_engine, sp.english_supertonic_voice, sp.other_voice,
+            sp.supertonic_steps) == ("supertonic", "M4", "F3", 12)
+    assert not win._is_dirty()
+
+
+def test_supertonic_hint_follows_presence(tk_root):
+    rec = Recorder()
+    win = make_window(tk_root, rec)
+    assert "Supertonic tab" in win._supertonic_hint.cget("text")
+    # the Supertonic choices stay selectable
+    assert state(win._en_st_combo) == "readonly" and state(win._other_combo) == "readonly"
+    rec.st_present = True
+    win.refresh()
+    assert win._supertonic_hint.cget("text") == ""
+
+
+def test_refresh_follows_new_keys_unless_edited(tk_root):
+    rec = Recorder()
+    win = make_window(tk_root, rec)
+    rec.config.speech.english_engine = "supertonic"  # tray changes
+    rec.config.speech.other_language = "fr"
+    rec.config.speech.language_mode = "other"
+    win.refresh()
+    assert win._vars["english_engine"].get() == "supertonic"
+    assert win._vars["other_language"].get() == "French"
+    assert win._vars["language_mode"].get() == "Always French"
+    assert not win._is_dirty()
+    win._vars["other_voice"].set("M2")  # the user edits it
+    rec.config.speech.other_voice = "F5"
+    win.refresh()
+    assert win._vars["other_voice"].get() == "M2" and win._is_dirty()
 
 
 def test_refresh_follows_tray_changes_unless_edited(tk_root):
@@ -183,10 +320,153 @@ def test_save_round_trips_voice(tk_root):
 
 def test_window_fits_a_1080p_screen(tk_root):
     win = make_window(tk_root, Recorder())
-    for tab in ("voice", "export"):
+    for tab in ("voice", "export", "supertonic"):
         win._nb.select(TABS.index(tab))
         win.top.update_idletasks()
         assert win.top.winfo_reqheight() <= 1080 - 90
+
+# ---------------------------------------------------------------- supertonic tab
+
+class FakeSupertonic:
+    """Stands in for the model_setup Supertonic functions (slice A may not have them yet)."""
+
+    def __init__(self, monkeypatch, installed=False):
+        self.installed = installed
+        self.downloads, self.deletes = [], []
+        self.error = None
+        self.progress = [(50_000_000, 400_000_000), (400_000_000, 400_000_000)]
+        monkeypatch.setattr(model_setup, "supertonic_missing",
+                            lambda d: [] if self.installed else ["onnx/vocoder.onnx"],
+                            raising=False)
+        monkeypatch.setattr(model_setup, "download_supertonic", self.download, raising=False)
+        monkeypatch.setattr(model_setup, "delete_supertonic", self.delete, raising=False)
+
+    def download(self, dest, progress=None, cancel=None):
+        self.downloads.append(dest)
+        for done, total in self.progress:
+            if progress:
+                progress(done, total)
+        if self.error:
+            raise self.error
+        self.installed = True
+
+    def delete(self, dest):
+        self.deletes.append(dest)
+        self.installed = False
+
+
+def st_win(tk_root, monkeypatch, installed=False, spawn=lambda fn: fn(), tmp_path=None):
+    fake = FakeSupertonic(monkeypatch, installed)
+    rec = Recorder()
+    if tmp_path is not None:
+        rec.st_dir = tmp_path
+    win = SettingsWindow(tk_root, rec.hooks(), lambda fn: fn(), spawn)
+    try:
+        win.show("supertonic")
+    except tk.TclError:
+        pytest.skip("settings window cannot be built headless")
+    return fake, rec, win
+
+
+def test_supertonic_tab_status_not_installed_and_installed(tk_root, monkeypatch, tmp_path):
+    fake, rec, win = st_win(tk_root, monkeypatch, tmp_path=tmp_path)
+    assert win._nb.index(win._nb.select()) == TABS.index("supertonic")
+    assert win._st_status.cget("text") == "Not installed"
+    assert state(win._st_dl_btn) == "normal" and state(win._st_del_btn) == "disabled"
+    assert "OpenRAIL-M" in settings_ui.SUPERTONIC_NOTE
+    (tmp_path / "a.bin").write_bytes(b"x" * 2_000_000)
+    fake.installed = True
+    win.refresh()
+    assert win._st_status.cget("text") == "Installed (2 MB on disk)"
+    assert state(win._st_dl_btn) == "disabled" and state(win._st_del_btn) == "normal"
+
+
+def test_supertonic_download_success(tk_root, monkeypatch, tmp_path):
+    fake, rec, win = st_win(tk_root, monkeypatch, tmp_path=tmp_path)
+    labels = []
+    real = win._st_progress_label.configure
+    win._st_progress_label.configure = lambda **kw: (labels.append(kw.get("text")), real(**kw))
+    win._st_dl_btn.invoke()
+    assert fake.downloads == [tmp_path]
+    assert "Downloading Supertonic: 50 / 400 MB" in labels
+    assert rec.st_changed == 1
+    assert not win._st_busy and state(win._st_cancel_btn) == "disabled"
+    assert win._st_status.cget("text").startswith("Installed")
+
+
+def test_show_with_download_on_supertonic_tab_fetches_supertonic(tk_root, monkeypatch, tmp_path):
+    fake, rec, win = st_win(tk_root, monkeypatch, tmp_path=tmp_path)
+    kokoro = []
+    monkeypatch.setattr(win, "_download_missing", lambda: kokoro.append(1))
+    win.show("supertonic", download=True)
+    assert fake.downloads == [tmp_path] and kokoro == []
+    assert TABS[win._nb.index(win._nb.select())] == "supertonic"
+
+
+def test_supertonic_download_cancelled_and_failed(tk_root, monkeypatch, tmp_path):
+    errors = []
+    monkeypatch.setattr(settings_ui.messagebox, "showerror", lambda *a, **k: errors.append(a))
+    fake, rec, win = st_win(tk_root, monkeypatch, tmp_path=tmp_path)
+    fake.error = model_setup.DownloadCancelled()
+    win._st_dl_btn.invoke()
+    assert rec.st_changed == 0 and errors == [] and not win._st_busy
+    assert win._status.cget("text") == "Download cancelled."
+    fake.error = model_setup.SetupError("no network")
+    win._st_dl_btn.invoke()
+    assert rec.st_changed == 0 and errors and "no network" in errors[0][1]
+    assert state(win._st_dl_btn) == "normal"
+
+
+def test_supertonic_cancel_button_sets_event(tk_root, monkeypatch, tmp_path):
+    pending = []
+    fake, rec, win = st_win(tk_root, monkeypatch, spawn=pending.append, tmp_path=tmp_path)
+    win._st_dl_btn.invoke()
+    assert win._st_busy and state(win._st_cancel_btn) == "normal"
+    assert state(win._st_dl_btn) == "disabled" and state(win._st_del_btn) == "disabled"
+    win._st_dl_btn.invoke()  # ignored while busy
+    assert len(pending) == 1
+    win._st_cancel_btn.invoke()
+    assert win._st_cancel.is_set()
+    pending.pop()()
+    assert not win._st_busy
+
+
+def test_supertonic_delete_confirms(tk_root, monkeypatch, tmp_path):
+    fake, rec, win = st_win(tk_root, monkeypatch, installed=True, tmp_path=tmp_path)
+    monkeypatch.setattr(settings_ui.messagebox, "askyesno", lambda *a, **k: False)
+    win._st_del_btn.invoke()
+    assert fake.deletes == [] and rec.st_changed == 0
+    monkeypatch.setattr(settings_ui.messagebox, "askyesno", lambda *a, **k: True)
+    win._st_del_btn.invoke()
+    assert fake.deletes == [tmp_path] and rec.st_changed == 1 and "stop" in rec.calls
+    assert win._st_status.cget("text") == "Not installed"
+    assert "Supertonic tab" in win._supertonic_hint.cget("text")
+
+
+def test_supertonic_steps_slider_and_entry(tk_root, monkeypatch, tmp_path):
+    fake, rec, win = st_win(tk_root, monkeypatch, tmp_path=tmp_path)
+    assert win._vars["supertonic_steps"].get() == "8"
+    win._st_scale.set(12)
+    assert win._vars["supertonic_steps"].get() == "12"
+    win._vars["supertonic_steps"].set("5")
+    assert round(float(win._st_scale.get())) == 5
+    assert win._is_dirty()
+    assert win.save() is True and rec.config.speech.supertonic_steps == 5
+    monkeypatch.setattr(settings_ui.messagebox, "showerror", lambda *a, **k: None)
+    win._vars["supertonic_steps"].set("99")
+    assert win.save() is False
+
+
+def test_supertonic_hooks_defaults():
+    hooks = Recorder().hooks()
+    h = SettingsHooks(get_config=hooks.get_config, apply=hooks.apply, is_autostart=lambda: False,
+                      set_autostart=lambda v: None, set_show_on_start=lambda v: None,
+                      models_dir=lambda: Path("."), voices=lambda: [], output_devices=lambda: [],
+                      play_test=lambda c, t: None, stop=lambda: None, open_logs=lambda: None,
+                      open_config=lambda: None)
+    assert h.supertonic_present() is False and h.supertonic_changed() is None
+    assert h.supertonic_dir().parts[-2:] == ("models", "supertonic-3")
+
 
 # ---------------------------------------------------------------- export / mcp tabs
 
@@ -272,6 +552,7 @@ def test_export_runs_hook_with_request(tk_root, monkeypatch, tmp_path):
     assert (req.text, req.out, req.voice, req.bitrate, req.speed) == (
         "Some text to read.", out, None, 96, 1.25)
     assert req.fmt is None and req.overwrite is True and req.markdown is True
+    assert req.lang is None
     assert win._export_status.cget("text") == "Saved x.mp3 \u00b7 3:12"
     assert state(win._export_btn) == "normal" and state(win._export_cancel_btn) == "disabled"
     assert state(win._export_folder_btn) == "normal"
@@ -289,6 +570,35 @@ def test_export_voice_choice_and_missing_extension(tk_root, monkeypatch, tmp_pat
     win._export_start()
     req = rec.exports[0]
     assert req.voice == "bf_emma" and req.out == tmp_path / "speech.wav"
+
+
+def test_export_language_combo_and_mapping(tk_root, monkeypatch, tmp_path):
+    rec, win = export_win(tk_root, monkeypatch, save_to=tmp_path / "a.wav")
+    values = list(win._export_lang_combo.cget("values"))
+    assert values[:2] == ["Auto", "English"] and len(values) == 32
+    assert win._export_lang.get() == "Auto"
+    win._export_set_text("Hi")
+    for label, lang in (("Auto", None), ("English", "en"), ("Croatian", "hr"),
+                        ("Korean", "ko")):
+        win._export_lang.set(label)
+        win._export_start()
+        assert rec.exports[-1].lang == lang
+    assert {win._export_lang_codes[v] for v in values[2:]} == set(SUPERTONIC_LANGUAGES) - {"en"}
+    assert not win._is_dirty()  # transient export control
+
+
+def test_export_voice_lists_supertonic_voices(tk_root, monkeypatch, tmp_path):
+    rec = Recorder()
+    rec.voice_list = ["af_heart", "supertonic:F1", "supertonic:M5"]
+    win = make_window(tk_root, rec)
+    ids = win._export_voice_ids
+    assert ids[settings_ui.AUTO_VOICE] is None
+    assert [v for v in ids.values() if v] == ["af_heart", "supertonic:F1", "supertonic:M5"]
+
+
+def test_export_bitrates_come_from_config(tk_root):
+    win = make_window(tk_root, Recorder())
+    assert list(win._export_bitrate.cget("values")) == [str(b) for b in MP3_BITRATES]
 
 
 def spy_status(win):

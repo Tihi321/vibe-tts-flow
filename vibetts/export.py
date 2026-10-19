@@ -1,4 +1,4 @@
-"""Export speech to an audio file (WAV or MP3), chunk by chunk."""
+"""Export speech to an audio file (WAV or MP3, 44.1 kHz mono), chunk by chunk."""
 from __future__ import annotations
 
 import os
@@ -29,8 +29,9 @@ class ExportBusy(RuntimeError):
 class ExportRequest:
     text: str
     out: Path | None = None        # None / relative / bare name -> resolved under the export folder
-    voice: str | None = None       # None = speech.voice
+    voice: str | None = None       # None = routed as configured; Kokoro id or supertonic:F1
     speed: float | None = None     # None = speech.speed
+    lang: str | None = None        # None = routed as configured, else a Supertonic language code
     fmt: str | None = None         # None = from the out suffix, else [export] format
     bitrate: int | None = None     # None = [export] mp3_bitrate
     markdown: bool = True          # clean markdown symbols before speaking
@@ -55,6 +56,7 @@ class ExportResult:
     chunks: int
     bytes: int
     voice: str
+    lang: str = "en"
 
 
 class AudioSink(Protocol):
@@ -150,6 +152,7 @@ class Mp3Sink:
         self._enc = lameenc.Encoder()
         self._enc.set_bit_rate(int(bitrate))
         self._enc.set_in_sample_rate(SAMPLE_RATE)
+        self._enc.set_out_sample_rate(SAMPLE_RATE)  # 44.1 kHz: MPEG-1 Layer III (32..320 kbps)
         self._enc.set_channels(1)
         self._enc.set_quality(2)
         self._f = open(path, "wb")

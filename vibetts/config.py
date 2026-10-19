@@ -40,16 +40,45 @@ class HotkeyConfig:
     read: str = "alt+win"  # press: read the selection; press again (or Esc): stop
 
 
+ENGINES = ("kokoro", "supertonic")
+LANGUAGE_MODES = ("auto", "english", "other")  # auto: English-looking text -> English profile
+SUPERTONIC_PREFIX = "supertonic:"
+SUPERTONIC_VOICES = ("F1", "F2", "F3", "F4", "F5", "M1", "M2", "M3", "M4", "M5")
+SUPERTONIC_STEPS_RANGE = (4, 16)
+SUPERTONIC_LANGUAGE_NAMES = {
+    "en": "English", "ko": "Korean", "ja": "Japanese", "ar": "Arabic", "bg": "Bulgarian",
+    "cs": "Czech", "da": "Danish", "de": "German", "el": "Greek", "es": "Spanish",
+    "et": "Estonian", "fi": "Finnish", "fr": "French", "hi": "Hindi", "hr": "Croatian",
+    "hu": "Hungarian", "id": "Indonesian", "it": "Italian", "lt": "Lithuanian", "lv": "Latvian",
+    "nl": "Dutch", "pl": "Polish", "pt": "Portuguese", "ro": "Romanian", "ru": "Russian",
+    "sk": "Slovak", "sl": "Slovenian", "sv": "Swedish", "tr": "Turkish", "uk": "Ukrainian",
+    "vi": "Vietnamese",
+}
+SUPERTONIC_LANGUAGES = tuple(SUPERTONIC_LANGUAGE_NAMES)  # the 31 codes Supertonic 3 reads
+
+
+def is_supertonic_voice(voice: str) -> bool:
+    """'supertonic:F1' .. 'supertonic:M5'."""
+    return voice.startswith(SUPERTONIC_PREFIX) and voice[len(SUPERTONIC_PREFIX):] in SUPERTONIC_VOICES
+
+
 @dataclass
 class SpeechConfig:
     model: str = "models/kokoro-v1.0.int8.onnx"
     voices: str = "models/voices-v1.0.bin"
-    voice: str = "af_heart"
+    voice: str = "af_heart"      # Kokoro voice for English
     speed: float = 1.0           # 0.5 .. 2.0
     sentence_pause: float = 0.25  # seconds of silence between sentences
     volume: float = 1.0          # 0 .. 1
     device: str = ""             # "" = Windows default output, or part of the device name
     preload: bool = True         # load the model at startup so the first read starts at once
+    english_engine: str = "kokoro"          # kokoro | supertonic: who reads English
+    english_supertonic_voice: str = "F1"    # Supertonic voice for English (english_engine supertonic)
+    other_language: str = "hr"              # Supertonic language for text that is not English
+    other_voice: str = "F1"                 # Supertonic voice for that language
+    language_mode: str = "auto"             # auto | english | other
+    supertonic_dir: str = "models/supertonic-3"  # Supertonic model files, downloaded from Settings
+    supertonic_steps: int = 8               # 4 .. 16: fewer = faster, more = better quality
 
 
 @dataclass
@@ -69,7 +98,7 @@ class UiConfig:
 
 
 EXPORT_FORMATS = ("wav", "mp3")
-MP3_BITRATES = (32, 48, 64, 96, 128, 160)  # kbps; MPEG-2 Layer III at 24 kHz caps at 160
+MP3_BITRATES = (32, 48, 64, 96, 128, 160, 192, 256, 320)  # kbps; MPEG-1 Layer III at 44.1 kHz
 MCP_DEFAULT_PORT = 7723
 
 
@@ -170,11 +199,30 @@ def _build(cls: type, data: Any, where: str) -> Any:
 
 
 def _validate_speech(s: SpeechConfig) -> None:
+    d = SpeechConfig()
     v = s.voice
-    if not (len(v) > 3 and v[2:3] == "_"):  # Kokoro ids look like af_heart
-        log.warning("config: speech.voice %r is not a Kokoro voice; using %s", v,
-                    SpeechConfig().voice)
-        s.voice = SpeechConfig().voice
+    # Kokoro ids look like af_heart; only the English ones (a* American, b* British) are offered
+    if not (len(v) > 3 and v[2:3] == "_" and v[:1] in ("a", "b")):
+        log.warning("config: speech.voice %r is not an English Kokoro voice; using %s", v, d.voice)
+        s.voice = d.voice
+
+    def check(name: str, ok: bool) -> None:
+        if not ok:
+            log.warning("config: speech.%s %r is not valid; using %r", name, getattr(s, name),
+                        getattr(d, name))
+            setattr(s, name, getattr(d, name))
+
+    check("english_engine", s.english_engine in ENGINES)
+    check("language_mode", s.language_mode in LANGUAGE_MODES)
+    check("other_language", s.other_language in SUPERTONIC_LANGUAGES and s.other_language != "en")
+    check("english_supertonic_voice", s.english_supertonic_voice in SUPERTONIC_VOICES)
+    check("other_voice", s.other_voice in SUPERTONIC_VOICES)
+    lo, hi = SUPERTONIC_STEPS_RANGE
+    steps = min(max(int(s.supertonic_steps), lo), hi)
+    if steps != s.supertonic_steps:
+        log.warning("config: speech.supertonic_steps %d outside %d..%d; using %d",
+                    s.supertonic_steps, lo, hi, steps)
+        s.supertonic_steps = steps
 
 
 def config_from_dict(d: dict) -> Config:

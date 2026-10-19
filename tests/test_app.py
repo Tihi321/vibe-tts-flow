@@ -1,6 +1,7 @@
 import dataclasses
 import threading
 import time
+import types
 from pathlib import Path
 
 import numpy as np
@@ -33,36 +34,68 @@ def test_short():
 
 class FakeKokoro:
     def __init__(self, *paths):
-        self.paths, self.calls = paths, []
+        self.paths, self.calls, self.langs = paths, [], []
 
     def voices(self):
         return ["af_heart"]
 
-    def synth(self, text, voice, speed):
+    def synth(self, text, voice, speed, lang=None):
         self.calls.append((text, voice, speed))
+        self.langs.append(lang)
         return np.ones(10, np.float32)
+
+
+class FakeSupertonic:
+    instances: list = []
+
+    def __init__(self, model_dir, steps=8):
+        self.model_dir, self.steps, self.calls, self.langs = model_dir, steps, [], []
+        FakeSupertonic.instances.append(self)
+
+    def voices(self):
+        return app.supertonic_voice_ids()
+
+    def synth(self, text, voice, speed, lang=None):
+        self.calls.append((text, voice, speed))
+        self.langs.append(lang)
+        return np.ones(20, np.float32)
+
+
+def install_supertonic(s):
+    """Make the fake Supertonic 'downloaded' for the SpeechConfig `s`."""
+    d = Path(s.supertonic_dir)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "ok").write_bytes(b"x")
 
 
 @pytest.fixture
 def fakes(tmp_path, monkeypatch):
+    """A SpeechConfig whose Kokoro files exist; Supertonic is faked and not installed yet
+    (install_supertonic(s) installs it). Nothing here touches the real engines or models."""
     monkeypatch.setattr("vibetts.tts.KokoroEngine", FakeKokoro)
+    FakeSupertonic.instances = []
+    fake = types.SimpleNamespace(models_present=lambda d: (Path(d) / "ok").exists(),
+                                 SupertonicEngine=FakeSupertonic)
+    monkeypatch.setattr(app, "_st", lambda: fake)
+    monkeypatch.setattr(app, "_fallback_warned", False)
     model, voices = tmp_path / "m.onnx", tmp_path / "v.bin"
     model.write_bytes(b"x")
     voices.write_bytes(b"x")
-    return SpeechConfig(model=str(model), voices=str(voices))
+    return SpeechConfig(model=str(model), voices=str(voices),
+                        supertonic_dir=str(tmp_path / "st"))
 
 
 def test_holder_loads_once_and_reloads_on_new_files(fakes, tmp_path):
     s = fakes
     holder = app.EngineHolder()
     assert holder.loaded is None
-    engine = holder.get(s)
-    assert isinstance(engine, FakeKokoro) and holder.loaded is engine
+    engine = holder.get(s).kokoro
+    assert isinstance(engine, FakeKokoro) and holder.loaded.kokoro is engine
     assert engine.calls == [("Ready.", "af_heart", 1.0)]  # warm-up
-    assert holder.get(s) is engine  # cached, not reloaded
+    assert holder.get(s).kokoro is engine  # cached, not reloaded
     other = tmp_path / "m2.onnx"
     other.write_bytes(b"x")
-    assert holder.get(dataclasses.replace(s, model=str(other))) is not engine
+    assert holder.get(dataclasses.replace(s, model=str(other))).kokoro is not engine
 
 
 def test_preload_loads_in_the_background(fakes):
@@ -72,7 +105,7 @@ def test_preload_loads_in_the_background(fakes):
         if holder.loaded is not None:
             break
         time.sleep(0.02)
-    assert isinstance(holder.loaded, FakeKokoro)
+    assert isinstance(holder.loaded.kokoro, FakeKokoro) and holder.loaded.supertonic is None
 
 
 EN_TEXT = "This is plain English text."
@@ -81,9 +114,9 @@ EN_TEXT = "This is plain English text."
 class SpyKokoro(FakeKokoro):
     seen: list = []
 
-    def synth(self, text, voice, speed):
+    def synth(self, text, voice, speed, lang=None):
         SpyKokoro.seen.append((text, voice))
-        return super().synth(text, voice, speed)
+        return super().synth(text, voice, speed, lang)
 
 
 def test_say_reads_with_the_configured_voice(fakes, monkeypatch, tmp_path):
@@ -118,8 +151,14 @@ def test_speak_passes_the_voice_to_the_engine(fakes):
     a.speaker = type("Sp", (), {"speak": lambda self, req: reqs.append(req)})()
     a.speak([Chunk("Hi", 0.0)], s, "bf_emma")
     a.speak([Chunk("Hi", 0.0)], s)
-    assert [r.voice for r in reqs] == ["bf_emma", "af_heart"]  # default: speech.voice
-    assert isinstance(a._engine_for_speaker(), FakeKokoro)
+    a.speak([Chunk("Hi", 0.0)], s, "supertonic:F2", "hr")
+    assert [r.voice for r in reqs] == ["bf_emma", "af_heart", "supertonic:F2"]  # default: speech.voice
+    assert [r.lang for r in reqs] == [None, None, "hr"]
+    install_supertonic(s)
+    engine = a._engine_for_speaker()  # loads the engine of the request being spoken
+    assert isinstance(engine.supertonic, FakeSupertonic) and engine.kokoro is None
+    a.speak([Chunk("Hi", 0.0)], s)
+    assert isinstance(a._engine_for_speaker().kokoro, FakeKokoro)
 
 
 # ---------------------------------------------------------------- app helpers
@@ -173,8 +212,26 @@ def make_app(s):
 def test_tray_set_voice(fakes):
     a = make_app(fakes)
     a._set_voice("bf_emma")
-    assert a.cfg.speech.voice == "bf_emma"
+    assert a.cfg.speech.voice == "bf_emma" and a.cfg.speech.english_engine == "kokoro"
     assert len(a.saved_configs) == 1 and a.tray.updates == 1
+    a._set_voice("supertonic:M2")  # a Supertonic voice also switches the English engine
+    assert (a.cfg.speech.english_engine, a.cfg.speech.english_supertonic_voice) == ("supertonic", "M2")
+    assert a.cfg.speech.voice == "bf_emma"
+    a._set_voice("af_heart")
+    assert a.cfg.speech.english_engine == "kokoro" and a.cfg.speech.english_supertonic_voice == "M2"
+
+
+def test_tray_set_other_voice_and_language_mode(fakes):
+    a = make_app(fakes)
+    a._set_other_voice("supertonic:M3")
+    assert a.cfg.speech.other_voice == "M3"
+    a._set_other_voice("af_heart")  # not a Supertonic voice: ignored
+    assert a.cfg.speech.other_voice == "M3"
+    a._set_language_mode("other")
+    assert a.cfg.speech.language_mode == "other"
+    a._set_language_mode("bogus")
+    assert a.cfg.speech.language_mode == "other"
+    assert len(a.saved_configs) == 2 and a.tray.updates == 2
 
 
 # ---------------------------------------------------------------- tray menus
@@ -196,10 +253,12 @@ def make_tray(voices=None, current="af_heart"):
 
 
 def test_tray_voices_grouped_by_language():
-    tray, calls = make_tray(current="am_adam")
+    tray, calls = make_tray(current="am_adam", voices=["af_heart", "am_adam", "bf_emma",
+                                                       "supertonic:F1", "supertonic:M1"])
     groups = {g.text: [i.text for i in g.submenu.items] for g in tray._voice_menu().items}
     assert groups == {"American English": ["Heart (female)", "Adam (male)"],
-                      "British English": ["Emma (female)"]}
+                      "British English": ["Emma (female)"],
+                      "Supertonic": ["F1 (female)", "M1 (male)"]}
     us = tray._voice_menu().items[0]
     assert [i.checked for i in us.submenu.items] == [False, True]
     us.submenu.items[0](tray._icon)  # picking a voice goes through set_voice
@@ -209,9 +268,52 @@ def test_tray_voices_grouped_by_language():
 def test_tray_menu_has_voice_entry():
     tray, _ = make_tray()
     texts = [getattr(i, "text", "") for i in tray._menu_items()]
-    assert "Voice" in texts and "Engine" not in texts
+    assert "English voice" in texts and "Language" in texts and "Speed" in texts
+    assert "Croatian voice" not in texts  # Supertonic not installed: no other-language voices
     tray, _ = make_tray(voices=[])
-    assert "Voice" not in [getattr(i, "text", "") for i in tray._menu_items()]
+    texts = [getattr(i, "text", "") for i in tray._menu_items()]
+    assert "English voice" not in texts and "Language" in texts
+
+
+def make_profile_tray(mode="auto", other="supertonic:F1", english="af_heart"):
+    from vibetts.tray import Tray, TrayHooks
+
+    calls = []
+    noop = lambda *a: None  # noqa: E731
+    hooks = TrayHooks(
+        is_enabled=lambda: True, set_enabled=noop, is_speaking=lambda: False, stop=noop,
+        model_missing=lambda: False, download_model=noop,
+        voices=lambda: ["af_heart", "bf_emma"] + app.supertonic_voice_ids(),
+        current_voice=lambda: english, set_voice=lambda v: calls.append(("voice", v)),
+        current_speed=lambda: 1.0, set_speed=noop, is_autostart=lambda: False,
+        set_autostart=noop, open_settings=noop, open_config=noop, open_logs=noop,
+        reload_config=noop, quit=noop,
+        current_language_mode=lambda: mode, set_language_mode=lambda m: calls.append(("mode", m)),
+        other_language_name=lambda: "Croatian", supertonic_available=lambda: True,
+        current_other_voice=lambda: other, set_other_voice=lambda v: calls.append(("other", v)))
+    return Tray(hooks), calls
+
+
+def test_tray_language_menu():
+    tray, calls = make_profile_tray(mode="other")
+    items = {i.text: i for i in tray._menu_items() if hasattr(i, "submenu") and i.submenu}
+    lang = items["Language"].submenu.items
+    assert [i.text for i in lang] == ["Auto (detect English)", "English", "Croatian"]
+    assert [i.checked for i in lang] == [False, False, True]
+    lang[1](tray._icon)
+    assert calls == [("mode", "english")]
+
+
+def test_tray_other_voice_menu():
+    tray, calls = make_profile_tray(other="supertonic:M2")
+    items = {i.text: i for i in tray._menu_items() if hasattr(i, "submenu") and i.submenu}
+    other = items["Croatian voice"].submenu.items
+    assert [i.text for i in other][:2] == ["F1 (female)", "F2 (female)"] and len(other) == 10
+    assert [i.checked for i in other] == [v.endswith("M2") for v in app.supertonic_voice_ids()]
+    other[5](tray._icon)
+    assert calls == [("other", "supertonic:M1")]
+    eng = items["English voice"].submenu.items
+    assert [g.text for g in eng] == ["American English", "British English", "Supertonic"]
 
 
 # ---------------------------------------------------------------- plan_speech / run_export
@@ -225,9 +327,9 @@ def _wav_frames(path):
 
 def test_plan_speech_voice(fakes):
     s = fakes
-    chunks, voice = app.plan_speech(s, EN_TEXT)
-    assert voice == "af_heart" and chunks
-    assert app.plan_speech(s, EN_TEXT, voice="bf_emma")[1] == "bf_emma"
+    chunks, route = app.plan_speech(s, EN_TEXT)
+    assert route == app.Route("kokoro", "af_heart", "en") and chunks
+    assert app.plan_speech(s, EN_TEXT, voice="bf_emma")[1].voice == "bf_emma"
 
 
 def test_plan_speech_max_chars_and_markdown(fakes):
@@ -250,6 +352,7 @@ def test_run_export_writes_wav(fakes, tmp_path):
     assert res.path == tmp_path / "out" / "a.wav" and res.fmt == "wav"
     assert res.chunks == len(kokoro.calls) and _wav_frames(res.path) == 10 * res.chunks
     assert kokoro.calls[0][1:3] == ("af_heart", 1.3) and res.voice == "af_heart"
+    assert res.lang == "en" and kokoro.langs[0] == "en"
     assert isinstance(progress[-1], ExportProgress) and progress[-1].done == res.chunks
 
 
@@ -398,10 +501,17 @@ def bridge(eapp):
 
 def test_bridge_list_voices(bridge):
     b, a = bridge
-    assert b.list_voices() == {
-        "voices": [{"id": "af_heart", "label": "Heart (American English, female)"},
-                   {"id": "bf_emma", "label": "Emma (British English, female)"}],
-        "default_voice": "af_heart"}
+    out = b.list_voices()
+    assert out["voices"] == [
+        {"id": "af_heart", "label": "Heart (American English, female)", "engine": "kokoro",
+         "languages": ["en"]},
+        {"id": "bf_emma", "label": "Emma (British English, female)", "engine": "kokoro",
+         "languages": ["en"]}]
+    assert [l["code"] for l in out["languages"]][:3] == ["en", "ko", "ja"] and len(out["languages"]) == 31
+    assert {"code": "hr", "name": "Croatian"} in out["languages"]
+    assert out["english"] == {"engine": "kokoro", "voice": "af_heart"}
+    assert out["other"] == {"language": "hr", "voice": "supertonic:F1"}
+    assert out["language_mode"] == "auto" and out["supertonic_installed"] is False
 
 
 def test_bridge_speak_waits_for_the_real_speaker(bridge):
@@ -429,7 +539,7 @@ def test_bridge_speak_waits_for_the_real_speaker(bridge):
     a.speaker = Speaker(a._engine_for_speaker, Out)
     out = b.speak("Hello there.", None, 1.4, True, 5.0)
     assert out == {"started": True, "completed": True, "interrupted": False, "error": None,
-                   "voice": "af_heart"}
+                   "voice": "af_heart", "lang": "en"}
     assert a._speak_cfg.speed == 1.4 and a.cfg.speech.speed != 1.4  # a copy, config untouched
     out = b.speak("Hello there.", "bf_emma", None, False, 5.0)  # fire and forget
     assert out["started"] and not out["completed"] and out["voice"] == "bf_emma"
@@ -487,7 +597,7 @@ def test_bridge_synthesize_text_and_file(bridge, tmp_path):
     b, a = bridge
     out = b.synthesize_to_file({"text": "Hello there.", "output": "talk.wav"})
     assert out["path"] == str(tmp_path / "exports" / "talk.wav")
-    assert out["format"] == "wav" and out["voice"] == "af_heart"
+    assert out["format"] == "wav" and out["voice"] == "af_heart" and out["lang"] == "en"
     assert out["chunks"] == 1 and out["bytes"] > 0 and out["duration_seconds"] >= 0
     doc = tmp_path / "My Notes.txt"
     doc.write_text("A short note. Nothing more.", encoding="utf-8")
@@ -871,3 +981,420 @@ def test_run_mcp_only_serves_until_interrupted(cli, monkeypatch, capsys):
     assert "synthesize_batch" in started["names"] and started["stopped"]
     assert "7701" in capsys.readouterr().out
     assert app.run_mcp_only(cli, 80) == 2
+
+
+# ---------------------------------------------------------------- language routing
+
+HR_TEXT = "Ovo je jednostavan test sustava koji čita tekst na hrvatskom jeziku, i to dobro."
+EN_LONG = "This is a simple test of the system that reads the text out loud in English."
+
+
+@pytest.mark.parametrize("mode,text,engine,expected", [
+    ("auto", EN_LONG, "kokoro", ("kokoro", "af_heart", "en")),
+    ("auto", HR_TEXT, "kokoro", ("supertonic", "supertonic:F2", "hr")),
+    ("auto", EN_LONG, "supertonic", ("supertonic", "supertonic:M1", "en")),
+    ("auto", HR_TEXT, "supertonic", ("supertonic", "supertonic:F2", "hr")),
+    ("english", HR_TEXT, "kokoro", ("kokoro", "af_heart", "en")),
+    ("english", HR_TEXT, "supertonic", ("supertonic", "supertonic:M1", "en")),
+    ("other", EN_LONG, "kokoro", ("supertonic", "supertonic:F2", "hr")),
+    ("other", EN_LONG, "supertonic", ("supertonic", "supertonic:F2", "hr")),
+])
+def test_route_matrix(fakes, mode, text, engine, expected):
+    s = dataclasses.replace(fakes, language_mode=mode, english_engine=engine,
+                            english_supertonic_voice="M1", other_voice="F2")
+    install_supertonic(s)
+    route = app.route_for(s, text)
+    assert tuple(route[:3]) == expected and route.fell_back is False
+
+
+def test_route_other_language_and_explicit_lang(fakes):
+    s = dataclasses.replace(fakes, other_language="de", other_voice="M4")
+    install_supertonic(s)
+    assert app.route_for(s, "Das ist ein einfacher Test des Systems, der den Text vorliest, schön.")[::2] \
+        == ("supertonic", "de")
+    # an explicit lang: "en" is the English profile, anything else the other-language voice
+    assert app.route_for(s, HR_TEXT, "en") == app.Route("kokoro", "af_heart", "en")
+    assert app.route_for(s, EN_LONG, "fr") == app.Route("supertonic", "supertonic:M4", "fr")
+
+
+def test_route_falls_back_to_kokoro_when_supertonic_is_missing(fakes, caplog):
+    s = fakes  # not installed
+    route = app.route_for(s, HR_TEXT)
+    assert route == app.Route("kokoro", "af_heart", "en", True)
+    s2 = dataclasses.replace(s, english_engine="supertonic")
+    assert app.route_for(s2, EN_LONG) == app.Route("kokoro", "af_heart", "en", True)
+    with caplog.at_level("WARNING", logger="vibetts.app"):
+        assert app.note_fallback(route) is True and app.note_fallback(route) is False  # once
+    assert caplog.text.count("Supertonic is not installed") == 1
+    assert app.note_fallback(app.route_for(s, EN_LONG)) is False  # no fallback, no warning
+    install_supertonic(s)
+    assert app.route_for(s, HR_TEXT).fell_back is False
+
+
+def test_route_request_explicit_voice_and_lang(fakes):
+    s = fakes
+    install_supertonic(s)
+    r = app.route_request(s, HR_TEXT, "supertonic:F3")
+    assert r == app.Route("supertonic", "supertonic:F3", "hr")  # language: as routed
+    assert app.route_request(s, EN_LONG, "supertonic:F3").lang == "en"
+    assert app.route_request(s, EN_LONG, "supertonic:F3", "de").lang == "de"
+    assert app.route_request(s, HR_TEXT, "bf_emma") == app.Route("kokoro", "bf_emma", "en")
+    assert app.route_request(s, HR_TEXT, "bf_emma", "en").lang == "en"
+    with pytest.raises(ValueError, match="English only"):
+        app.route_request(s, HR_TEXT, "bf_emma", "hr")
+    with pytest.raises(ValueError, match="Unknown language"):
+        app.route_request(s, EN_LONG, None, "xx")
+
+
+def test_active_voices_per_mode(fakes):
+    s = dataclasses.replace(fakes, english_engine="supertonic", english_supertonic_voice="F5")
+    assert app.needed_voices(s) == ["supertonic:F5", "supertonic:F1"]
+    assert app.needed_voices(dataclasses.replace(s, language_mode="english")) == ["supertonic:F5"]
+    assert app.needed_voices(dataclasses.replace(s, language_mode="other")) == ["supertonic:F1"]
+    assert app.primary_voice(dataclasses.replace(s, language_mode="other")) == "supertonic:F1"
+    assert app.primary_voice(fakes) == "af_heart"
+    assert app.missing_voices(fakes) == ["supertonic:F1"]
+    install_supertonic(fakes)
+    assert app.missing_voices(fakes) == []
+
+
+# ---------------------------------------------------------------- engines
+
+def test_holder_loads_each_family_lazily(fakes):
+    s = fakes
+    install_supertonic(s)
+    holder = app.EngineHolder()
+    holder.get(s, voice="af_heart")
+    assert holder.loaded.supertonic is None and FakeSupertonic.instances == []
+    engine = holder.get(s, voice="supertonic:F1")
+    st = engine.supertonic
+    assert isinstance(st, FakeSupertonic) and isinstance(engine.kokoro, FakeKokoro)
+    assert st.calls == [("Ready.", "supertonic:F1", 1.0)] and st.langs == ["en"]  # warm-up
+    assert holder.get(s, voice="supertonic:M1").supertonic is st  # cached
+    assert st.model_dir == Path(s.supertonic_dir) and st.steps == 8
+    # the key is (dir, steps): other steps reload only Supertonic
+    kokoro = engine.kokoro
+    again = holder.get(dataclasses.replace(s, supertonic_steps=12), voice="supertonic:F1")
+    assert again.supertonic is not st and again.supertonic.steps == 12 and again.kokoro is kokoro
+    holder.unload_supertonic()
+    assert holder.loaded.supertonic is None and holder.loaded.kokoro is kokoro
+
+
+def test_holder_default_voice_follows_the_profile(fakes):
+    s = dataclasses.replace(fakes, language_mode="other")
+    install_supertonic(s)
+    engine = app.EngineHolder().get(s)  # no voice: the primary one (other-language profile)
+    assert engine.kokoro is None and isinstance(engine.supertonic, FakeSupertonic)
+
+
+def test_holder_supertonic_missing(fakes):
+    with pytest.raises(RuntimeError, match="Supertonic is not installed"):
+        app.EngineHolder().get(fakes, voice="supertonic:F1")
+
+
+def test_routing_engine_dispatches_by_voice(fakes):
+    k, st = FakeKokoro(), FakeSupertonic("d")
+    r = app.RoutingEngine(k, st)
+    r.synth("a", "af_heart", 1.0, "en")
+    r.synth("b", "supertonic:F1", 1.2, "hr")
+    assert k.calls == [("a", "af_heart", 1.0)] and st.calls == [("b", "supertonic:F1", 1.2)]
+    assert st.langs == ["hr"]
+    assert r.voices() == ["af_heart", *app.supertonic_voice_ids()]
+    with pytest.raises(RuntimeError, match="Supertonic is not installed"):
+        app.RoutingEngine(k, None).synth("c", "supertonic:F1", 1.0)
+    with pytest.raises(RuntimeError, match="Download the voice model"):
+        app.RoutingEngine(None, st).synth("c", "af_heart", 1.0)
+
+
+def _wait_loaded(holder, kokoro=False, supertonic=False):
+    for _ in range(100):
+        loaded = holder.loaded
+        if loaded is not None and (not kokoro or loaded.kokoro) \
+                and (not supertonic or loaded.supertonic):
+            return loaded
+        time.sleep(0.02)
+    raise AssertionError("preload did not finish")
+
+
+def test_preload_loads_the_engines_the_profiles_need(fakes):
+    s = fakes
+    install_supertonic(s)
+    holder = app.EngineHolder()
+    holder.preload(s)  # auto: English (Kokoro) and other language (Supertonic)
+    loaded = _wait_loaded(holder, kokoro=True, supertonic=True)
+    assert isinstance(loaded.kokoro, FakeKokoro) and isinstance(loaded.supertonic, FakeSupertonic)
+    only_en = app.EngineHolder()
+    only_en.preload(dataclasses.replace(s, language_mode="english"))
+    _wait_loaded(only_en, kokoro=True)
+    assert only_en.loaded.supertonic is None
+    only_other = app.EngineHolder()
+    only_other.preload(dataclasses.replace(s, language_mode="other"))
+    _wait_loaded(only_other, supertonic=True)
+    assert only_other.loaded.kokoro is None
+
+
+def test_preload_without_supertonic_loads_kokoro_only(fakes):
+    holder = app.EngineHolder()
+    holder.preload(fakes)  # the other profile falls back to Kokoro English
+    _wait_loaded(holder, kokoro=True)
+    assert holder.loaded.supertonic is None and FakeSupertonic.instances == []
+
+
+# ---------------------------------------------------------------- export / bridge with lang
+
+def test_run_export_routes_by_lang(fakes, tmp_path):
+    from vibetts.export import ExportRequest
+
+    s = dataclasses.replace(fakes, sentence_pause=0.0)
+    install_supertonic(s)
+    k, st = FakeKokoro(), FakeSupertonic("d")
+    engine = app.RoutingEngine(k, st)
+    res = app.run_export(engine, s, ExportRequest("Zdravo svijete.", Path("a.wav"), lang="hr"),
+                         tmp_path)
+    assert (res.voice, res.lang) == ("supertonic:F1", "hr") and st.langs == ["hr"] and not k.calls
+    res = app.run_export(engine, s, ExportRequest(HR_TEXT, Path("b.wav")), tmp_path)
+    assert (res.voice, res.lang) == ("supertonic:F1", "hr")  # detected
+    res = app.run_export(engine, s, ExportRequest(EN_LONG, Path("c.wav")), tmp_path)
+    assert (res.voice, res.lang) == ("af_heart", "en") and k.langs == ["en"]
+    res = app.run_export(engine, s, ExportRequest(HR_TEXT, Path("d.wav"), voice="supertonic:M2",
+                                                  lang="sl"), tmp_path)
+    assert (res.voice, res.lang) == ("supertonic:M2", "sl")
+    with pytest.raises(ValueError, match="English only"):
+        app.run_export(engine, s, ExportRequest("Hi.", Path("e.wav"), voice="bf_emma", lang="hr"),
+                       tmp_path)
+    with pytest.raises(ValueError, match="Unknown language"):
+        app.run_export(engine, s, ExportRequest("Hi.", Path("f.wav"), lang="xx"), tmp_path)
+
+
+def test_run_export_44k_wav_header(fakes, tmp_path):
+    import wave
+
+    from vibetts.export import ExportRequest
+
+    s = dataclasses.replace(fakes, sentence_pause=0.0)
+    res = app.run_export(FakeKokoro(), s, ExportRequest("Hello there.", Path("r.wav")), tmp_path)
+    with wave.open(str(res.path)) as w:
+        assert w.getframerate() == 44100 and w.getnchannels() == 1
+
+
+def test_run_export_supertonic_missing_for_explicit_voice(fakes, tmp_path):
+    from vibetts.export import ExportRequest
+
+    with pytest.raises(RuntimeError, match="Supertonic is not installed"):
+        app.run_export(FakeKokoro(), fakes, ExportRequest("Hi.", voice="supertonic:F1"), tmp_path)
+
+
+def test_run_export_falls_back_when_supertonic_is_missing(fakes, tmp_path):
+    from vibetts.export import ExportRequest
+
+    s = dataclasses.replace(fakes, sentence_pause=0.0)
+    k = FakeKokoro()
+    res = app.run_export(k, s, ExportRequest(HR_TEXT, Path("fb.wav")), tmp_path)
+    assert (res.voice, res.lang) == ("af_heart", "en") and k.calls
+
+
+def test_export_audio_loads_the_engine_of_the_route(eapp):
+    from vibetts.export import ExportRequest
+
+    install_supertonic(eapp.cfg.speech)
+    res = eapp.export_audio(ExportRequest("Zdravo.", Path("hr.wav"), lang="hr"))
+    assert res.voice == "supertonic:F1" and res.lang == "hr"
+    assert eapp.engine.loaded.kokoro is None  # English was never needed
+    assert eapp.engine.loaded.supertonic.langs[-1] == "hr"
+    res = eapp.export_audio(ExportRequest("Hello there.", Path("en.wav")))
+    assert res.voice == "af_heart" and eapp.engine.loaded.kokoro is not None
+
+
+def test_bridge_checks_voice_and_lang(bridge):
+    from vibetts.mcp_server import ToolError
+
+    b, a = bridge
+    s = a.cfg.speech
+    with pytest.raises(ToolError, match="Supertonic is not installed"):
+        b.synthesize_to_file({"text": "Hi.", "voice": "supertonic:F1"})
+    with pytest.raises(ToolError, match="Unknown language 'xx'"):
+        b.synthesize_to_file({"text": "Hi.", "lang": "xx"})
+    with pytest.raises(ToolError, match="English only"):
+        b.synthesize_to_file({"text": "Hi.", "voice": "bf_emma", "lang": "hr"})
+    with pytest.raises(ToolError, match="Unknown voice"):
+        b.speak("Hello.", "supertonic:Z9", None, False, 1.0)
+    install_supertonic(s)
+    out = b.synthesize_to_file({"text": "Zdravo svijete.", "lang": "hr", "output": "z.wav"})
+    assert (out["voice"], out["lang"]) == ("supertonic:F1", "hr")
+    out = b.synthesize_to_file({"text": "Hello.", "voice": "supertonic:M1", "output": "m.wav"})
+    assert (out["voice"], out["lang"]) == ("supertonic:M1", "en")
+    out = b.synthesize_to_file({"text": "Hello.", "lang": "en", "output": "e.wav"})
+    assert (out["voice"], out["lang"]) == ("af_heart", "en")
+
+
+def test_bridge_list_voices_with_supertonic(bridge):
+    b, a = bridge
+    install_supertonic(a.cfg.speech)
+    a._voices = lambda: ["af_heart", *app.supertonic_voice_ids()]
+    a.cfg.speech.other_language, a.cfg.speech.language_mode = "de", "other"
+    out = b.list_voices()
+    st = out["voices"][1]
+    assert st == {"id": "supertonic:F1", "label": "F1 (Supertonic, female)", "engine": "supertonic",
+                  "languages": list(app.SUPERTONIC_LANGUAGES)}
+    assert out["supertonic_installed"] is True and out["language_mode"] == "other"
+    assert out["other"] == {"language": "de", "voice": "supertonic:F1"}
+
+
+def test_bridge_speak_routes_by_lang(bridge, monkeypatch):
+    b, a = bridge
+    install_supertonic(a.cfg.speech)
+    seen = []
+    req = types.SimpleNamespace(done=threading.Event(), interrupted=False, error=None)
+    req.done.set()
+    monkeypatch.setattr(a, "speak", lambda chunks, s, voice=None, lang=None: seen.append(
+        (voice, lang)) or req)
+    assert b.speak("Zdravo svijete.", None, None, True, 1.0, "hr")["lang"] == "hr"
+    assert b.speak(HR_TEXT, None, None, True, 1.0)["voice"] == "supertonic:F1"
+    assert b.speak(EN_LONG, None, None, True, 1.0)["voice"] == "af_heart"
+    assert seen == [("supertonic:F1", "hr"), ("supertonic:F1", "hr"), ("af_heart", "en")]
+
+
+def test_bridge_batch_with_lang(bridge, tmp_path):
+    b, a = bridge
+    install_supertonic(a.cfg.speech)
+    out_dir = tmp_path / "clips"
+    out_dir.mkdir()
+    items = [
+        {"text": "Dobar dan.", "output": str(out_dir / "a.wav"), "lang": "hr"},
+        {"text": "Hello.", "output": str(out_dir / "b.wav"), "voice": "bf_emma", "lang": "hr"},
+        {"text": "Hello.", "output": str(out_dir / "c.wav"), "lang": "xx"},
+    ]
+    r = b.synthesize_batch({"items": items})["results"]
+    assert [x["ok"] for x in r] == [True, False, False]
+    assert "English only" in r[1]["error"] and "Unknown language" in r[2]["error"]
+    assert (out_dir / "a.wav").exists()
+
+
+# ---------------------------------------------------------------- app wiring
+
+def test_voices_lists_english_kokoro_then_supertonic_when_installed(fakes, tmp_path):
+    a = make_app(fakes)
+    with open(a.cfg.speech.voices, "wb") as fh:
+        np.savez(fh, af_heart=np.zeros(2), ff_siwis=np.zeros(2), bm_george=np.zeros(2))
+    assert a._voices() == ["af_heart", "bm_george"]
+    install_supertonic(a.cfg.speech)
+    assert a._voices() == ["af_heart", "bm_george", *app.supertonic_voice_ids()]
+
+
+def test_supertonic_changed_reloads_and_refreshes(fakes):
+    a = make_app(fakes)
+    install_supertonic(a.cfg.speech)
+    a.engine.get(a.cfg.speech, voice="supertonic:F1")
+    assert a.engine.loaded.supertonic is not None
+    app._fallback_warned = True
+    import shutil
+
+    shutil.rmtree(a.cfg.speech.supertonic_dir)
+    a.cfg.speech.preload = False
+    a._supertonic_changed()
+    assert a.engine.loaded is None and app._fallback_warned is False and a.tray.updates == 1
+
+
+def test_settings_hooks_get_supertonic_wiring(mapp, monkeypatch):
+    a = mapp
+    a._autostart = type("A", (), {"is_enabled": staticmethod(lambda: False)})
+    monkeypatch.setattr("vibetts.settings_ui.SettingsWindow", FakeSettingsWindow)
+    hooks = a._settings_window().hooks
+    assert hooks.supertonic_dir() == Path(a.cfg.speech.supertonic_dir)
+    assert hooks.supertonic_present() is False
+    install_supertonic(a.cfg.speech)
+    assert hooks.supertonic_present() is True
+    hooks.supertonic_changed()
+
+
+def test_apply_config_reports_the_missing_engine(mapp):
+    a = mapp
+    a.listener = type("L", (), {"set_bindings": lambda self, b: None})()
+    base = a.cfg.speech
+    new = Config(speech=dataclasses.replace(base, english_engine="supertonic"))
+    assert a.apply_config(new) == app.MISSING_SUPERTONIC  # the English profile needs it
+    ok = Config(speech=dataclasses.replace(base, preload=False))
+    assert a.apply_config(ok) is None  # Kokoro is there; Supertonic is only a soft need
+
+
+def test_read_selection_uses_the_route(fakes, monkeypatch):
+    """The hotkey path: routing decided once from the grabbed text, then speak(route)."""
+    from vibetts import hotkeys, selection
+
+    a = make_app(fakes)
+    install_supertonic(a.cfg.speech)
+    a.cfg.selection.max_chars = 0
+    a.listener = type("L", (), {"chord": lambda self, n: None})()
+    spoken = []
+    a.speak = lambda chunks, s, voice=None, lang=None: spoken.append((voice, lang))
+    a.open_settings = lambda *args, **kw: spoken.append(("settings", args))
+    a._grabbing, a._grab_lock, a._hint = True, threading.Lock(), None
+    monkeypatch.setattr(hotkeys, "wait_for_chord_release", lambda chord, t: True)
+    for text in (HR_TEXT, EN_LONG):
+        monkeypatch.setattr(selection, "grab_selection", lambda *a, text=text: types.SimpleNamespace(
+            text=text, from_clipboard=False))
+        a._read_selection()
+    assert spoken == [("supertonic:F1", "hr"), ("af_heart", "en")]
+    # Supertonic missing: Kokoro reads it and a hint is queued (once)
+    import shutil
+
+    shutil.rmtree(a.cfg.speech.supertonic_dir)
+    for _ in range(2):
+        monkeypatch.setattr(selection, "grab_selection", lambda *a: types.SimpleNamespace(
+            text=HR_TEXT, from_clipboard=False))
+        a._read_selection()
+    assert spoken[2:] == [("af_heart", "en"), ("af_heart", "en")]
+    assert a._hint == app.SUPERTONIC_HINT
+
+
+def test_speak_done_shows_the_hint(fakes):
+    a = make_app(fakes)
+    a.tray = type("T", (), {"set_speaking": lambda self, v: None, "update_menu": lambda self: None})()
+    a.overlay = type("O", (), {"hide": lambda self: None, "show": lambda self, *x, **k: None})()
+    a._hint = app.SUPERTONIC_HINT
+    a._current = req = object()
+    a._on_speak_done(req, None)
+    assert a.flashes == [("ok", app.SUPERTONIC_HINT)] and a._hint is None
+
+
+def test_tray_download_opens_the_engine_that_is_missing(fakes):
+    a = make_app(fakes)
+    opened = []
+    a.open_settings = lambda tab=None, banner=None, download=False: opened.append((tab, download))
+    a._download_missing()
+    assert opened == [("supertonic", True)]  # Kokoro is there, Supertonic (other profile) is not
+    a.cfg.speech.model = str(Path(a.cfg.speech.model).with_name("nope.onnx"))
+    a._download_missing()
+    assert opened[-1] == ("kokoro", True)
+
+
+# ---------------------------------------------------------------- CLI routing
+
+def test_say_routes_like_the_hotkey(fakes, tmp_path, monkeypatch, capsys):
+    s = dataclasses.replace(fakes, sentence_pause=0.0)
+    install_supertonic(s)
+    cfg = Config(speech=s)
+    cfg.export.format = "wav"
+    assert app.say(cfg, HR_TEXT, str(tmp_path / "hr.wav")) == 0
+    assert "voice supertonic:F1, language hr" in capsys.readouterr().out
+    assert FakeSupertonic.instances[-1].langs[-1] == "hr"
+    assert app.say(cfg, EN_LONG, str(tmp_path / "en.wav")) == 0
+    assert "voice af_heart, language en" in capsys.readouterr().out
+    # forced English: Croatian text goes to the English voice
+    cfg.speech.language_mode = "english"
+    assert app.say(cfg, HR_TEXT, str(tmp_path / "forced.wav")) == 0
+    assert "voice af_heart" in capsys.readouterr().out
+
+
+def test_say_without_supertonic_falls_back_and_says_so(fakes, tmp_path, capsys):
+    cfg = Config(speech=dataclasses.replace(fakes, sentence_pause=0.0))
+    assert app.say(cfg, HR_TEXT, str(tmp_path / "fb.wav")) == 0
+    captured = capsys.readouterr()
+    assert "Supertonic is not installed" in captured.err and "voice af_heart" in captured.out
+
+
+def test_say_supertonic_only_missing_message(fakes, tmp_path, capsys):
+    cfg = Config(speech=dataclasses.replace(fakes, english_engine="supertonic", language_mode="english"))
+    cfg.speech.model = str(tmp_path / "nope.onnx")  # even Kokoro is gone: the fallback fails too
+    assert app.say(cfg, EN_LONG, str(tmp_path / "x.wav")) == 1
+    assert "model files missing" in capsys.readouterr().err

@@ -14,8 +14,10 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Any, Callable
 
 from . import docload, model_setup
-from .config import (EXPORT_FORMATS, MCP_DEFAULT_PORT, MP3_BITRATES, ROOT, Config,
-                     export_folder, snap_bitrate)
+from .config import (ENGINES, EXPORT_FORMATS, LANGUAGE_MODES, MCP_DEFAULT_PORT, MP3_BITRATES,
+                     ROOT, SUPERTONIC_LANGUAGE_NAMES, SUPERTONIC_LANGUAGES, SUPERTONIC_PREFIX,
+                     SUPERTONIC_STEPS_RANGE, SUPERTONIC_VOICES, Config, export_folder,
+                     is_supertonic_voice, snap_bitrate)
 from .export import ExportBusy, ExportCancelled, ExportProgress, ExportRequest
 from .hotkeys import parse_chord
 from .tts import voice_label
@@ -27,9 +29,10 @@ except ImportError:  # pragma: no cover
 
 log = logging.getLogger(__name__)
 
-TABS = ("general", "voice", "export", "kokoro", "mcp", "about")
+TABS = ("general", "voice", "export", "kokoro", "supertonic", "mcp", "about")
 TAB_TITLES = {"general": "General", "voice": "Voice", "export": "Export", "kokoro": "Kokoro",
-              "mcp": "Agents (MCP)", "about": "About"}
+              "supertonic": "Supertonic", "mcp": "Agents (MCP)", "about": "About"}
+SCROLL_TABS = ("voice", "export")
 PILL_POSITIONS = ("top", "bottom")
 SAMPLE_TEXT = ("Hello! This is how VibeTTS sounds. Select any text, press the hotkey, "
                "and I will read it aloud.")
@@ -93,6 +96,41 @@ def _clock(seconds: float) -> str:
     return f"{s // 60}:{s % 60:02d}"
 
 
+LANG_AUTO = "Auto (detect English)"
+LANG_ENGLISH = "Always English"
+EXPORT_LANG_AUTO = "Auto"
+EXPORT_LANG_ENGLISH = "English"
+SUPERTONIC_NOTE = ("Supertonic 3 by Supertone: 31 languages, about 400 MB. "
+                   "Model licence OpenRAIL-M.")
+SUPERTONIC_HINT = "Download Supertonic in the Supertonic tab"
+# the 30 non-English Supertonic languages: English name -> code
+OTHER_LANGUAGES: dict[str, str] = dict(sorted(
+    ((name, code) for code, name in SUPERTONIC_LANGUAGE_NAMES.items() if code != "en"),
+    key=lambda kv: kv[0]))
+FOLLOW_KEYS = ("voice", "english_engine", "english_supertonic_voice", "other_language",
+               "other_voice", "language_mode")
+
+
+def language_mode_label(mode: str, other_name: str) -> str:
+    if mode == "english":
+        return LANG_ENGLISH
+    if mode == "other":
+        return f"Always {other_name}"
+    return LANG_AUTO
+
+
+def language_mode_from_label(label: Any) -> str:
+    """'Auto (detect English)' -> 'auto', 'Always Croatian' -> 'other'; unknown text is kept."""
+    text = str(label or "").strip()
+    if text == LANG_AUTO:
+        return "auto"
+    if text == LANG_ENGLISH:
+        return "english"
+    if text.startswith("Always ") and text[7:] in OTHER_LANGUAGES:
+        return "other"
+    return text
+
+
 def _voice_token(raw: Any) -> str:
     """Voice id from a combo entry ('af_heart  Heart (American English, female)' -> 'af_heart')."""
     return str(raw or "").strip().split(" ", 1)[0]
@@ -116,6 +154,12 @@ def form_from_config(cfg: Config) -> dict[str, Any]:
         "pill_position": cfg.ui.pill_position,
         "model": model_choice(s.model),
         "voice": s.voice,
+        "english_engine": s.english_engine,
+        "english_supertonic_voice": s.english_supertonic_voice,
+        "other_language": s.other_language,
+        "other_voice": s.other_voice,
+        "language_mode": s.language_mode,
+        "supertonic_steps": str(s.supertonic_steps),
         "speed": _num(s.speed),
         "sentence_pause": _num(s.sentence_pause),
         "volume": _num(s.volume),
@@ -165,6 +209,14 @@ def _choice(form: dict, key: str, label: str, options: tuple[str, ...]) -> str:
     return value
 
 
+def _supertonic_voice(form: dict, key: str, label: str) -> str:
+    raw = _voice_token(form.get(key, ""))
+    name = raw[len(SUPERTONIC_PREFIX):] if raw.startswith(SUPERTONIC_PREFIX) else raw
+    if name not in SUPERTONIC_VOICES:
+        raise ValueError(f"{label} must be one of: {', '.join(SUPERTONIC_VOICES)}")
+    return name
+
+
 def config_from_form(base: Config, form: dict[str, Any]) -> Config:
     """Apply `form` onto a deep copy of `base`; ValueError (readable text) on invalid input."""
     cfg = copy.deepcopy(base)
@@ -193,7 +245,21 @@ def config_from_form(base: Config, form: dict[str, Any]) -> Config:
     voice = _voice_token(form.get("voice", ""))
     if not voice:
         raise ValueError("Pick a voice")
+    if is_supertonic_voice(voice):
+        raise ValueError("English voice (Kokoro) must be a Kokoro voice")
     s.voice = voice
+    s.english_engine = _choice(form, "english_engine", "English engine", ENGINES)
+    s.english_supertonic_voice = _supertonic_voice(
+        form, "english_supertonic_voice", "English Supertonic voice")
+    other = str(form.get("other_language", "")).strip()
+    other = other if other in SUPERTONIC_LANGUAGES else OTHER_LANGUAGES.get(other, "")
+    if not other or other == "en":
+        raise ValueError("Other language must be one of the 30 non-English Supertonic languages")
+    s.other_language = other
+    s.other_voice = _supertonic_voice(form, "other_voice", "Other language voice")
+    s.language_mode = _choice(form, "language_mode", "Language", LANGUAGE_MODES)
+    s.supertonic_steps = _int(form, "supertonic_steps", "Quality steps",
+                              SUPERTONIC_STEPS_RANGE[0], SUPERTONIC_STEPS_RANGE[1])
     s.speed = _float(form, "speed", "Speed", 0.5, 2.0)
     s.sentence_pause = _float(form, "sentence_pause", "Pause between sentences (s)", 0.0, 3.0)
     s.volume = _float(form, "volume", "Volume", 0.0, 1.0)
@@ -238,6 +304,10 @@ class SettingsHooks:
     mcp_status: Callable[[], dict] = lambda: {"enabled": False, "running": False, "url": "",
                                               "error": ""}
     open_folder: Callable[[Path], None] = lambda path: None
+    # Supertonic model files (download / delete run from the Supertonic tab)
+    supertonic_dir: Callable[[], Path] = lambda: ROOT / "models" / "supertonic-3"
+    supertonic_present: Callable[[], bool] = lambda: False
+    supertonic_changed: Callable[[], None] = lambda: None
 
 
 # ---------------------------------------------------------------- win32 / theme helpers
@@ -322,6 +392,9 @@ class SettingsWindow:
         self._export_cancel = threading.Event()
         self._export_title = ""
         self._export_markdown = True
+        self._st_busy = False
+        self._st_cancel = threading.Event()
+        self._st_sync = False
 
     # -- public -----------------------------------------------------------
     def is_visible(self) -> bool:
@@ -353,7 +426,9 @@ class SettingsWindow:
             top.focus_force()
         except tk.TclError:
             pass
-        if download and not self._busy:
+        if download and tab == "supertonic":
+            self._st_download()
+        elif download and not self._busy:
             self._nb.select(TABS.index("kokoro"))
             self._download_missing()
 
@@ -363,6 +438,7 @@ class SettingsWindow:
         if self.top is not None:
             self._safe_ui(self._follow_config)
             self._safe_ui(self._refresh_files)
+            self._safe_ui(self._refresh_supertonic)
             self._safe_ui(self._load_voices)
             self._safe_ui(self._refresh_export)
             self._safe_ui(self._refresh_mcp)
@@ -370,9 +446,10 @@ class SettingsWindow:
     def _follow_config(self) -> None:
         form = form_from_config(self.hooks.get_config())
         collected = self._collect()
-        if collected.get("voice") == self._snapshot.get("voice"):
-            self._vars["voice"].set(form["voice"])
-            self._snapshot["voice"] = form["voice"]
+        for key in FOLLOW_KEYS:
+            if key in self._vars and collected.get(key) == self._snapshot.get(key):
+                self._set_form_var(key, form[key])
+                self._snapshot[key] = form[key]
 
     def _fit(self) -> None:
         top = self.top
@@ -460,7 +537,7 @@ class SettingsWindow:
         self._nb.pack(side="top", fill="both", expand=True)
         frames = {}
         for name in TABS:
-            if name == "export":  # the tallest tab: scrolls instead of growing the window
+            if name in SCROLL_TABS:  # the tall tabs scroll instead of growing the window
                 holder = ScrollableFrame(self._nb, height=int(480 * scale))
                 self._nb.add(holder, text=TAB_TITLES[name])
                 frames[name] = holder.body
@@ -472,6 +549,7 @@ class SettingsWindow:
         self._build_voice(frames["voice"])
         self._build_export(frames["export"])
         self._build_kokoro(frames["kokoro"])
+        self._build_supertonic(frames["supertonic"])
         self._build_mcp(frames["mcp"])
         self._build_about(frames["about"])
         top.update_idletasks()
@@ -576,9 +654,44 @@ class SettingsWindow:
 
     # -- Voice ----------------------------------------------------------------------
     def _build_voice(self, f: ttk.Frame) -> None:
-        vo = ttk.LabelFrame(f, text="Voice", padding=10)
-        vo.pack(fill="x")
-        self._voice_combo = self._combo(vo, 0, "Voice", "voice", [], 44, readonly=True)
+        en = ttk.LabelFrame(f, text="English", padding=10)
+        en.pack(fill="x")
+        ttk.Label(en, text="Engine").grid(row=0, column=0, sticky="w", pady=3, padx=(0, 10))
+        eng_row = ttk.Frame(en)
+        eng_row.grid(row=0, column=1, columnspan=2, sticky="w", pady=3)
+        engine_var = self._var("english_engine", "kokoro")
+        for value, text in (("kokoro", "Kokoro"), ("supertonic", "Supertonic")):
+            ttk.Radiobutton(eng_row, text=text, value=value, variable=engine_var).pack(
+                side="left", padx=(0, 12))
+        # both voice combos share one row; only the selected engine's is shown
+        self._voice_combo = self._combo(en, 1, "Voice", "voice", [], 44, readonly=True)
+        self._en_st_combo = self._combo(en, 1, "Voice", "english_supertonic_voice",
+                                        list(SUPERTONIC_VOICES), 44, readonly=True)
+        engine_var.trace_add("write", lambda *_: self._safe_ui(self._show_engine_combo))
+        self._show_engine_combo()
+
+        ot = ttk.LabelFrame(f, text="Other language", padding=10)
+        ot.pack(fill="x", pady=(10, 0))
+        self._other_combo = self._combo(ot, 0, "Language", "other_language",
+                                        list(OTHER_LANGUAGES), 44, readonly=True)
+        self._other_voice_combo = self._combo(ot, 1, "Voice", "other_voice",
+                                              list(SUPERTONIC_VOICES), 44, readonly=True)
+
+        lg = ttk.LabelFrame(f, text="Language", padding=10)
+        lg.pack(fill="x", pady=(10, 0))
+        self._language_combo = self._combo(
+            lg, 0, "Read", "language_mode",
+            [LANG_AUTO, LANG_ENGLISH, language_mode_label("other", "")], 44, readonly=True)
+        ttk.Label(lg, text="Auto reads English-looking text with the English voice, anything "
+                  "else with the other language.", foreground="gray", wraplength=580,
+                  justify="left").grid(row=1, column=0, columnspan=3, sticky="w")
+        self._supertonic_hint = ttk.Label(lg, text="", foreground="#d33")
+        self._supertonic_hint.grid(row=2, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        self._vars["other_language"].trace_add(
+            "write", lambda *_: self._safe_ui(self._sync_language_labels))
+
+        vo = ttk.LabelFrame(f, text="Playback", padding=10)
+        vo.pack(fill="x", pady=(10, 0))
         self._entry(vo, 1, "Speed", "speed", 6, hint="0.5 .. 2.0")
         self._entry(vo, 2, "Pause between sentences (s)", "sentence_pause", 6)
         self._entry(vo, 3, "Volume", "volume", 6, hint="0 .. 1")
@@ -597,6 +710,37 @@ class SettingsWindow:
             lambda: self.hooks.stop())).pack(side="left", padx=6)
         self._test_result = ttk.Label(row, text="", wraplength=440, justify="left")
         self._test_result.pack(side="left", padx=10)
+
+    def _show_engine_combo(self) -> None:
+        supertonic = str(self._vars["english_engine"].get()) == "supertonic"
+        shown, hidden = (self._en_st_combo, self._voice_combo) if supertonic else (
+            self._voice_combo, self._en_st_combo)
+        hidden.grid_remove()
+        shown.grid()
+
+    def _sync_language_labels(self) -> None:
+        """The third Language choice names the selected other language."""
+        name = str(self._vars["other_language"].get())
+        third = language_mode_label("other", name)
+        mode = language_mode_from_label(self._vars["language_mode"].get())
+        self._language_combo.configure(values=[LANG_AUTO, LANG_ENGLISH, third])
+        if mode == "other":
+            self._vars["language_mode"].set(third)
+
+    def _set_form_var(self, key: str, value: Any) -> None:
+        """Set a form variable from its config-side value (codes -> display names)."""
+        if key == "other_language":
+            value = SUPERTONIC_LANGUAGE_NAMES.get(str(value), value)
+        elif key == "language_mode":
+            value = language_mode_label(str(value), str(self._vars["other_language"].get()))
+        self._vars[key].set(value)
+
+    def _refresh_voice_hint(self) -> None:
+        try:
+            present = bool(self.hooks.supertonic_present())
+        except Exception:
+            present = False
+        self._supertonic_hint.configure(text="" if present else SUPERTONIC_HINT)
 
     # -- Export ------------------------------------------------------------------
     def _build_export(self, f: ttk.Frame) -> None:
@@ -630,6 +774,14 @@ class SettingsWindow:
             vo, textvariable=self._export_voice, values=[AUTO_VOICE], width=44,
             state="readonly")
         self._export_voice_combo.grid(row=0, column=1, columnspan=2, sticky="w", pady=3)
+        self._export_lang_codes: dict[str, str | None] = {
+            EXPORT_LANG_AUTO: None, EXPORT_LANG_ENGLISH: "en", **OTHER_LANGUAGES}
+        self._export_lang = tk.StringVar(value=EXPORT_LANG_AUTO)
+        ttk.Label(vo, text="Language").grid(row=2, column=0, sticky="w", pady=3, padx=(0, 10))
+        self._export_lang_combo = ttk.Combobox(
+            vo, textvariable=self._export_lang, values=list(self._export_lang_codes), width=44,
+            state="readonly")
+        self._export_lang_combo.grid(row=2, column=1, columnspan=2, sticky="w", pady=3)
         self._export_speed = tk.StringVar(value=_num(self.hooks.get_config().speech.speed))
         ttk.Label(vo, text="Speed").grid(row=1, column=0, sticky="w", pady=3, padx=(0, 10))
         ttk.Entry(vo, textvariable=self._export_speed, width=6).grid(
@@ -843,7 +995,8 @@ class SettingsWindow:
             out = out.with_name(f"{out.name}.{fmt}")
         req = ExportRequest(
             text=text, out=out, voice=self._export_voice_ids.get(self._export_voice.get()),
-            speed=speed, fmt=None, bitrate=bitrate, markdown=self._export_markdown, gain=1.0, overwrite=True,
+            speed=speed, lang=self._export_lang_codes.get(self._export_lang.get()), fmt=None,
+            bitrate=bitrate, markdown=self._export_markdown, gain=1.0, overwrite=True,
             title=title)
         cancel = self._export_cancel
         cancel.clear()
@@ -1022,6 +1175,178 @@ class SettingsWindow:
         self._progress_label = ttk.Label(mm, text="")
         self._progress_label.pack(anchor="w", pady=(4, 0))
 
+    # -- Supertonic -------------------------------------------------------------
+    def _build_supertonic(self, f: ttk.Frame) -> None:
+        mm = ttk.LabelFrame(f, text="Supertonic 3 model", padding=10)
+        mm.pack(fill="x")
+        ttk.Label(mm, text=SUPERTONIC_NOTE, wraplength=580, justify="left").pack(anchor="w")
+        self._st_status = ttk.Label(mm, text="")
+        self._st_status.pack(anchor="w", pady=(8, 0))
+        btns = ttk.Frame(mm)
+        btns.pack(fill="x", pady=(8, 0))
+        self._st_dl_btn = ttk.Button(btns, text="Download", command=self._st_download,
+                                     style="Accent.TButton" if sv_ttk else "TButton")
+        self._st_dl_btn.pack(side="left")
+        self._st_del_btn = ttk.Button(btns, text="Delete", command=self._st_delete)
+        self._st_del_btn.pack(side="left", padx=6)
+        self._st_progress = ttk.Progressbar(btns, mode="determinate", length=160, maximum=100)
+        self._st_progress.pack(side="left", padx=(12, 6))
+        self._st_cancel_btn = ttk.Button(btns, text="Cancel", command=self._st_cancel.set,
+                                         state="disabled")
+        self._st_cancel_btn.pack(side="left")
+        ttk.Button(btns, text="Open folder", command=self._safe_call(self._open_supertonic)).pack(
+            side="right")
+        self._st_progress_label = ttk.Label(mm, text="")
+        self._st_progress_label.pack(anchor="w", pady=(4, 0))
+
+        q = ttk.LabelFrame(f, text="Quality", padding=10)
+        q.pack(fill="x", pady=(10, 0))
+        lo, hi = SUPERTONIC_STEPS_RANGE
+        ttk.Label(q, text="Quality steps").grid(row=0, column=0, sticky="w", padx=(0, 10))
+        var = self._var("supertonic_steps", "8")
+        self._st_scale = ttk.Scale(q, from_=lo, to=hi, orient="horizontal", length=220,
+                                   command=self._st_scale_moved)
+        self._st_scale.grid(row=0, column=1, sticky="w")
+        ttk.Entry(q, textvariable=var, width=5).grid(row=0, column=2, sticky="w", padx=8)
+        ttk.Label(q, text=f"{lo} .. {hi}: fewer steps are faster, more are cleaner",
+                  foreground="gray").grid(row=1, column=1, columnspan=2, sticky="w")
+        var.trace_add("write", lambda *_: self._safe_ui(self._st_steps_typed))
+
+    def _st_scale_moved(self, raw: str) -> None:
+        if self._st_sync:
+            return
+        self._st_sync = True
+        try:
+            self._vars["supertonic_steps"].set(str(int(round(float(raw)))))
+        except (ValueError, tk.TclError):
+            pass
+        finally:
+            self._st_sync = False
+
+    def _st_steps_typed(self) -> None:
+        if self._st_sync:
+            return
+        self._st_sync = True
+        try:
+            self._st_scale.set(int(str(self._vars["supertonic_steps"].get()).strip()))
+        except (ValueError, tk.TclError):
+            pass
+        finally:
+            self._st_sync = False
+
+    def _open_supertonic(self) -> None:
+        folder = self.hooks.supertonic_dir()
+        folder.mkdir(parents=True, exist_ok=True)
+        os.startfile(str(folder))  # type: ignore[attr-defined]
+
+    def _refresh_supertonic(self) -> None:
+        """Status line, button states and the hint on the Voice tab."""
+        folder = Path(self.hooks.supertonic_dir())
+        try:
+            missing = list(model_setup.supertonic_missing(folder))
+        except Exception:
+            log.debug("supertonic status failed", exc_info=True)
+            missing = ["?"]
+        size = 0
+        try:
+            if folder.exists():
+                size = sum(p.stat().st_size for p in folder.rglob("*") if p.is_file())
+        except OSError:
+            pass
+        if not missing:
+            text = f"Installed ({_fmt_size(size)} on disk)"
+        elif size == 0:
+            text = "Not installed"
+        else:
+            text = f"Incomplete ({len(missing)} files missing, {_fmt_size(size)} on disk)"
+        self._st_status.configure(text=text)
+        idle = not self._st_busy
+        self._st_dl_btn.configure(state="normal" if idle and missing else "disabled")
+        self._st_del_btn.configure(state="normal" if idle and (size or not missing) else "disabled")
+        self._refresh_voice_hint()
+
+    def _set_st_busy(self, busy: bool, text: str = "") -> None:
+        self._st_busy = busy
+        self._st_cancel_btn.configure(state="normal" if busy else "disabled")
+        self._st_progress_label.configure(text=text)
+        if not busy:
+            self._st_progress.configure(value=0)
+        self._st_cancel.clear()
+        if busy:
+            self._st_dl_btn.configure(state="disabled")
+            self._st_del_btn.configure(state="disabled")
+
+    def _st_progress_cb(self) -> Callable[[int, int | None], None]:
+        def cb(done: int, total: int | None) -> None:
+            def ui() -> None:
+                try:
+                    if total:
+                        text = f"Downloading Supertonic: {done / 1e6:.0f} / {total / 1e6:.0f} MB"
+                        self._st_progress.configure(mode="determinate",
+                                                    value=100.0 * done / total)
+                    else:
+                        text = f"Downloading Supertonic: {done / 1e6:.0f} MB"
+                    self._st_progress_label.configure(text=text)
+                except tk.TclError:
+                    pass
+            self._post(ui)
+        return cb
+
+    def _st_changed(self) -> None:
+        try:
+            self.hooks.supertonic_changed()
+        except Exception:
+            log.exception("supertonic_changed failed")
+        self._refresh_supertonic()
+        self._load_voices()
+
+    def _st_download(self) -> None:
+        if self._st_busy:
+            return
+        cancel = self._st_cancel
+        cb = self._st_progress_cb()
+        folder = self.hooks.supertonic_dir()
+        self._set_st_busy(True, "Downloading Supertonic...")
+
+        def run() -> None:
+            error: Exception | None = None
+            try:
+                model_setup.download_supertonic(folder, cb, cancel)
+            except Exception as e:  # noqa: BLE001
+                error = e
+
+            def finish() -> None:
+                self._set_st_busy(False)
+                if isinstance(error, model_setup.DownloadCancelled):
+                    self._refresh_supertonic()
+                    self._set_status("Download cancelled.")
+                elif error is not None:
+                    self._refresh_supertonic()
+                    messagebox.showerror("Download failed", str(error), parent=self.top)
+                else:
+                    self._st_changed()
+                    self._set_status("Supertonic downloaded.")
+            self._post(lambda: self._safe_ui(finish))
+
+        self._spawn(run)
+
+    def _st_delete(self) -> None:
+        if self._st_busy:
+            return
+        if not messagebox.askyesno("Delete Supertonic", "Delete the Supertonic model files?",
+                                   parent=self.top):
+            return
+        self.hooks.stop()
+        try:
+            model_setup.delete_supertonic(self.hooks.supertonic_dir())
+        except OSError as e:
+            messagebox.showerror("Delete failed", f"{e}\n\nQuit VibeTTS first if the model is "
+                                 "in use.", parent=self.top)
+            self._refresh_supertonic()
+            return
+        self._st_changed()
+        self._set_status("Supertonic deleted.")
+
     def _open_models(self) -> None:
         folder = self.hooks.models_dir()
         folder.mkdir(parents=True, exist_ok=True)
@@ -1045,9 +1370,9 @@ class SettingsWindow:
             self._setup.pack_forget()
 
     def _load_voices(self) -> None:
-        """Fill the voice combo."""
+        """Fill the Kokoro English voice combo (Supertonic voices are the fixed F1..M5)."""
         try:
-            voices = list(self.hooks.voices())
+            voices = [v for v in self.hooks.voices() if not is_supertonic_voice(v)]
         except Exception:
             log.debug("voice list failed", exc_info=True)
             voices = []
@@ -1058,6 +1383,7 @@ class SettingsWindow:
         self._voice_combo.configure(values=[display[v] for v in voices])
         if current:
             self._vars["voice"].set(display.get(current, current))
+        self._refresh_voice_hint()
 
     def _refresh_files(self) -> None:
         mdir = self.hooks.models_dir()
@@ -1198,7 +1524,7 @@ class SettingsWindow:
     def _build_about(self, f: ttk.Frame) -> None:
         ttk.Label(f, text="VibeTTS", font=("Segoe UI", 16, "bold")).pack(anchor="w")
         ttk.Label(f, text=f"Version {self.hooks.version}").pack(anchor="w", pady=(2, 8))
-        ttk.Label(f, text="Local text-to-speech with Kokoro-82M (Apache 2.0).",
+        ttk.Label(f, text="Local text-to-speech with Kokoro-82M (Apache 2.0) and Supertonic 3 (OpenRAIL-M).",
                   wraplength=600, justify="left").pack(anchor="w")
         ttk.Label(f, text=f"App folder: {ROOT}", wraplength=600, justify="left").pack(
             anchor="w", pady=(6, 0))
@@ -1230,8 +1556,9 @@ class SettingsWindow:
         form = form_from_config(cfg)
         for key, value in form.items():
             if key in self._vars:
-                self._vars[key].set(value)
+                self._set_form_var(key, value)
         self._load_voices()
+        self._refresh_supertonic()
         self._refresh_export()
         self._refresh_mcp()
         try:
@@ -1252,6 +1579,14 @@ class SettingsWindow:
         form = {k: v.get() for k, v in self._vars.items()}
         if "voice" in form:
             form["voice"] = _voice_token(form["voice"])
+        for key in ("english_supertonic_voice", "other_voice"):
+            if key in form:
+                form[key] = _voice_token(form[key])
+        if "other_language" in form:
+            name = str(form["other_language"]).strip()
+            form["other_language"] = OTHER_LANGUAGES.get(name, name)
+        if "language_mode" in form:
+            form["language_mode"] = language_mode_from_label(form["language_mode"])
         return form
 
     def _is_dirty(self) -> bool:

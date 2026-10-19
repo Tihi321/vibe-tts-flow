@@ -1,4 +1,4 @@
-"""Kokoro speech engine and a streaming speaker.
+"""Kokoro speech engine and a streaming speaker (all audio is 44.1 kHz).
 
 The speaker generates one chunk ahead on a worker thread while the previous chunk
 plays, so audio starts after the first (short) chunk and never waits afterwards:
@@ -16,32 +16,40 @@ from typing import Any, Callable, Protocol
 
 import numpy as np
 
+from .config import SUPERTONIC_PREFIX, is_supertonic_voice
 from .textprep import Chunk
 
 log = logging.getLogger(__name__)
 
-SAMPLE_RATE = 24000
-BLOCK_FRAMES = 2400  # 100 ms: how quickly Stop takes effect
+SAMPLE_RATE = 44100   # every output: Supertonic natively, Kokoro resampled up from 24 kHz
+KOKORO_RATE = 24000
+BLOCK_FRAMES = 4410   # 100 ms: how quickly Stop takes effect
 
-# voice name prefix -> espeak language. Japanese (j) and Chinese (z) voices need extra
-# phonemizer packages that are not bundled, so they are not offered.
-VOICE_LANGS = {"a": "en-us", "b": "en-gb", "e": "es", "f": "fr-fr", "h": "hi", "i": "it",
-               "p": "pt-br"}
-LANG_LABELS = {"a": "American English", "b": "British English", "e": "Spanish",
-               "f": "French", "h": "Hindi", "i": "Italian", "p": "Portuguese (BR)"}
+# Kokoro voice name prefix -> espeak language. Kokoro only reads English here (other
+# languages go to Supertonic), so only the American and British voices are offered.
+VOICE_LANGS = {"a": "en-us", "b": "en-gb"}
+LANG_LABELS = {"a": "American English", "b": "British English"}
 
 
 def voice_lang(voice: str) -> str:
     return VOICE_LANGS.get(voice[:1], "en-us")
 
 
-def voice_supported(voice: str) -> bool:
+def kokoro_voice_supported(voice: str) -> bool:
     return len(voice) > 3 and voice[:1] in VOICE_LANGS and voice[2:3] == "_"
 
 
+def voice_supported(voice: str) -> bool:
+    """A Kokoro English voice id (af_heart) or a Supertonic one (supertonic:F1)."""
+    return kokoro_voice_supported(voice) or is_supertonic_voice(voice)
+
+
 def voice_label(voice: str) -> str:
-    """'af_heart' -> 'Heart (American English, female)'."""
-    if not voice_supported(voice):
+    """'af_heart' -> 'Heart (American English, female)'; 'supertonic:F1' -> 'F1 (Supertonic, female)'."""
+    if is_supertonic_voice(voice):
+        name = voice[len(SUPERTONIC_PREFIX):]
+        return f"{name} (Supertonic, {'female' if name[:1] == 'F' else 'male'})"
+    if not kokoro_voice_supported(voice):
         return voice
     gender = {"f": "female", "m": "male"}.get(voice[1:2], "")
     name = voice[3:].replace("_", " ").title()
@@ -51,7 +59,8 @@ def voice_label(voice: str) -> str:
 
 class Engine(Protocol):
     def voices(self) -> list[str]: ...
-    def synth(self, text: str, voice: str, speed: float) -> np.ndarray: ...
+    def synth(self, text: str, voice: str, speed: float,
+              lang: str | None = None) -> np.ndarray: ...
 
 
 class KokoroEngine:
@@ -67,13 +76,23 @@ class KokoroEngine:
         log.info("loaded %s in %.2fs", Path(model_path).name, time.perf_counter() - t0)
 
     def voices(self) -> list[str]:
-        return [v for v in self._kokoro.get_voices() if voice_supported(v)]
+        return [v for v in self._kokoro.get_voices() if kokoro_voice_supported(v)]
 
-    def synth(self, text: str, voice: str, speed: float) -> np.ndarray:
+    def synth(self, text: str, voice: str, speed: float, lang: str | None = None) -> np.ndarray:
+        """44.1 kHz mono audio (`lang` is ignored: Kokoro reads English here)."""
         with self._lock:
-            samples, _ = self._kokoro.create(text, voice=voice, speed=speed,
-                                             lang=voice_lang(voice))
-        return np.asarray(samples, dtype=np.float32)
+            samples, rate = self._kokoro.create(text, voice=voice, speed=speed,
+                                                lang=voice_lang(voice))
+        return resample(np.asarray(samples, dtype=np.float32), int(rate or KOKORO_RATE))
+
+
+def resample(samples: np.ndarray, rate: int, target: int = SAMPLE_RATE) -> np.ndarray:
+    """`samples` at `rate` Hz -> `target` Hz (soxr, high quality)."""
+    if rate == target or len(samples) == 0:
+        return samples.astype(np.float32, copy=False)
+    import soxr  # lazy: only Kokoro needs it
+
+    return np.asarray(soxr.resample(samples, rate, target, quality="HQ"), dtype=np.float32)
 
 
 # ---------------------------------------------------------------- audio output
@@ -144,9 +163,10 @@ def write_wav(path: Path, samples: np.ndarray) -> None:
 
 class SpeakRequest:
     def __init__(self, chunks: list[Chunk], voice: str, speed: float, pause: float,
-                 volume: float = 1.0, device: str = ""):
+                 volume: float = 1.0, device: str = "", lang: str | None = None):
         self.chunks = chunks
         self.voice = voice
+        self.lang = lang  # Supertonic language code (None = English); Kokoro ignores it
         self.speed = speed
         self.pause = pause
         self.volume = volume
@@ -232,7 +252,7 @@ class Speaker:
                 if stop.is_set():
                     return
                 t0 = time.perf_counter()
-                samples = engine.synth(chunk.text, req.voice, req.speed)
+                samples = engine.synth(chunk.text, req.voice, req.speed, req.lang)
                 log.debug("synth %d chars -> %.2fs audio in %.2fs", len(chunk.text),
                           len(samples) / SAMPLE_RATE, time.perf_counter() - t0)
                 gap = int(req.pause * chunk.pause_after * SAMPLE_RATE)

@@ -1,4 +1,4 @@
-"""VibeTTS application: hotkey -> selected text -> Kokoro -> speakers, plus tray and settings."""
+"""VibeTTS application: hotkey -> selected text -> Kokoro / Supertonic -> speakers, plus tray and settings."""
 from __future__ import annotations
 
 import argparse
@@ -11,15 +11,20 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from . import __version__
 from .config import (
     ROOT,
+    SUPERTONIC_LANGUAGE_NAMES,
+    SUPERTONIC_LANGUAGES,
+    SUPERTONIC_PREFIX,
+    SUPERTONIC_VOICES,
     Config,
     SpeechConfig,
     config_path,
     export_folder,
+    is_supertonic_voice,
     load_config,
     resolve_path,
     save_config,
@@ -35,6 +40,8 @@ log = logging.getLogger(__name__)
 _MCP_LOCK = threading.RLock()  # serializes _sync_mcp / stop (Tk thread, tray thread, quit)
 
 MISSING_MODEL = "Download the voice model to start reading aloud"
+MISSING_SUPERTONIC = "Supertonic is not installed: download it in Settings > Supertonic"
+SUPERTONIC_HINT = "Download Supertonic in Settings"
 
 
 def _short(msg: str, limit: int = 60) -> str:
@@ -47,15 +54,171 @@ def model_files(s: SpeechConfig) -> tuple[Path, Path]:
 
 
 def models_present(s: SpeechConfig) -> bool:
+    """Are the Kokoro model files there?"""
     return all(p.is_file() for p in model_files(s))
 
 
-def plan_speech(s: SpeechConfig, text: str, voice: str | None = None, markdown: bool = True,
-                max_chars: int = 0) -> tuple[list[Chunk], str]:
-    """Chunks and voice of one request (an explicit `voice`, else speech.voice)."""
+def _st() -> Any:
+    """The Supertonic module, imported on first use (it is only needed for those voices)."""
+    from . import supertonic
+
+    return supertonic
+
+
+def supertonic_dir(s: SpeechConfig) -> Path:
+    return resolve_path(s.supertonic_dir)
+
+
+def supertonic_present(s: SpeechConfig) -> bool:
+    try:
+        return bool(_st().models_present(supertonic_dir(s)))
+    except Exception:
+        log.debug("Supertonic check failed", exc_info=True)
+        return False
+
+
+def supertonic_voice_ids() -> list[str]:
+    return [SUPERTONIC_PREFIX + v for v in SUPERTONIC_VOICES]
+
+
+def voice_ready(s: SpeechConfig, voice: str) -> bool:
+    """Are the model files for the engine that speaks `voice` present?"""
+    return supertonic_present(s) if is_supertonic_voice(voice) else models_present(s)
+
+
+def missing_message(voice: str) -> str:
+    return MISSING_SUPERTONIC if is_supertonic_voice(voice) else MISSING_MODEL
+
+
+def setup_tab(voice: str) -> str:
+    """The Settings tab with the Download panel for the engine that speaks `voice`."""
+    return "supertonic" if is_supertonic_voice(voice) else "kokoro"
+
+
+class Route(NamedTuple):
+    """How one request is read: the engine, the voice id, the language ('en' or a Supertonic
+    code) and whether Supertonic was wanted but is not installed (Kokoro English reads it)."""
+    engine: str
+    voice: str
+    lang: str
+    fell_back: bool = False
+
+
+def kokoro_voice_of(s: SpeechConfig) -> str:
+    from .tts import kokoro_voice_supported
+
+    return s.voice if kokoro_voice_supported(s.voice) else "af_heart"
+
+
+def english_voice_of(s: SpeechConfig) -> str:
+    """The voice id of the English profile."""
+    if s.english_engine == "supertonic":
+        return SUPERTONIC_PREFIX + s.english_supertonic_voice
+    return kokoro_voice_of(s)
+
+
+def other_voice_of(s: SpeechConfig) -> str:
+    """The voice id of the other-language profile."""
+    return SUPERTONIC_PREFIX + s.other_voice
+
+
+def profile_lang(s: SpeechConfig, text: str) -> str:
+    """Language of the profile `text` goes to: 'en', or speech.other_language (decided once
+    per read by language_mode, and by looks_english in auto mode)."""
+    from .textprep import looks_english
+
+    if s.language_mode == "english":
+        return "en"
+    if s.language_mode == "other":
+        return s.other_language
+    return "en" if looks_english(text) else s.other_language
+
+
+def route_for(s: SpeechConfig, text: str, lang: str | None = None,
+              supertonic_ok: bool | None = None) -> Route:
+    """Engine, voice and language of one read. `lang` None: language_mode + looks_english pick
+    the profile; 'en' is the English profile; any other code is read with the other-language
+    voice in that language. Supertonic not installed: Kokoro English reads it (fell_back)."""
+    lang = lang or profile_lang(s, text)
+    wants_supertonic = lang != "en" or s.english_engine == "supertonic"
+    if wants_supertonic and not (supertonic_present(s) if supertonic_ok is None
+                                 else supertonic_ok):
+        return Route("kokoro", kokoro_voice_of(s), "en", True)
+    if lang == "en":
+        voice = english_voice_of(s)
+        return Route("supertonic" if is_supertonic_voice(voice) else "kokoro", voice, "en")
+    return Route("supertonic", other_voice_of(s), lang)
+
+
+def route_request(s: SpeechConfig, text: str, voice: str | None = None,
+                  lang: str | None = None) -> Route:
+    """Route of an explicit request (export, MCP): without `voice` it is route_for. An explicit
+    voice is used as is; a Kokoro voice reads English only (ValueError for another `lang`)."""
+    if lang is not None and lang not in SUPERTONIC_LANGUAGES:
+        raise ValueError(f"Unknown language '{lang}'")
+    if not voice:
+        return route_for(s, text, lang)
+    if is_supertonic_voice(voice):
+        return Route("supertonic", voice, lang or profile_lang(s, text))
+    if lang not in (None, "en"):
+        raise ValueError(f"The Kokoro voice '{voice}' reads English only; "
+                         f"use a supertonic: voice for language '{lang}'")
+    return Route("kokoro", voice, "en")
+
+
+def needed_voices(s: SpeechConfig) -> list[str]:
+    """The configured voices language_mode can pick: English profile, other profile or both."""
+    voices = []
+    if s.language_mode != "other":
+        voices.append(english_voice_of(s))
+    if s.language_mode != "english":
+        voices.append(other_voice_of(s))
+    return voices
+
+
+def missing_voices(s: SpeechConfig) -> list[str]:
+    return [v for v in needed_voices(s) if not voice_ready(s, v)]
+
+
+def primary_voice(s: SpeechConfig) -> str:
+    """The voice the app mainly needs: the other profile's when forced, else the English one."""
+    return other_voice_of(s) if s.language_mode == "other" else english_voice_of(s)
+
+
+def profile_routes(s: SpeechConfig) -> list[Route]:
+    """Routes of the profiles language_mode can pick (what to preload)."""
+    ok = supertonic_present(s)
+    routes = []
+    if s.language_mode != "other":
+        routes.append(route_for(s, "", "en", ok))
+    if s.language_mode != "english":
+        routes.append(route_for(s, "", s.other_language, ok))
+    return routes
+
+
+_fallback_warned = False
+
+
+def note_fallback(route: Route) -> bool:
+    """Log (once per session) that Supertonic is missing and Kokoro English reads instead.
+    True the first time."""
+    global _fallback_warned
+    if not route.fell_back or _fallback_warned:
+        return False
+    _fallback_warned = True
+    log.warning("Supertonic is not installed: reading with the Kokoro voice %s instead "
+                "(download it in Settings > Supertonic)", route.voice)
+    return True
+
+
+def plan_speech(s: SpeechConfig, text: str, voice: str | None = None, lang: str | None = None,
+                markdown: bool = True, max_chars: int = 0) -> tuple[list[Chunk], Route]:
+    """Chunks and Route of one request (does not check voice_ready). Without `voice` it is
+    routed as configured (route_for); `lang` then picks the profile / language."""
     from . import textprep
 
-    return textprep.prepare(text, markdown, max_chars), voice or s.voice
+    route = route_request(s, text, voice, lang)
+    return textprep.prepare(text, markdown, max_chars), route
 
 
 def run_export(engine: Any, s: SpeechConfig, req: ExportRequest, folder: Path,
@@ -63,15 +226,17 @@ def run_export(engine: Any, s: SpeechConfig, req: ExportRequest, folder: Path,
                fmt_default: str = "wav", bitrate_default: int = 64) -> ExportResult:
     """Blocking: synthesize req.text with `engine` and write the audio file (CLI, Settings
     Export tab and MCP all come through here). Raises ExportCancelled, FileExistsError,
-    ValueError (bad format / empty text) and RuntimeError (voice model missing)."""
+    ValueError (bad format / language / empty text) and RuntimeError (voice model missing)."""
     from . import export
 
-    chunks, voice = plan_speech(s, req.text, req.voice, req.markdown)
+    chunks, route = plan_speech(s, req.text, req.voice, req.lang, req.markdown)
+    voice, lang = route.voice, route.lang
     if not chunks:
         raise ValueError("Nothing to read in this text")
     speed = req.speed or s.speed
-    if not models_present(s):
-        raise RuntimeError(MISSING_MODEL)
+    if not voice_ready(s, voice):
+        raise RuntimeError(missing_message(voice))
+    note_fallback(route)
     fmt = req.fmt
     if req.out is not None and str(req.out).strip():
         by_name = export.format_for(req.out, default=fmt or fmt_default)
@@ -85,63 +250,132 @@ def run_export(engine: Any, s: SpeechConfig, req: ExportRequest, folder: Path,
         raise RuntimeError("MP3 export is unavailable: the lameenc package is not installed")
     path = export.resolve_output(req.out, folder, req.title, fmt, req.overwrite)
     seconds, size = export.render(
-        chunks, lambda text: engine.synth(text, voice, speed), path, fmt,
+        chunks, lambda text: engine.synth(text, voice, speed, lang), path, fmt,
         pause=s.sentence_pause, gain=req.gain, bitrate=req.bitrate or bitrate_default,
         progress=progress, cancel=cancel, before_chunk=before_chunk)
-    return export.ExportResult(path, fmt, seconds, len(chunks), size, voice)
+    return export.ExportResult(path, fmt, seconds, len(chunks), size, voice, lang)
 
 
 def voices_in_file(path: Path) -> list[str]:
-    """Voice names stored in voices-v1.0.bin (an .npz archive) without loading the model."""
+    """English voice names stored in voices-v1.0.bin (an .npz archive) without loading the model."""
     import numpy as np
 
-    from .tts import voice_supported
+    from .tts import kokoro_voice_supported
 
     with np.load(path) as data:
-        return sorted(v for v in data.files if voice_supported(v))
+        return sorted(v for v in data.files if kokoro_voice_supported(v))
+
+
+class RoutingEngine:
+    """Engine protocol over the loaded engines: synth goes to Supertonic for supertonic:
+    voices, to Kokoro for the rest; voices() merges both lists."""
+
+    def __init__(self, kokoro: Any = None, supertonic: Any = None):
+        self.kokoro = kokoro
+        self.supertonic = supertonic
+
+    def voices(self) -> list[str]:
+        out: list[str] = []
+        for engine in (self.kokoro, self.supertonic):
+            if engine is not None:
+                out += list(engine.voices())
+        return out
+
+    def synth(self, text: str, voice: str, speed: float, lang: str | None = None):
+        if is_supertonic_voice(voice):
+            if self.supertonic is None:
+                raise RuntimeError(MISSING_SUPERTONIC)
+            return self.supertonic.synth(text, voice, speed, lang)
+        if self.kokoro is None:
+            raise RuntimeError(MISSING_MODEL)
+        return self.kokoro.synth(text, voice, speed, lang)
 
 
 class EngineHolder:
-    """Loads the Kokoro engine once (lazily or in the background) and reloads it when the
-    model or voices file changes."""
+    """Loads one engine per family (Kokoro, Supertonic) lazily or in the background and
+    reloads a family when its files / settings change. get() loads the family that speaks
+    `voice` (default: the primary configured voice) and returns a RoutingEngine over
+    everything loaded so far."""
 
     def __init__(self, on_loading=lambda: None):
         self._lock = threading.Lock()
-        self._engine: Any = None
-        self._key: tuple[Path, Path] | None = None
+        self._kokoro: Any = None
+        self._kokoro_key: tuple | None = None
+        self._supertonic: Any = None
+        self._supertonic_key: tuple | None = None
         self.on_loading = on_loading
 
     @property
     def loaded(self) -> Any:
-        return self._engine
+        """A RoutingEngine over the loaded families, or None when nothing is loaded."""
+        with self._lock:
+            if self._kokoro is None and self._supertonic is None:
+                return None
+            return RoutingEngine(self._kokoro, self._supertonic)
 
-    def get(self, s: SpeechConfig, announce: bool = True) -> Any:
-        from .tts import KokoroEngine
+    def get(self, s: SpeechConfig, announce: bool = True, voice: str | None = None) -> Any:
+        voice = voice or primary_voice(s)
+        with self._lock:
+            if is_supertonic_voice(voice):
+                self._ensure_supertonic(s, announce, voice)
+            else:
+                self._ensure_kokoro(s, voice, announce)
+            return RoutingEngine(self._kokoro, self._supertonic)
+
+    def _ensure_kokoro(self, s: SpeechConfig, voice: str, announce: bool) -> None:
+        from .tts import KokoroEngine, kokoro_voice_supported
 
         key = model_files(s)
+        if self._kokoro is not None and self._kokoro_key == key:
+            return
+        if not all(p.is_file() for p in key):
+            raise RuntimeError(MISSING_MODEL)
+        if announce:
+            self.on_loading()
+        self._kokoro = None
+        engine = KokoroEngine(*key)
+        engine.synth("Ready.", voice if kokoro_voice_supported(voice) else kokoro_voice_of(s),
+                     1.0)  # warm-up: first run is slower
+        self._kokoro, self._kokoro_key = engine, key
+
+    def _ensure_supertonic(self, s: SpeechConfig, announce: bool, voice: str) -> None:
+        key = (supertonic_dir(s), int(s.supertonic_steps))
+        if self._supertonic is not None and self._supertonic_key == key:
+            return
+        if not supertonic_present(s):
+            raise RuntimeError(MISSING_SUPERTONIC)
+        if announce:
+            self.on_loading()
+        self._supertonic = None
+        engine = _st().SupertonicEngine(key[0], key[1])
+        try:
+            engine.synth("Ready.", voice if is_supertonic_voice(voice) else other_voice_of(s),
+                         1.0, "en")  # warm-up: first run is slower
+        except Exception:
+            log.warning("Supertonic warm-up failed", exc_info=True)
+        self._supertonic, self._supertonic_key = engine, key
+
+    def unload_supertonic(self) -> None:
+        """Drop the Supertonic engine (before its files are deleted, or after a download)."""
         with self._lock:
-            if self._engine is not None and self._key == key:
-                return self._engine
-            if not all(p.is_file() for p in key):
-                raise RuntimeError(MISSING_MODEL)
-            if announce:
-                self.on_loading()
-            self._engine = None
-            engine = KokoroEngine(*key)
-            engine.synth("Ready.", s.voice, 1.0)  # warm-up: first run is slower
-            self._engine, self._key = engine, key
-            return engine
+            self._supertonic, self._supertonic_key = None, None
 
     def preload(self, s: SpeechConfig) -> None:
-        """Load the engine in the background."""
-        if not models_present(s):
+        """Load the engine(s) of the configured profile(s) in the background (those whose
+        files are present)."""
+        voices: dict[str, str] = {}
+        for route in profile_routes(s):
+            if voice_ready(s, route.voice):
+                voices.setdefault(route.engine, route.voice)
+        if not voices:
             return
 
         def run() -> None:
-            try:
-                self.get(s, announce=False)
-            except Exception:
-                log.exception("preloading the voice model failed")
+            for voice in voices.values():
+                try:
+                    self.get(s, announce=False, voice=voice)
+                except Exception:
+                    log.exception("preloading the voice model failed")
         threading.Thread(target=run, name="vibetts-preload", daemon=True).start()
 
 
@@ -166,6 +400,7 @@ class TTSApp:
         self._quit_lock = threading.Lock()
         self._quit_done = False
         self._startup_errors: list[str] = []
+        self._hint: str | None = None  # shown once reading ends (e.g. Supertonic is missing)
         self._export_lock = threading.Lock()  # one export at a time (app, Settings, MCP)
         self._export_cancel: threading.Event | None = None
         self._mcp: Any = None  # the running McpServer
@@ -185,6 +420,7 @@ class TTSApp:
         self.speaker = Speaker(self._engine_for_speaker, SoundDeviceOutput,
                                on_start=self._on_speak_start, on_done=self._on_speak_done)
         self._speak_cfg: SpeechConfig = cfg.speech
+        self._speak_voice: str | None = None  # voice of the request being spoken
         self.listener = HotkeyListener({"read": chord}, self._on_hotkey, self._on_escape)
 
         hooks = TrayHooks(
@@ -192,11 +428,18 @@ class TTSApp:
             set_enabled=self._set_enabled,
             is_speaking=lambda: self.speaker.busy,
             stop=self.stop,
-            model_missing=lambda: not models_present(self.cfg.speech),
-            download_model=lambda: self.open_settings("kokoro", download=True),
+            model_missing=lambda: bool(missing_voices(self.cfg.speech)),
+            download_model=self._download_missing,
             voices=self._voices,
-            current_voice=lambda: self.cfg.speech.voice,
+            current_voice=lambda: english_voice_of(self.cfg.speech),
             set_voice=self._set_voice,
+            current_language_mode=lambda: self.cfg.speech.language_mode,
+            set_language_mode=self._set_language_mode,
+            other_language_name=lambda: SUPERTONIC_LANGUAGE_NAMES.get(
+                self.cfg.speech.other_language, self.cfg.speech.other_language),
+            supertonic_available=lambda: supertonic_present(self.cfg.speech),
+            current_other_voice=lambda: other_voice_of(self.cfg.speech),
+            set_other_voice=self._set_other_voice,
             current_speed=lambda: self.cfg.speech.speed,
             set_speed=self._set_speed,
             is_autostart=autostart.is_enabled,
@@ -237,11 +480,11 @@ class TTSApp:
                 self._instance.watch(lambda: self.open_settings())
             except Exception:
                 log.exception("single-instance watcher failed")
-        if not models_present(self.cfg.speech):
-            self.open_settings("kokoro")  # the Kokoro tab has the Download panel
+        primary = primary_voice(self.cfg.speech)
+        if not voice_ready(self.cfg.speech, primary):
+            self.open_settings(setup_tab(primary))  # its tab has the Download panel
         else:
-            if self.cfg.speech.preload:
-                self.engine.preload(self.cfg.speech)
+            self._preload()
             if self.cfg.ui.show_settings_on_start and not self._start_hidden:
                 self.open_settings()
         self._sync_mcp()
@@ -300,18 +543,21 @@ class TTSApp:
                 self._flash("ok", "Nothing selected")
                 return
             s = self.cfg.speech
-            if not models_present(s):
+            route = route_for(s, grab.text)  # decided once, up front
+            if not voice_ready(s, route.voice):
                 self._flash("error", "Error: voice model not downloaded")
-                self.open_settings("kokoro")
+                self.open_settings(setup_tab(route.voice))
                 return
             chunks = textprep.prepare(grab.text, sel.clean_markdown, sel.max_chars)
             if not chunks:
                 self._flash("ok", "Nothing to read")
                 return
-            log.info("reading %d chars in %d chunks with %s%s",
-                     sum(len(c.text) for c in chunks), len(chunks), s.voice,
+            if note_fallback(route):
+                self._hint = SUPERTONIC_HINT
+            log.info("reading %d chars in %d chunks with %s (%s)%s",
+                     sum(len(c.text) for c in chunks), len(chunks), route.voice, route.lang,
                      " (from clipboard)" if grab.from_clipboard else "")
-            self.speak(chunks, s)
+            self.speak(chunks, s, route.voice, route.lang)
         except Exception as e:
             log.exception("read selection failed")
             self._flash("error", "Error: " + _short(str(e) or e.__class__.__name__, 53))
@@ -320,21 +566,24 @@ class TTSApp:
                 self._grabbing = False
 
     # -- speaking
-    def speak(self, chunks: list, s: SpeechConfig, voice: str | None = None) -> Any:
-        """Start reading `chunks`; returns the SpeakRequest (its `done` event, `error` and
-        `interrupted` tell how it ended). Safe to call from any thread."""
+    def speak(self, chunks: list, s: SpeechConfig, voice: str | None = None,
+              lang: str | None = None) -> Any:
+        """Start reading `chunks` (voice: default the Kokoro English voice; lang: Supertonic
+        language code); returns the SpeakRequest (its `done` event, `error` and `interrupted`
+        tell how it ended). Safe to call from any thread."""
         from .tts import SpeakRequest
 
-        req = SpeakRequest(chunks, voice or s.voice, s.speed, s.sentence_pause, s.volume,
-                           s.device)
+        voice = voice or kokoro_voice_of(s)
+        req = SpeakRequest(chunks, voice, s.speed, s.sentence_pause, s.volume, s.device, lang)
         self._speak_cfg = s
+        self._speak_voice = voice
         self._current = req
         self.overlay.show("processing", "Starting…")
         self.speaker.speak(req)
         return req
 
     def _engine_for_speaker(self) -> Any:
-        return self.engine.get(self._speak_cfg)
+        return self.engine.get(self._speak_cfg, voice=self._speak_voice)
 
     def stop(self) -> None:
         if self.speaker.busy:
@@ -358,6 +607,11 @@ class TTSApp:
             self._flash("error", "Error: " + _short(error, 53))
             if MISSING_MODEL in error:
                 self.open_settings("kokoro")
+            elif MISSING_SUPERTONIC in error:
+                self.open_settings("supertonic")
+        elif self._hint:
+            hint, self._hint = self._hint, None
+            self._flash("ok", hint, 3.0)
         elif time.monotonic() >= self._flash_until:
             self.overlay.hide()
 
@@ -376,7 +630,8 @@ class TTSApp:
         try:
             cfg = copy.deepcopy(self.cfg)  # a snapshot: Settings may change while we run
             s = cfg.speech
-            engine = self.engine.get(s, announce=False)
+            route = route_request(s, req.text, req.voice, req.lang)
+            engine = self.engine.get(s, announce=False, voice=route.voice)
             last = [ExportProgress(0, 0, 0.0)]
 
             def on_progress(p: ExportProgress) -> None:
@@ -384,7 +639,8 @@ class TTSApp:
                 if progress is not None:
                     progress(p)
 
-            log.info("export started: %d chars, voice=%s", len(req.text), req.voice or s.voice)
+            log.info("export started: %d chars, voice=%s lang=%s", len(req.text), route.voice,
+                     route.lang)
             result = run_export(
                 engine, s, req, export_folder(cfg), on_progress, cancel,
                 lambda: self._export_yield(last[0], progress, cancel),
@@ -424,7 +680,8 @@ class TTSApp:
                     row["error"] = "cancelled"
                 else:
                     try:
-                        engine = self.engine.get(s, announce=False)
+                        route = route_request(s, req.text, req.voice, req.lang)
+                        engine = self.engine.get(s, announce=False, voice=route.voice)
                         result = run_export(
                             engine, s, req, export_folder(cfg), None, cancel,
                             lambda: self._export_yield(idle, None, cancel),
@@ -544,6 +801,9 @@ class TTSApp:
                 set_show_on_start=self._set_show_on_start,
                 models_dir=lambda: resolve_path(self.cfg.speech.model).parent,
                 voices=self._voices,
+                supertonic_dir=lambda: supertonic_dir(self.cfg.speech),
+                supertonic_present=lambda: supertonic_present(self.cfg.speech),
+                supertonic_changed=self._supertonic_changed,
                 output_devices=list_output_devices,
                 play_test=self._play_test,
                 stop=self.stop,
@@ -593,9 +853,10 @@ class TTSApp:
         chunks = textprep.prepare(text)
         if not chunks:
             return
-        if not models_present(cfg.speech):
-            raise RuntimeError(MISSING_MODEL)
-        threading.Thread(target=self.speak, args=(chunks, cfg.speech),
+        route = route_for(cfg.speech, text)
+        if not voice_ready(cfg.speech, route.voice):
+            raise RuntimeError(missing_message(route.voice))
+        threading.Thread(target=self.speak, args=(chunks, cfg.speech, route.voice, route.lang),
                          name="vibetts-test", daemon=True).start()
 
     def _voices_changed(self) -> None:
@@ -606,6 +867,23 @@ class TTSApp:
             log.debug("tray refresh failed", exc_info=True)
         if self.settings is not None:
             self.overlay.call_soon(self.settings.refresh)
+
+    def _preload(self) -> None:
+        if self.cfg.speech.preload:
+            self.engine.preload(self.cfg.speech)
+
+    def _download_missing(self) -> None:
+        """Tray 'Download voice model…': open the tab of the first engine still missing."""
+        missing = missing_voices(self.cfg.speech)
+        self.open_settings(setup_tab(missing[0]) if missing else "kokoro", download=True)
+
+    def _supertonic_changed(self) -> None:
+        """Called after a Supertonic download or delete: reload, refresh the menus."""
+        global _fallback_warned
+        _fallback_warned = False
+        self.engine.unload_supertonic()
+        self._preload()
+        self._voices_changed()
 
     def _set_show_on_start(self, value: bool) -> None:
         self.cfg.ui.show_settings_on_start = bool(value)
@@ -632,8 +910,9 @@ class TTSApp:
             log.error("invalid hotkey on reload: %s", e)
             self._flash("error", "Error: " + _short(str(e), 53))
             return str(e)
-        if not models_present(new.speech):
-            return MISSING_MODEL
+        primary = primary_voice(new.speech)
+        if not voice_ready(new.speech, primary):
+            return missing_message(primary)
         if new.speech.preload:
             self.engine.preload(new.speech)  # no-op when the same files are already loaded
         self._flash("ok", ok_message)
@@ -659,21 +938,50 @@ class TTSApp:
         self.tray.set_enabled(self.enabled)
 
     def _voices(self) -> list[str]:
-        """Kokoro voices: from the loaded engine, else read from the voices file."""
+        """English Kokoro voices (from the loaded engine, else read from the voices file), then
+        the Supertonic voices when they are installed."""
+        out: list[str] = []
         loaded = self.engine.loaded
-        if loaded is not None:
-            return list(loaded.voices())
-        path = resolve_path(self.cfg.speech.voices)
-        if path.is_file():
-            try:
-                return voices_in_file(path)
-            except Exception:
-                log.exception("could not read %s", path)
-        return []
+        if loaded is not None and loaded.kokoro is not None:
+            out = list(loaded.kokoro.voices())
+        else:
+            path = resolve_path(self.cfg.speech.voices)
+            if path.is_file():
+                try:
+                    out = voices_in_file(path)
+                except Exception:
+                    log.exception("could not read %s", path)
+        if supertonic_present(self.cfg.speech):
+            out += supertonic_voice_ids()
+        return out
 
     def _set_voice(self, voice: str) -> None:
-        self.cfg.speech.voice = voice
+        """Pick the English voice: a Kokoro id, or a supertonic: id (also switches the engine)."""
+        s = self.cfg.speech
+        if is_supertonic_voice(voice):
+            s.english_engine = "supertonic"
+            s.english_supertonic_voice = voice[len(SUPERTONIC_PREFIX):]
+            self._preload()
+        else:
+            s.english_engine, s.voice = "kokoro", voice
         self._save()
+        self._voices_changed()
+
+    def _set_other_voice(self, voice: str) -> None:
+        if not is_supertonic_voice(voice):
+            return
+        self.cfg.speech.other_voice = voice[len(SUPERTONIC_PREFIX):]
+        self._save()
+        self._voices_changed()
+
+    def _set_language_mode(self, mode: str) -> None:
+        from .config import LANGUAGE_MODES
+
+        if mode not in LANGUAGE_MODES:
+            return
+        self.cfg.speech.language_mode = mode
+        self._save()
+        self._preload()
         self._voices_changed()
 
     def _set_speed(self, speed: float) -> None:
@@ -707,21 +1015,41 @@ class AgentBridge:
     def __init__(self, app: TTSApp):
         self.app = app
 
-    def _check_voice(self, s: SpeechConfig, voice: str | None) -> None:
+    def _check_voice(self, s: SpeechConfig, voice: str | None, lang: str | None = None) -> None:
         from .mcp_server import ToolError
 
+        if lang is not None and lang not in SUPERTONIC_LANGUAGES:
+            raise ToolError(f"Unknown language '{lang}'. Call list_voices to get the valid codes.")
         if not voice:
+            return
+        if is_supertonic_voice(voice):
+            if not supertonic_present(s):
+                raise ToolError(MISSING_SUPERTONIC)
             return
         if not models_present(s):
             raise ToolError(MISSING_MODEL)
         if voice not in self.app._voices():
             raise ToolError(f"Unknown voice '{voice}'. Call list_voices to get the valid ids.")
+        if lang not in (None, "en"):
+            raise ToolError(f"The Kokoro voice '{voice}' reads English only; use a supertonic: "
+                            f"voice for language '{lang}'.")
 
     def list_voices(self) -> dict:
         from .tts import voice_label
 
-        voices = [{"id": v, "label": voice_label(v)} for v in self.app._voices()]
-        return {"voices": voices, "default_voice": self.app.cfg.speech.voice}
+        s = self.app.cfg.speech
+        voices = []
+        for v in self.app._voices():
+            supertonic = is_supertonic_voice(v)
+            voices.append({"id": v, "label": voice_label(v),
+                           "engine": "supertonic" if supertonic else "kokoro",
+                           "languages": list(SUPERTONIC_LANGUAGES) if supertonic else ["en"]})
+        return {"voices": voices,
+                "languages": [{"code": c, "name": n} for c, n in SUPERTONIC_LANGUAGE_NAMES.items()],
+                "english": {"engine": s.english_engine, "voice": english_voice_of(s)},
+                "other": {"language": s.other_language, "voice": other_voice_of(s)},
+                "language_mode": s.language_mode,
+                "supertonic_installed": supertonic_present(s)}
 
     def synthesize_batch(self, args: dict) -> dict:
         from .export import ExportRequest, format_for
@@ -746,14 +1074,16 @@ class AgentBridge:
                     raise ValueError("'text' must be a non-empty string")
                 if limit > 0 and len(text) > limit:
                     raise ValueError(f"text is too long ({len(text)} characters); the limit is {limit}")
-                voice, speed = it.get("voice"), it.get("speed")
+                voice, speed, lang = it.get("voice"), it.get("speed"), it.get("lang")
                 if voice is not None and not isinstance(voice, str):
                     raise ValueError("'voice' must be a string")
+                if lang is not None and not isinstance(lang, str):
+                    raise ValueError("'lang' must be a string")
                 if speed is not None and (isinstance(speed, bool) or not isinstance(speed, (int, float))
                                           or not 0.5 <= speed <= 2):
                     raise ValueError("'speed' must be a number between 0.5 and 2")
                 try:
-                    self._check_voice(app.cfg.speech, voice)
+                    self._check_voice(app.cfg.speech, voice, lang)
                 except ToolError as e:
                     raise ValueError(str(e)) from e
             except ValueError as e:
@@ -762,8 +1092,8 @@ class AgentBridge:
                 results[i] = {"output": out if isinstance(out, str) else "", "duration_s": 0.0,
                               "ok": False, "error": err}
                 continue
-            reqs.append(ExportRequest(text, Path(out), voice or None, speed, fmt, None, True, 1.0,
-                                      overwrite, ""))
+            reqs.append(ExportRequest(text, Path(out), voice or None, speed, lang or None, fmt,
+                                      None, True, 1.0, overwrite, ""))
             slots.append(i)
         log.info("MCP synthesize_batch: %d items (%d valid)", len(items), len(reqs))
         if reqs:
@@ -775,7 +1105,7 @@ class AgentBridge:
                 "total_duration_s": round(sum(r["duration_s"] for r in done), 2)}
 
     def speak(self, text: str, voice: str | None, speed: float | None, wait: bool,
-              timeout: float) -> dict:
+              timeout: float, lang: str | None = None) -> dict:
         from .mcp_server import ToolError
 
         app = self.app
@@ -784,22 +1114,27 @@ class AgentBridge:
                             "ask the user to turn it on")
         cfg = app.cfg
         s = cfg.speech
-        self._check_voice(s, voice)
-        chunks, voice = plan_speech(s, text, voice, cfg.selection.clean_markdown,
-                                    cfg.selection.max_chars)
+        self._check_voice(s, voice, lang)
+        try:
+            chunks, route = plan_speech(s, text, voice, lang, cfg.selection.clean_markdown,
+                                        cfg.selection.max_chars)
+        except ValueError as e:
+            raise ToolError(str(e)) from e
         if not chunks:
             raise ToolError("Nothing to read in this text")
-        if not models_present(s):
-            raise ToolError(MISSING_MODEL)
+        if not voice_ready(s, route.voice):
+            raise ToolError(missing_message(route.voice))
+        note_fallback(route)
         if speed:
             s = dataclasses.replace(s, speed=float(speed))
-        log.info("MCP speak: %d chars with %s", len(text), voice)
-        req = app.speak(chunks, s, voice)
+        log.info("MCP speak: %d chars with %s (%s)", len(text), route.voice, route.lang)
+        req = app.speak(chunks, s, route.voice, route.lang)
         done = bool(wait and req is not None and req.done.wait(timeout))
         error = req.error if done else None
         interrupted = bool(done and req.interrupted)
         return {"started": True, "completed": bool(done and not interrupted and not error),
-                "interrupted": interrupted, "error": error, "voice": voice}
+                "interrupted": interrupted, "error": error, "voice": route.voice,
+                "lang": route.lang}
 
     def stop(self, cancel_export: bool) -> dict:
         app = self.app
@@ -828,19 +1163,19 @@ class AgentBridge:
             limit = app.cfg.mcp.max_chars
             if limit > 0 and len(text) > limit:
                 raise ToolError(f"The document has {len(text)} characters; the limit is {limit}")
-        self._check_voice(app.cfg.speech, args.get("voice"))
+        self._check_voice(app.cfg.speech, args.get("voice"), args.get("lang"))
         output, fmt = args.get("output"), args.get("format")
         suffix = Path(output).suffix.lower() if output else ""
         if fmt and suffix in (".wav", ".mp3") and suffix[1:] != fmt:
             raise ToolError(f"format '{fmt}' does not match the output file name '{output}'")
         req = ExportRequest(text, Path(output) if output else None, args.get("voice"),
-                            args.get("speed"), fmt, None, markdown, 1.0,
+                            args.get("speed"), args.get("lang"), fmt, None, markdown, 1.0,
                             bool(args.get("overwrite", False)), title)
         log.info("MCP export: %d chars", len(text))
         result = app.export_audio(req)
         return {"path": str(result.path), "format": result.fmt,
                 "duration_seconds": round(result.seconds, 2), "chunks": result.chunks,
-                "bytes": result.bytes, "voice": result.voice}
+                "bytes": result.bytes, "voice": result.voice, "lang": result.lang}
 
 
 # ---------------------------------------------------------------- headless MCP (agents)
@@ -915,8 +1250,9 @@ def run_mcp_only(cfg: Config, port: int | None = None) -> int:
 
 def say(cfg: Config, text: str, out: str | None = None, title: str = "",
         markdown: bool | None = None) -> int:
-    """Speak `text` (or write it to an audio file, WAV/MP3 by extension) without the tray;
-    for testing and scripts."""
+    """Speak `text` (or write it to an audio file, WAV/MP3 by extension) without the tray,
+    routed like the hotkey (English profile or other-language profile); for testing and
+    scripts."""
     from . import textprep
     from .export import ExportRequest
     from .tts import SpeakRequest, Speaker
@@ -924,20 +1260,29 @@ def say(cfg: Config, text: str, out: str | None = None, title: str = "",
     s = cfg.speech
     if markdown is None:
         markdown = cfg.selection.clean_markdown
-    if not models_present(s):
-        print(f"error: model files missing ({s.model}, {s.voices}); "
-              "run: python -m vibetts.model_setup", file=sys.stderr)
+    route = route_for(s, text)
+    if not voice_ready(s, route.voice):
+        if is_supertonic_voice(route.voice):
+            print(f"error: Supertonic files missing ({s.supertonic_dir}); "
+                  "run: python -m vibetts.model_setup --supertonic", file=sys.stderr)
+        else:
+            print(f"error: model files missing ({s.model}, {s.voices}); "
+                  "run: python -m vibetts.model_setup", file=sys.stderr)
         return 1
     chunks = textprep.prepare(text, markdown)
     if not chunks:
         print("error: nothing to say", file=sys.stderr)
         return 1
+    if note_fallback(route):
+        print(f"note: Supertonic is not installed; reading with {route.voice} instead "
+              "(python -m vibetts.model_setup --supertonic)", file=sys.stderr)
     t0 = time.perf_counter()
-    engine = EngineHolder().get(s, announce=False)  # loads the engine, warms it up
-    print(f"model loaded in {time.perf_counter() - t0:.2f}s", flush=True)
+    engine = EngineHolder().get(s, announce=False, voice=route.voice)  # loads, warms it up
+    print(f"model loaded in {time.perf_counter() - t0:.2f}s (voice {route.voice}, "
+          f"language {route.lang})", flush=True)
     if out:
-        req = ExportRequest(text, Path(out), s.voice, None, None, cfg.export.mp3_bitrate,
-                            markdown, s.volume, True, title)
+        req = ExportRequest(text, Path(out), route.voice, None, route.lang, None,
+                            cfg.export.mp3_bitrate, markdown, s.volume, True, title)
         t0 = time.perf_counter()
         try:
             result = run_export(engine, s, req, Path.cwd(), fmt_default=cfg.export.format,
@@ -959,8 +1304,8 @@ def say(cfg: Config, text: str, out: str | None = None, title: str = "",
 
     speaker = Speaker(lambda: engine, on_start=on_start,
                       on_done=lambda req, err: errors.append(err) if err else None)
-    speaker.speak_and_wait(SpeakRequest(chunks, s.voice, s.speed, s.sentence_pause, s.volume,
-                                        s.device))
+    speaker.speak_and_wait(SpeakRequest(chunks, route.voice, s.speed, s.sentence_pause, s.volume,
+                                        s.device, route.lang))
     if errors:
         print(f"error: {errors[0]}", file=sys.stderr)
         return 1
@@ -1038,8 +1383,9 @@ def main(argv: list[str] | None = None) -> int:
             inst = None
             return 0
         cfg = load_config()
-        log.info("effective hotkey=%s voice=%s speed=%s", cfg.hotkey.read, cfg.speech.voice,
-                 cfg.speech.speed)
+        log.info("effective hotkey=%s english=%s other=%s/%s mode=%s speed=%s", cfg.hotkey.read,
+                 english_voice_of(cfg.speech), cfg.speech.other_language,
+                 other_voice_of(cfg.speech), cfg.speech.language_mode, cfg.speech.speed)
         TTSApp(cfg, start_hidden=args.hidden, instance=inst).run()
         return 0
     except KeyboardInterrupt:

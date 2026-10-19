@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "vibetts"
 dynamic = ["version"]
-description = "Read selected text aloud on Windows with a local Kokoro voice"
+description = "Read selected text aloud on Windows with local Kokoro and Supertonic voices"
 requires-python = ">=3.11"
 dependencies = [
     "pynput",
@@ -20,6 +20,7 @@ dependencies = [
     "kokoro-onnx",
     "pypdf>=4",
     "lameenc>=1.7",
+    "soxr",
 ]
 
 [project.optional-dependencies]

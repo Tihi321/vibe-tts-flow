@@ -24,6 +24,10 @@ hiddenimports = [
     "vibetts.single_instance",
     "vibetts.selection",
     "vibetts.textprep",
+    # VTF-06: Supertonic engine (imported lazily, model files are downloaded, not bundled)
+    "vibetts.supertonic",
+    "soxr",
+    "soxr.soxr_ext",
     # VTF-04: export to audio files + local MCP server (all imported lazily)
     "vibetts.docload",
     "vibetts.export",

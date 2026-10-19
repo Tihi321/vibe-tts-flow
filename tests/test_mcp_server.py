@@ -23,8 +23,8 @@ class FakeApi:
         self.calls.append(("list_voices",))
         return {"voices": ["af_heart"]}
 
-    def speak(self, text, voice, speed, wait, timeout):
-        self.calls.append(("speak", text, voice, speed, wait, timeout))
+    def speak(self, text, voice, speed, wait, timeout, lang=None):
+        self.calls.append(("speak", text, voice, speed, wait, timeout, lang))
         self._maybe_raise()
         return {"ok": True}
 
@@ -121,7 +121,8 @@ def test_synthesize_validation(server, api):
         {"text": "  "},
         {"text": "a", "speed": 3},
         {"text": "a", "format": "ogg"},
-        {"text": "a", "lang": "en"},
+        {"text": "a", "lang": "xx"},
+        {"text": "a", "lang": 3},
         {"text": "a", "bogus": 1},
     ]:
         assert call(server, "synthesize_to_file", args)["isError"] is True, args
@@ -152,10 +153,13 @@ def test_cancelled_export_is_a_tool_error(server, api):
 
 def test_speak_and_stop(server, api):
     assert call(server, "speak", {"text": "hi", "wait": True, "timeout_seconds": 5})["isError"] is False
-    assert api.calls[-1] == ("speak", "hi", None, None, True, 5.0)
+    assert api.calls[-1] == ("speak", "hi", None, None, True, 5.0, None)
     assert call(server, "speak", {"text": "x" * 101})["isError"] is True
     assert call(server, "speak", {"text": "hi", "timeout_seconds": 601})["isError"] is True
     assert call(server, "speak", {"text": "hi", "speed": 0.1})["isError"] is True
+    assert call(server, "speak", {"text": "hi", "lang": "xx"})["isError"] is True
+    assert call(server, "speak", {"text": "hi", "lang": "hr", "voice": "supertonic:F1"})["isError"] is False
+    assert api.calls[-1] == ("speak", "hi", "supertonic:F1", None, False, 120.0, "hr")
     call(server, "stop", {"cancel_export": True})
     assert api.calls[-1] == ("stop", True)
 
@@ -257,10 +261,41 @@ def test_synthesize_batch_validation(server, api):
     assert r["isError"] is False and api.calls[-1][0] == "batch"
     for args in [
         {}, {"items": []}, {"items": "x"}, {"items": [3]}, {"items": [{"text": "a", "output": "b", "zz": 1}]},
-        {"items": [{"text": "a", "output": "b", "lang": "en"}]},
+        {"items": [{"text": "a", "output": "b", "lang": "xx"}]},
         {"items": [good], "overwrite": "yes"}, {"items": [good], "other": 1},
         {"items": [good] * 501},
     ]:
         n = len(api.calls)
         assert call(server, "synthesize_batch", args)["isError"] is True, args
         assert len(api.calls) == n
+
+
+def test_lang_param_is_an_enum_of_the_31_codes(server):
+    from vibetts.config import SUPERTONIC_LANGUAGES
+
+    tools = {t["name"]: t for t in rpc(server, "tools/list")["result"]["tools"]}
+    assert len(SUPERTONIC_LANGUAGES) == 31
+    for name in ("synthesize_to_file", "speak"):
+        lang = tools[name]["inputSchema"]["properties"]["lang"]
+        assert lang["type"] == "string" and lang["enum"] == list(SUPERTONIC_LANGUAGES)
+    item = tools["synthesize_batch"]["inputSchema"]["properties"]["items"]["items"]
+    assert item["properties"]["lang"]["enum"] == list(SUPERTONIC_LANGUAGES)
+    assert "hr" in SUPERTONIC_LANGUAGES and "en" in SUPERTONIC_LANGUAGES
+    assert "lang" not in tools["list_voices"]["inputSchema"]["properties"]
+
+
+def test_lang_is_passed_through(server, api):
+    assert call(server, "synthesize_to_file", {"text": "x", "lang": "hr"})["isError"] is False
+    assert api.calls[-1] == ("synth", {"text": "x", "lang": "hr"})
+    item = {"text": "Hi.", "output": "C:/x/a.mp3", "lang": "de", "voice": "supertonic:M1"}
+    assert call(server, "synthesize_batch", {"items": [item]})["isError"] is False
+    assert api.calls[-1][1]["items"][0]["lang"] == "de"
+
+
+def test_descriptions_say_44k(server):
+    from vibetts.mcp_server import INSTRUCTIONS
+
+    tools = rpc(server, "tools/list")["result"]["tools"]
+    text = INSTRUCTIONS + " ".join(t["description"] for t in tools)
+    assert "44.1 kHz" in text and "24 kHz" not in text
+    assert "Supertonic" in INSTRUCTIONS

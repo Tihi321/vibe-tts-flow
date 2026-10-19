@@ -1,4 +1,7 @@
-from vibetts.textprep import FIRST_CHUNK_CHARS, clean_text, prepare, split_chunks
+import pytest
+
+from vibetts.textprep import (FIRST_CHUNK_CHARS, clean_text, looks_english, prepare,
+                              split_chunks)
 
 
 def test_markdown_cleanup():
@@ -85,3 +88,57 @@ def test_url_is_read_as_link():
     text = "See https://example.com/a for more."
     assert clean_text(text) == "See link for more."
     assert "link" in prepare(text)[0].text
+
+
+# ---------------------------------------------------------------- looks_english
+
+ENGLISH = [
+    "This is a simple test of the text to speech system, and it should be read in English.",
+    "I want to go to the store and buy some milk, but it is closed today.",
+    "It is what it is.",
+    "Please send the report to Željko Čović before the meeting tomorrow.",  # a Croatian name
+    "We met with Dr. Šimić and Mrs. Kovačević at the conference, and they were very kind.",
+    "The café near the station serves what you would expect from a naïve résumé.",
+    "Run the build script and check the output logs for errors.",
+    "Hello there",  # short: counts as English
+    "OK",
+    "",
+    "12345 67 89",
+    "Visit https://example.com/page for more information about the project.",
+]
+
+NOT_ENGLISH = {
+    "croatian": "Ovo je jednostavan test sustava za pretvaranje teksta u govor, čitat će na hrvatskom jeziku.",
+    "croatian no diacritics": "Ovo je jednostavan test sustava za pretvaranje teksta u govor koji cita hrvatski tekst.",
+    "croatian short": "Što radiš danas?",
+    "slovenian": "To je preprost preizkus sistema za pretvorbo besedila v govor, ki bere slovensko besedilo.",
+    "slovenian diacritics": "Danes je lep dan in šli bomo na sprehod v gozd, ker je toplo.",
+    "german": "Das ist ein einfacher Test des Systems, der den deutschen Text vorliest, weil es schön ist.",
+    "spanish": "Este es un sencillo test del sistema que lee el texto en español para todos los usuarios.",
+    "russian": "Это простой тест системы преобразования текста в речь на русском языке.",
+    "ukrainian": "Це простий тест системи перетворення тексту в мовлення українською мовою.",
+    "greek": "Αυτή είναι μια απλή δοκιμή του συστήματος που διαβάζει κείμενο.",
+    "hindi": "यह पाठ को वाक में बदलने वाली प्रणाली का एक सरल परीक्षण है।",
+    "japanese": "これはテキストを音声に変換するシステムの簡単なテストです。",
+    "russian short": "Привет, мир",
+}
+
+
+@pytest.mark.parametrize("text", ENGLISH)
+def test_looks_english(text):
+    assert looks_english(text) is True, text
+
+
+@pytest.mark.parametrize("name", list(NOT_ENGLISH))
+def test_does_not_look_english(name):
+    assert looks_english(NOT_ENGLISH[name]) is False, name
+
+
+def test_looks_english_mostly_foreign_script_with_english_name():
+    assert looks_english("Привет, Anna!") is False
+    assert looks_english("Reading the word привет is easy for the team.") is True  # one foreign word
+
+
+def test_looks_english_ignores_markup_and_case():
+    assert looks_english("# THE TITLE\n\n- the first item and the second item") is True
+    assert looks_english("**Ovo** je _tekst_ koji je pisan na hrvatskom jeziku, bez engleskog.") is False
