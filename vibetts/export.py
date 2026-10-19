@@ -29,9 +29,8 @@ class ExportBusy(RuntimeError):
 class ExportRequest:
     text: str
     out: Path | None = None        # None / relative / bare name -> resolved under the export folder
-    voice: str | None = None       # None = route as configured (route_for)
+    voice: str | None = None       # None = speech.voice
     speed: float | None = None     # None = speech.speed
-    lang: str | None = None        # None = auto ("hr" if the text looks Croatian, else "en")
     fmt: str | None = None         # None = from the out suffix, else [export] format
     bitrate: int | None = None     # None = [export] mp3_bitrate
     markdown: bool = True          # clean markdown symbols before speaking
@@ -56,7 +55,6 @@ class ExportResult:
     chunks: int
     bytes: int
     voice: str
-    lang: str
 
 
 class AudioSink(Protocol):

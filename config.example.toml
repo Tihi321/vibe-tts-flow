@@ -16,15 +16,6 @@ volume = 1.0                 # 0 .. 1
 device = ""                  # "" = Windows default output; or part of the device name
 preload = true               # load the model at startup so the first read starts at once
 
-# Engine: "kokoro" (default, small, fast) or "omnivoice" (any language incl. Croatian; install it
-# first from Settings > OmniVoice). Kokoro reads with `voice`, OmniVoice with `omni_voice`.
-engine = "kokoro"
-omnivoice_dir = "models/omnivoice"
-omnivoice_steps = 6          # 4 .. 16: fewer steps = faster, more = better quality
-omni_voice = "omni:default"  # omni:<preset>, presets live in models/omnivoice/voices
-croatian_voice = ""          # "" = omni_voice; or omni:<preset> for Croatian text only
-auto_language = true         # selection looks Croatian: read it with OmniVoice (needs it installed)
-
 [selection]
 copy_timeout_ms = 400        # how long to wait for the app to answer the copy shortcut
 fallback_to_clipboard = true # nothing selected: read the clipboard text instead

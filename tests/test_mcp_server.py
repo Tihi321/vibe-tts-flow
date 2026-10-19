@@ -23,24 +23,14 @@ class FakeApi:
         self.calls.append(("list_voices",))
         return {"voices": ["af_heart"]}
 
-    def speak(self, text, voice, speed, lang, wait, timeout):
-        self.calls.append(("speak", text, voice, speed, lang, wait, timeout))
+    def speak(self, text, voice, speed, wait, timeout):
+        self.calls.append(("speak", text, voice, speed, wait, timeout))
         self._maybe_raise()
         return {"ok": True}
-
-    def create_voice(self, args):
-        self.calls.append(("create_voice", args))
-        self._maybe_raise()
-        return {"voice": "omni:" + args["name"]}
 
     def stop(self, cancel_export):
         self.calls.append(("stop", cancel_export))
         return {"stopped": True}
-
-    def delete_voice(self, args):
-        self.calls.append(("delete_voice", args))
-        self._maybe_raise()
-        return {"deleted": "omni:" + args["name"]}
 
     def synthesize_batch(self, args):
         self.calls.append(("batch", args))
@@ -88,8 +78,8 @@ def test_initialize_negotiation(server):
 def test_ping_and_list(server):
     assert rpc(server, "ping")["result"] == {}
     tools = rpc(server, "tools/list")["result"]["tools"]
-    assert [t["name"] for t in tools] == ["synthesize_to_file", "speak", "list_voices", "create_voice", "delete_voice",
-                                           "synthesize_batch", "stop"]
+    assert [t["name"] for t in tools] == ["synthesize_to_file", "speak", "list_voices", "synthesize_batch",
+                                           "stop"]
     assert all(t["inputSchema"]["additionalProperties"] is False for t in tools)
 
 
@@ -131,7 +121,7 @@ def test_synthesize_validation(server, api):
         {"text": "  "},
         {"text": "a", "speed": 3},
         {"text": "a", "format": "ogg"},
-        {"text": "a", "lang": "de"},
+        {"text": "a", "lang": "en"},
         {"text": "a", "bogus": 1},
     ]:
         assert call(server, "synthesize_to_file", args)["isError"] is True, args
@@ -162,54 +152,12 @@ def test_cancelled_export_is_a_tool_error(server, api):
 
 def test_speak_and_stop(server, api):
     assert call(server, "speak", {"text": "hi", "wait": True, "timeout_seconds": 5})["isError"] is False
-    assert api.calls[-1] == ("speak", "hi", None, None, None, True, 5.0)
+    assert api.calls[-1] == ("speak", "hi", None, None, True, 5.0)
     assert call(server, "speak", {"text": "x" * 101})["isError"] is True
     assert call(server, "speak", {"text": "hi", "timeout_seconds": 601})["isError"] is True
     assert call(server, "speak", {"text": "hi", "speed": 0.1})["isError"] is True
     call(server, "stop", {"cancel_export": True})
     assert api.calls[-1] == ("stop", True)
-
-
-def test_create_voice_validation(server, api):
-    for args in [
-        {},
-        {"name": "  "},
-        {"name": 5},
-        {"name": "x" * 65},
-        {"name": "a", "seed": "7"},
-        {"name": "a", "seed": 1.5},
-        {"name": "a", "seed": True},
-        {"name": "a", "seed": -1},
-        {"name": "a", "seed": 2**31},
-        {"name": "a", "lang": "de"},
-        {"name": "a", "description": 3},
-        {"name": "a", "overwrite": "yes"},
-        {"name": "a", "bogus": 1},
-    ]:
-        assert call(server, "create_voice", args)["isError"] is True, args
-    assert api.calls == []
-
-
-def test_create_voice_success_and_errors(server, api):
-    args = {"name": "Alma", "description": "female", "seed": 0, "lang": "hr", "overwrite": True}
-    r = call(server, "create_voice", args)
-    assert r["isError"] is False and r["structuredContent"] == {"voice": "omni:Alma"}
-    assert api.calls == [("create_voice", args)]
-    for exc in (FileExistsError("exists"), ValueError("bad description"), RuntimeError("busy")):
-        api.raise_exc = exc
-        r = call(server, "create_voice", {"name": "a"})
-        assert r["isError"] is True and r["content"][0]["text"] == str(exc)
-
-
-def test_create_voice_schema_lists_vocabulary(api):
-    def desc(tools):
-        t = next(t for t in tools if t.name == "create_voice")
-        assert t.input_schema["required"] == ["name"]
-        return t.input_schema["properties"]["description"]["description"]
-
-    text = desc(build_tools(api, 100))
-    assert "young adult" in text and "very low pitch" in text and "whisper" in text
-    assert "robot" in desc(build_tools(api, 100, {"timbre": ["robot"]}))
 
 
 # ---- HTTP ----
@@ -303,23 +251,13 @@ def test_stop_rebinds_and_idempotent(server):
         sock.bind(("127.0.0.1", port))
 
 
-def test_delete_voice_validation(server, api):
-    assert call(server, "delete_voice", {"name": "nova"})["structuredContent"] == {"deleted": "omni:nova"}
-    for args in [{}, {"name": " "}, {"name": 3}, {"name": "default"}, {"name": "omni:default"},
-                 {"name": "a", "x": 1}]:
-        r = call(server, "delete_voice", args)
-        assert r["isError"] is True, args
-    api.raise_exc = FileNotFoundError("No voice named 'zz'.")
-    r = call(server, "delete_voice", {"name": "zz"})
-    assert r["isError"] is True and "No voice named" in r["content"][0]["text"]
-
-
 def test_synthesize_batch_validation(server, api):
-    good = {"text": "Hi.", "output": "C:/x/a.mp3", "voice": "omni:a", "lang": "hr", "speed": 1}
+    good = {"text": "Hi.", "output": "C:/x/a.mp3", "voice": "bf_emma", "speed": 1}
     r = call(server, "synthesize_batch", {"items": [good], "overwrite": True})
     assert r["isError"] is False and api.calls[-1][0] == "batch"
     for args in [
         {}, {"items": []}, {"items": "x"}, {"items": [3]}, {"items": [{"text": "a", "output": "b", "zz": 1}]},
+        {"items": [{"text": "a", "output": "b", "lang": "en"}]},
         {"items": [good], "overwrite": "yes"}, {"items": [good], "other": 1},
         {"items": [good] * 501},
     ]:

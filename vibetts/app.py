@@ -7,24 +7,20 @@ import ctypes
 import dataclasses
 import logging
 import os
-import random
 import sys
 import threading
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any
 
 from . import __version__
 from .config import (
-    OMNI_DEFAULT_VOICE,
     ROOT,
     Config,
     SpeechConfig,
     config_path,
     export_folder,
-    is_omni_voice,
     load_config,
-    normalize_omni_voice,
     resolve_path,
     save_config,
 )
@@ -39,7 +35,6 @@ log = logging.getLogger(__name__)
 _MCP_LOCK = threading.RLock()  # serializes _sync_mcp / stop (Tk thread, tray thread, quit)
 
 MISSING_MODEL = "Download the voice model to start reading aloud"
-MISSING_OMNI = "OmniVoice is not installed: install it in Settings > OmniVoice"
 
 
 def _short(msg: str, limit: int = 60) -> str:
@@ -55,148 +50,12 @@ def models_present(s: SpeechConfig) -> bool:
     return all(p.is_file() for p in model_files(s))
 
 
-def _omni() -> Any:
-    """The OmniVoice module, imported on first use (it is only needed for Croatian)."""
-    from . import omnivoice
-
-    return omnivoice
-
-
-def omni_dir(s: SpeechConfig) -> Path:
-    return resolve_path(s.omnivoice_dir)
-
-
-def omni_present(s: SpeechConfig) -> bool:
-    try:
-        return bool(_omni().models_present(omni_dir(s)))
-    except Exception:
-        log.debug("OmniVoice check failed", exc_info=True)
-        return False
-
-
-def omni_presets(s: SpeechConfig) -> list[str]:
-    """OmniVoice voice ids (omni:<preset>) when OmniVoice is installed, else []."""
-    if not omni_present(s):
-        return []
-    try:
-        return list(_omni().list_presets(omni_dir(s)))
-    except Exception:
-        log.exception("could not list OmniVoice voice presets")
-        return []
-
-
-def omni_preset_info(s: SpeechConfig) -> list[dict]:
-    """Rows for the Settings voices list ({name, voice, kind, description, lang})."""
-    if not omni_present(s):
-        return []
-    try:
-        return list(_omni().list_preset_info(omni_dir(s)))
-    except Exception:
-        log.exception("could not read OmniVoice voice presets")
-        return []
-
-
-def voice_ready(s: SpeechConfig, voice: str) -> bool:
-    """Are the model files for the engine that speaks `voice` present?"""
-    return omni_present(s) if is_omni_voice(voice) else models_present(s)
-
-
-def missing_message(voice: str) -> str:
-    return MISSING_OMNI if is_omni_voice(voice) else MISSING_MODEL
-
-
-class Route(NamedTuple):
-    """How one request is read: the voice, the language of the text ('hr' or 'en': also
-    picks the URL word) and whether OmniVoice was wanted but is not installed."""
-    voice: str
-    lang: str
-    fell_back: bool
-
-    @property
-    def omni(self) -> bool:
-        return is_omni_voice(self.voice)
-
-
-def omni_voice_of(s: SpeechConfig) -> str:
-    return normalize_omni_voice(s.omni_voice) if is_omni_voice(s.omni_voice) \
-        else OMNI_DEFAULT_VOICE
-
-
-def croatian_voice_of(s: SpeechConfig) -> str:
-    """The voice for Croatian text: `croatian_voice`, or the OmniVoice voice when it is empty."""
-    if s.croatian_voice and is_omni_voice(s.croatian_voice):
-        return normalize_omni_voice(s.croatian_voice)
-    return omni_voice_of(s)
-
-
-def kokoro_voice_of(s: SpeechConfig) -> str:
-    return s.voice if s.voice and not is_omni_voice(s.voice) else "af_heart"
-
-
-def choose_voice(s: SpeechConfig, text: str, omni_available: bool) -> Route:
-    """Voice and language of one request (decided once, up front):
-
-    - Croatian text (auto_language on and looks_croatian): `croatian_voice` (or `omni_voice`),
-      language hr, with either engine, when OmniVoice is installed;
-    - other text: the Kokoro `voice` (engine kokoro) or `omni_voice` (engine omnivoice, lang en).
-
-    Without OmniVoice installed everything falls back to the Kokoro voice (`fell_back` is
-    True when OmniVoice was wanted: engine omnivoice, or Croatian text)."""
-    from .textprep import looks_croatian
-
-    kokoro = kokoro_voice_of(s)
-    croatian = bool(s.auto_language and looks_croatian(text))
-    if s.engine == "omnivoice":
-        if not omni_available:
-            return Route(kokoro, "en", True)
-        return Route(croatian_voice_of(s), "hr", False) if croatian \
-            else Route(omni_voice_of(s), "en", False)
-    if croatian:
-        if omni_available:
-            return Route(croatian_voice_of(s), "hr", False)
-        return Route(kokoro, "en", True)
-    return Route(kokoro, "en", False)
-
-
-def route_for(s: SpeechConfig, text: str) -> Route:
-    """choose_voice with the OmniVoice check done only when it matters."""
-    wanted = s.engine == "omnivoice" or s.auto_language
-    return choose_voice(s, text, omni_present(s) if wanted else False)
-
-
-def active_voice(s: SpeechConfig) -> str:
-    """The voice normal (non-Croatian) text is read with: used for preloading and checks."""
-    return route_for(dataclasses.replace(s, auto_language=False), "").voice
-
-
-def plan_speech(s: SpeechConfig, text: str, voice: str | None = None, lang: str | None = None,
-                markdown: bool = True, max_chars: int = 0) -> tuple[list[Chunk], str, str, bool]:
-    """Chunks, voice, language and 'is OmniVoice' of one request (does not check voice_ready).
-
-    Without `voice` the request is routed as configured (route_for); `lang` ('en' / 'hr')
-    then overrides the language. An explicit `voice` is used as is (omni ids normalized);
-    its language is `lang`, else guessed from the text (a Kokoro voice only uses it for
-    the text preparation)."""
+def plan_speech(s: SpeechConfig, text: str, voice: str | None = None, markdown: bool = True,
+                max_chars: int = 0) -> tuple[list[Chunk], str]:
+    """Chunks and voice of one request (an explicit `voice`, else speech.voice)."""
     from . import textprep
 
-    lang = lang if lang in ("en", "hr") else None
-    if voice:
-        if is_omni_voice(voice):
-            voice = normalize_omni_voice(voice)
-        lang = lang or ("hr" if textprep.looks_croatian(text) else "en")
-    elif lang == "hr":
-        if omni_present(s):
-            voice = croatian_voice_of(s)
-        else:
-            voice, lang = kokoro_voice_of(s), "en"  # no OmniVoice: Kokoro reads it
-    elif lang == "en":
-        voice = route_for(dataclasses.replace(s, auto_language=False), text).voice
-    else:
-        route = route_for(s, text)
-        voice, lang = route.voice, route.lang
-    omni = is_omni_voice(voice)
-    chunks = textprep.prepare(text, markdown, max_chars, lang, long_chunks=omni)
-    return chunks, voice, lang, omni
+    return textprep.prepare(text, markdown, max_chars), voice or s.voice
 
 
 def run_export(engine: Any, s: SpeechConfig, req: ExportRequest, folder: Path,
@@ -207,12 +66,12 @@ def run_export(engine: Any, s: SpeechConfig, req: ExportRequest, folder: Path,
     ValueError (bad format / empty text) and RuntimeError (voice model missing)."""
     from . import export
 
-    chunks, voice, lang, _ = plan_speech(s, req.text, req.voice, req.lang, req.markdown)
+    chunks, voice = plan_speech(s, req.text, req.voice, req.markdown)
     if not chunks:
         raise ValueError("Nothing to read in this text")
     speed = req.speed or s.speed
-    if not voice_ready(s, voice):
-        raise RuntimeError(missing_message(voice))
+    if not models_present(s):
+        raise RuntimeError(MISSING_MODEL)
     fmt = req.fmt
     if req.out is not None and str(req.out).strip():
         by_name = export.format_for(req.out, default=fmt or fmt_default)
@@ -226,10 +85,10 @@ def run_export(engine: Any, s: SpeechConfig, req: ExportRequest, folder: Path,
         raise RuntimeError("MP3 export is unavailable: the lameenc package is not installed")
     path = export.resolve_output(req.out, folder, req.title, fmt, req.overwrite)
     seconds, size = export.render(
-        chunks, lambda text: engine.synth(text, voice, speed, lang), path, fmt,
+        chunks, lambda text: engine.synth(text, voice, speed), path, fmt,
         pause=s.sentence_pause, gain=req.gain, bitrate=req.bitrate or bitrate_default,
         progress=progress, cancel=cancel, before_chunk=before_chunk)
-    return export.ExportResult(path, fmt, seconds, len(chunks), size, voice, lang)
+    return export.ExportResult(path, fmt, seconds, len(chunks), size, voice)
 
 
 def voices_in_file(path: Path) -> list[str]:
@@ -242,128 +101,45 @@ def voices_in_file(path: Path) -> list[str]:
         return sorted(v for v in data.files if voice_supported(v))
 
 
-class ClipEngine:
-    """Engine stand-in that 'synthesizes' one ready-made clip (voice preview)."""
-
-    def __init__(self, audio: Any):
-        self.audio = audio
-
-    def voices(self) -> list[str]:
-        return []
-
-    def synth(self, text: str, voice: str, speed: float, lang: str | None = None):
-        return self.audio
-
-
-class RoutingEngine:
-    """Engine protocol over the loaded engines: synth goes to OmniVoice for omni voices,
-    to Kokoro for the rest; voices() merges both lists."""
-
-    def __init__(self, kokoro: Any = None, omni: Any = None):
-        self.kokoro = kokoro
-        self.omni = omni
-
-    def voices(self) -> list[str]:
-        out: list[str] = []
-        for engine in (self.kokoro, self.omni):
-            if engine is not None:
-                out += list(engine.voices())
-        return out
-
-    def synth(self, text: str, voice: str, speed: float, lang: str | None = None):
-        if is_omni_voice(voice):
-            if self.omni is None:
-                raise RuntimeError(MISSING_OMNI)
-            return self.omni.synth(text, voice, speed, lang)
-        if self.kokoro is None:
-            raise RuntimeError(MISSING_MODEL)
-        return self.kokoro.synth(text, voice, speed, lang)
-
-
 class EngineHolder:
-    """Loads one engine per family (Kokoro, OmniVoice) lazily or in the background and
-    reloads a family when its files / settings change. get() loads the family that speaks
-    `voice` (default: the configured engine's voice) and returns a RoutingEngine over
-    everything loaded so far."""
+    """Loads the Kokoro engine once (lazily or in the background) and reloads it when the
+    model or voices file changes."""
 
     def __init__(self, on_loading=lambda: None):
         self._lock = threading.Lock()
-        self._kokoro: Any = None
-        self._kokoro_key: tuple | None = None
-        self._omni: Any = None
-        self._omni_key: tuple | None = None
+        self._engine: Any = None
+        self._key: tuple[Path, Path] | None = None
         self.on_loading = on_loading
 
     @property
     def loaded(self) -> Any:
-        """A RoutingEngine over the loaded families, or None when nothing is loaded."""
-        with self._lock:
-            if self._kokoro is None and self._omni is None:
-                return None
-            return RoutingEngine(self._kokoro, self._omni)
+        return self._engine
 
-    def get(self, s: SpeechConfig, announce: bool = True, voice: str | None = None) -> Any:
-        voice = voice or active_voice(s)
-        with self._lock:
-            if is_omni_voice(voice):
-                self._ensure_omni(s, announce, voice)
-            else:
-                self._ensure_kokoro(s, voice, announce)
-            return RoutingEngine(self._kokoro, self._omni)
-
-    def _ensure_kokoro(self, s: SpeechConfig, voice: str, announce: bool) -> None:
+    def get(self, s: SpeechConfig, announce: bool = True) -> Any:
         from .tts import KokoroEngine
 
         key = model_files(s)
-        if self._kokoro is not None and self._kokoro_key == key:
-            return
-        if not all(p.is_file() for p in key):
-            raise RuntimeError(MISSING_MODEL)
-        if announce:
-            self.on_loading()
-        self._kokoro = None
-        engine = KokoroEngine(*key)
-        engine.synth("Ready.", voice, 1.0)  # warm-up: first run is slower
-        self._kokoro, self._kokoro_key = engine, key
-
-    def _ensure_omni(self, s: SpeechConfig, announce: bool, voice: str | None = None) -> None:
-        key = (omni_dir(s), int(s.omnivoice_steps))
-        if self._omni is not None and self._omni_key == key:
-            return
-        if not omni_present(s):
-            raise RuntimeError(MISSING_OMNI)
-        if announce:
-            self.on_loading()
-        self._omni = None
-        engine = _omni().OmniVoiceEngine(key[0], key[1])
-        try:
-            engine.synth("Ready.", voice if voice and is_omni_voice(voice) else omni_voice_of(s),
-                         1.0, "en")  # warm-up: first run is slower
-        except Exception:
-            log.warning("OmniVoice warm-up failed", exc_info=True)
-        self._omni, self._omni_key = engine, key
-
-    def get_omni(self, s: SpeechConfig, announce: bool = True) -> Any:
-        """The shared OmniVoice engine, loaded on demand whatever engine is configured
-        (used to design / clone voices). Never creates a second engine."""
         with self._lock:
-            self._ensure_omni(s, announce)
-            return self._omni
-
-    def unload_omni(self) -> None:
-        """Drop the OmniVoice engine (before its files are deleted, or after a reinstall)."""
-        with self._lock:
-            self._omni, self._omni_key = None, None
+            if self._engine is not None and self._key == key:
+                return self._engine
+            if not all(p.is_file() for p in key):
+                raise RuntimeError(MISSING_MODEL)
+            if announce:
+                self.on_loading()
+            self._engine = None
+            engine = KokoroEngine(*key)
+            engine.synth("Ready.", s.voice, 1.0)  # warm-up: first run is slower
+            self._engine, self._key = engine, key
+            return engine
 
     def preload(self, s: SpeechConfig) -> None:
-        """Load the engine of the configured voice in the background."""
-        voice = active_voice(s)
-        if not voice_ready(s, voice):
+        """Load the engine in the background."""
+        if not models_present(s):
             return
 
         def run() -> None:
             try:
-                self.get(s, announce=False, voice=voice)
+                self.get(s, announce=False)
             except Exception:
                 log.exception("preloading the voice model failed")
         threading.Thread(target=run, name="vibetts-preload", daemon=True).start()
@@ -390,8 +166,6 @@ class TTSApp:
         self._quit_lock = threading.Lock()
         self._quit_done = False
         self._startup_errors: list[str] = []
-        self._warned_omni_missing = False
-        self._clip_engine: Any = None  # set while a voice preview plays
         self._export_lock = threading.Lock()  # one export at a time (app, Settings, MCP)
         self._export_cancel: threading.Event | None = None
         self._mcp: Any = None  # the running McpServer
@@ -411,7 +185,6 @@ class TTSApp:
         self.speaker = Speaker(self._engine_for_speaker, SoundDeviceOutput,
                                on_start=self._on_speak_start, on_done=self._on_speak_done)
         self._speak_cfg: SpeechConfig = cfg.speech
-        self._speak_voice: str | None = None  # voice of the request being spoken
         self.listener = HotkeyListener({"read": chord}, self._on_hotkey, self._on_escape)
 
         hooks = TrayHooks(
@@ -419,15 +192,11 @@ class TTSApp:
             set_enabled=self._set_enabled,
             is_speaking=lambda: self.speaker.busy,
             stop=self.stop,
-            model_missing=lambda: not voice_ready(self.cfg.speech,
-                                                  active_voice(self.cfg.speech)),
+            model_missing=lambda: not models_present(self.cfg.speech),
             download_model=lambda: self.open_settings("kokoro", download=True),
             voices=self._voices,
-            current_voice=lambda: self._current_voice(),
+            current_voice=lambda: self.cfg.speech.voice,
             set_voice=self._set_voice,
-            current_engine=lambda: self.cfg.speech.engine,
-            set_engine=self._set_engine,
-            omni_available=lambda: omni_present(self.cfg.speech),
             current_speed=lambda: self.cfg.speech.speed,
             set_speed=self._set_speed,
             is_autostart=autostart.is_enabled,
@@ -468,9 +237,8 @@ class TTSApp:
                 self._instance.watch(lambda: self.open_settings())
             except Exception:
                 log.exception("single-instance watcher failed")
-        voice = active_voice(self.cfg.speech)
-        if not voice_ready(self.cfg.speech, voice):
-            self.open_settings(self._setup_tab(voice))  # its tab has the Download panel
+        if not models_present(self.cfg.speech):
+            self.open_settings("kokoro")  # the Kokoro tab has the Download panel
         else:
             if self.cfg.speech.preload:
                 self.engine.preload(self.cfg.speech)
@@ -532,24 +300,18 @@ class TTSApp:
                 self._flash("ok", "Nothing selected")
                 return
             s = self.cfg.speech
-            route = self._request_route(s, grab.text)  # decided once per request
-            voice = route.voice
-            if not voice_ready(s, voice):
-                if route.omni:
-                    self._flash("error", "Error: OmniVoice is not installed")
-                else:
-                    self._flash("error", "Error: voice model not downloaded")
-                self.open_settings(self._setup_tab(voice))
+            if not models_present(s):
+                self._flash("error", "Error: voice model not downloaded")
+                self.open_settings("kokoro")
                 return
-            chunks = textprep.prepare(grab.text, sel.clean_markdown, sel.max_chars,
-                                      route.lang, long_chunks=route.omni)
+            chunks = textprep.prepare(grab.text, sel.clean_markdown, sel.max_chars)
             if not chunks:
                 self._flash("ok", "Nothing to read")
                 return
-            log.info("reading %d chars in %d chunks with %s (%s)%s",
-                     sum(len(c.text) for c in chunks), len(chunks), voice, route.lang,
+            log.info("reading %d chars in %d chunks with %s%s",
+                     sum(len(c.text) for c in chunks), len(chunks), s.voice,
                      " (from clipboard)" if grab.from_clipboard else "")
-            self.speak(chunks, s, voice, route.lang)
+            self.speak(chunks, s)
         except Exception as e:
             log.exception("read selection failed")
             self._flash("error", "Error: " + _short(str(e) or e.__class__.__name__, 53))
@@ -557,42 +319,22 @@ class TTSApp:
             with self._grab_lock:
                 self._grabbing = False
 
-    def _request_route(self, s: SpeechConfig, text: str) -> Route:
-        """Voice and language of one request (see choose_voice). When OmniVoice is wanted but
-        not installed the Kokoro voice is used instead (logged once)."""
-        route = route_for(s, text)
-        if route.fell_back and not self._warned_omni_missing:
-            self._warned_omni_missing = True
-            log.warning("OmniVoice is not installed (%s); using %s. Install it in "
-                        "Settings > OmniVoice", s.omnivoice_dir, route.voice)
-        return route
-
-    @staticmethod
-    def _setup_tab(voice: str) -> str:
-        return "omnivoice" if is_omni_voice(voice) else "kokoro"
-
     # -- speaking
-    def speak(self, chunks: list, s: SpeechConfig, voice: str | None = None,
-              lang: str | None = None) -> Any:
+    def speak(self, chunks: list, s: SpeechConfig, voice: str | None = None) -> Any:
         """Start reading `chunks`; returns the SpeakRequest (its `done` event, `error` and
         `interrupted` tell how it ended). Safe to call from any thread."""
         from .tts import SpeakRequest
 
-        voice = voice or active_voice(s)
-        self._clip_engine = None
-        req = SpeakRequest(chunks, voice, s.speed, s.sentence_pause, s.volume, s.device, lang)
+        req = SpeakRequest(chunks, voice or s.voice, s.speed, s.sentence_pause, s.volume,
+                           s.device)
         self._speak_cfg = s
-        self._speak_voice = voice
         self._current = req
         self.overlay.show("processing", "Starting…")
         self.speaker.speak(req)
         return req
 
     def _engine_for_speaker(self) -> Any:
-        clip = self._clip_engine
-        if clip is not None:
-            return clip
-        return self.engine.get(self._speak_cfg, voice=self._speak_voice)
+        return self.engine.get(self._speak_cfg)
 
     def stop(self) -> None:
         if self.speaker.busy:
@@ -616,8 +358,6 @@ class TTSApp:
             self._flash("error", "Error: " + _short(error, 53))
             if MISSING_MODEL in error:
                 self.open_settings("kokoro")
-            elif MISSING_OMNI in error:
-                self.open_settings("omnivoice")
         elif time.monotonic() >= self._flash_until:
             self.overlay.hide()
 
@@ -636,8 +376,7 @@ class TTSApp:
         try:
             cfg = copy.deepcopy(self.cfg)  # a snapshot: Settings may change while we run
             s = cfg.speech
-            _, voice, _, _ = plan_speech(s, req.text, req.voice, req.lang, req.markdown)
-            engine = self.engine.get(s, announce=False, voice=voice)
+            engine = self.engine.get(s, announce=False)
             last = [ExportProgress(0, 0, 0.0)]
 
             def on_progress(p: ExportProgress) -> None:
@@ -645,7 +384,7 @@ class TTSApp:
                 if progress is not None:
                     progress(p)
 
-            log.info("export started: %d chars, voice=%s", len(req.text), voice)
+            log.info("export started: %d chars, voice=%s", len(req.text), req.voice or s.voice)
             result = run_export(
                 engine, s, req, export_folder(cfg), on_progress, cancel,
                 lambda: self._export_yield(last[0], progress, cancel),
@@ -685,8 +424,7 @@ class TTSApp:
                     row["error"] = "cancelled"
                 else:
                     try:
-                        _, voice, _, _ = plan_speech(s, req.text, req.voice, req.lang, req.markdown)
-                        engine = self.engine.get(s, announce=False, voice=voice)
+                        engine = self.engine.get(s, announce=False)
                         result = run_export(
                             engine, s, req, export_folder(cfg), None, cancel,
                             lambda: self._export_yield(idle, None, cancel),
@@ -754,13 +492,8 @@ class TTSApp:
                 self._mcp_error = None
                 return
             try:
-                try:
-                    options = {k: list(v) for k, v in _omni().INSTRUCT_OPTIONS.items()}
-                except Exception:
-                    log.debug("INSTRUCT_OPTIONS unavailable for the MCP schema", exc_info=True)
-                    options = None
                 server = mcp_server.McpServer(
-                    mcp_server.build_tools(AgentBridge(self), key[2], options), key[1],
+                    mcp_server.build_tools(AgentBridge(self), key[2]), key[1],
                     version=__version__, instructions=mcp_server.INSTRUCTIONS)
                 server.start()
             except OSError as e:
@@ -811,20 +544,6 @@ class TTSApp:
                 set_show_on_start=self._set_show_on_start,
                 models_dir=lambda: resolve_path(self.cfg.speech.model).parent,
                 voices=self._voices,
-                omni_present=lambda: omni_present(self.cfg.speech),
-                omni_voices=lambda: omni_presets(self.cfg.speech),
-                omni_voice_info=lambda: omni_preset_info(self.cfg.speech),
-                omni_status=self._omni_status,
-                omni_download_bytes=self._omni_download_bytes,
-                omni_install=self._omni_install,
-                omni_uninstall=self._omni_uninstall,
-                play_preset=self._play_preset,
-                design_clip=self._design_clip,
-                clone_clip=self._clone_clip,
-                save_voice=self._save_voice,
-                delete_voice=self._delete_voice,
-                play_clip=self._play_clip,
-                encoders_present=self._encoders_present,
                 output_devices=list_output_devices,
                 play_test=self._play_test,
                 stop=self.stop,
@@ -871,129 +590,16 @@ class TTSApp:
     def _play_test(self, cfg: Config, text: str) -> None:
         from . import textprep
 
-        route = self._request_route(cfg.speech, text)
-        chunks = textprep.prepare(text, True, 0, route.lang, long_chunks=route.omni)
+        chunks = textprep.prepare(text)
         if not chunks:
             return
-        if not voice_ready(cfg.speech, route.voice):
-            raise RuntimeError(missing_message(route.voice))
-        threading.Thread(target=self.speak, args=(chunks, cfg.speech, route.voice, route.lang),
+        if not models_present(cfg.speech):
+            raise RuntimeError(MISSING_MODEL)
+        threading.Thread(target=self.speak, args=(chunks, cfg.speech),
                          name="vibetts-test", daemon=True).start()
 
-    # -- OmniVoice install (called from the settings window, on a worker thread)
-    @staticmethod
-    def _setup() -> Any:
-        from . import omnivoice_setup  # lazy: the installer pulls in requests / numpy
-
-        return omnivoice_setup
-
-    def _omni_status(self) -> dict:
-        """{'installed', 'encoders', 'bytes_on_disk'} of the OmniVoice files."""
-        try:
-            return dict(self._setup().status(omni_dir(self.cfg.speech)))
-        except Exception:
-            log.debug("OmniVoice status failed", exc_info=True)
-            return {"installed": omni_present(self.cfg.speech),
-                    "encoders": self._encoders_present(), "bytes_on_disk": 0}
-
-    def _omni_download_bytes(self, include_encoders: bool) -> int:
-        return int(self._setup().DOWNLOAD_BYTES(bool(include_encoders)))
-
-    def _omni_install(self, include_encoders: bool, progress: Any, cancel: Any) -> None:
-        """Blocking: download and convert OmniVoice into omnivoice_dir (raises
-        model_setup.DownloadCancelled / SetupError)."""
-        self.engine.unload_omni()
-        try:
-            self._setup().install(omni_dir(self.cfg.speech), include_encoders, progress, cancel)
-        finally:
-            self._voices_changed()  # also after a failure: files may be partly there
-        if self.cfg.speech.preload and self.cfg.speech.engine == "omnivoice":
-            self.engine.preload(self.cfg.speech)
-
-    def _omni_uninstall(self) -> None:
-        """Blocking: unload the engine and delete the OmniVoice files (voices are kept). An
-        OmniVoice engine setting is switched back to Kokoro."""
-        self.stop()
-        self.cancel_export()
-        self.engine.unload_omni()
-        self._setup().uninstall(omni_dir(self.cfg.speech), keep_voices=True)
-        if self.cfg.speech.engine == "omnivoice":
-            self.cfg.speech.engine = "kokoro"
-            self._save()
-        self._voices_changed()
-
-    # -- custom voices (called from the settings window)
-    def _design_clip(self, instruct: str, seed: int, text: str | None = None,
-                     lang: str | None = None) -> Any:
-        """Blocking (call from a worker thread): a voice clip from a description."""
-        engine = self.engine.get_omni(self.cfg.speech)
-        return engine.design_clip(instruct, seed, text, lang)
-
-    def _clone_clip(self, wav_path: Any, ref_text: str) -> Any:
-        """Blocking (call from a worker thread): a voice clip cloned from a recording. The
-        language stored with the preset is guessed from the transcript."""
-        from .textprep import looks_croatian
-
-        engine = self.engine.get_omni(self.cfg.speech)
-        return engine.clone_clip(Path(wav_path), ref_text,
-                                 "hr" if looks_croatian(ref_text) else "en")
-
-    def _encoders_present(self) -> bool:
-        try:
-            return bool(_omni().encoders_present(omni_dir(self.cfg.speech)))
-        except Exception:
-            log.debug("encoder check failed", exc_info=True)
-            return False
-
-    def _save_voice(self, name: str, clip: Any, overwrite: bool = False) -> str:
-        """Store `clip` as preset `name`; returns the voice id (omni:<name>). An existing
-        preset is only replaced with overwrite=True (the settings window asks first)."""
-        voice_id = _omni().save_preset(omni_dir(self.cfg.speech), name, clip,
-                                       overwrite=overwrite)
-        self._voices_changed()
-        return voice_id
-
-    def _delete_voice(self, name: str) -> None:
-        """Delete preset `name` (or an omni:<name> id). A deleted voice that was selected falls
-        back (omni_voice to omni:default, croatian_voice to 'same as omni_voice') and the
-        config is saved."""
-        from .tts import omni_preset
-
-        preset = omni_preset(name) if is_omni_voice(name) else name
-        _omni().delete_preset(omni_dir(self.cfg.speech), preset)
-        voice_id = f"omni:{preset}"
-        sp = self.cfg.speech
-        changed = False
-        if normalize_omni_voice(sp.omni_voice) == voice_id:
-            sp.omni_voice = OMNI_DEFAULT_VOICE
-            changed = True
-        if sp.croatian_voice and normalize_omni_voice(sp.croatian_voice) == voice_id:
-            sp.croatian_voice = ""
-            changed = True
-        if changed:
-            self._save()
-        self._voices_changed()
-
-    def _play_preset(self, name: str) -> None:
-        """Play the stored sample of preset `name` through the output device."""
-        wav = omni_dir(self.cfg.speech) / "voices" / f"{name}.wav"
-        audio, _ = _omni().read_wav(wav)
-        self._play_clip(type("Sample", (), {"audio": audio})())
-
-    def _play_clip(self, clip: Any) -> None:
-        """Preview a VoiceClip through the configured output device (stop() ends it)."""
-        from .textprep import Chunk
-        from .tts import SpeakRequest
-
-        s = self.cfg.speech
-        self._clip_engine = ClipEngine(clip.audio)
-        self._current = None  # no overlay callbacks for previews
-        req = SpeakRequest([Chunk("preview", 0.0)], OMNI_DEFAULT_VOICE, 1.0, 0.0, s.volume,
-                           s.device, "hr")
-        self.speaker.speak(req)
-
     def _voices_changed(self) -> None:
-        """Refresh the tray menus and the settings window (voices, engine radio, status)."""
+        """Refresh the tray menus and the settings window."""
         try:
             self.tray.update_menu()
         except Exception:
@@ -1026,9 +632,8 @@ class TTSApp:
             log.error("invalid hotkey on reload: %s", e)
             self._flash("error", "Error: " + _short(str(e), 53))
             return str(e)
-        voice = active_voice(new.speech)
-        if not voice_ready(new.speech, voice):
-            return missing_message(voice)
+        if not models_present(new.speech):
+            return MISSING_MODEL
         if new.speech.preload:
             self.engine.preload(new.speech)  # no-op when the same files are already loaded
         self._flash("ok", ok_message)
@@ -1054,44 +659,21 @@ class TTSApp:
         self.tray.set_enabled(self.enabled)
 
     def _voices(self) -> list[str]:
-        """Kokoro voices (from the loaded engine, else read from the voices file) plus the
-        OmniVoice presets when OmniVoice is installed."""
-        voices: list[str] = []
+        """Kokoro voices: from the loaded engine, else read from the voices file."""
         loaded = self.engine.loaded
-        if loaded is not None and loaded.kokoro is not None:
-            voices = list(loaded.kokoro.voices())
-        else:
-            path = resolve_path(self.cfg.speech.voices)
-            if path.is_file():
-                try:
-                    voices = voices_in_file(path)
-                except Exception:
-                    log.exception("could not read %s", path)
-        return voices + omni_presets(self.cfg.speech)
-
-    def _current_voice(self) -> str:
-        sp = self.cfg.speech
-        return omni_voice_of(sp) if sp.engine == "omnivoice" else kokoro_voice_of(sp)
+        if loaded is not None:
+            return list(loaded.voices())
+        path = resolve_path(self.cfg.speech.voices)
+        if path.is_file():
+            try:
+                return voices_in_file(path)
+            except Exception:
+                log.exception("could not read %s", path)
+        return []
 
     def _set_voice(self, voice: str) -> None:
-        """Pick a voice from the tray: its engine becomes the active one."""
-        sp = self.cfg.speech
-        if is_omni_voice(voice):
-            sp.engine, sp.omni_voice = "omnivoice", normalize_omni_voice(voice)
-        else:
-            sp.engine, sp.voice = "kokoro", voice
+        self.cfg.speech.voice = voice
         self._save()
-        self._voices_changed()
-
-    def _set_engine(self, engine: str) -> None:
-        if engine not in ("kokoro", "omnivoice"):
-            return
-        if engine == "omnivoice" and not omni_present(self.cfg.speech):
-            return
-        self.cfg.speech.engine = engine
-        self._save()
-        if self.cfg.speech.preload:
-            self.engine.preload(self.cfg.speech)
         self._voices_changed()
 
     def _set_speed(self, speed: float) -> None:
@@ -1130,78 +712,16 @@ class AgentBridge:
 
         if not voice:
             return
-        voice = normalize_omni_voice(voice) if is_omni_voice(voice) else voice
-        if not voice_ready(s, voice):
-            raise ToolError(missing_message(voice))
+        if not models_present(s):
+            raise ToolError(MISSING_MODEL)
         if voice not in self.app._voices():
             raise ToolError(f"Unknown voice '{voice}'. Call list_voices to get the valid ids.")
 
     def list_voices(self) -> dict:
         from .tts import voice_label
 
-        s = self.app.cfg.speech
-        info = {r.get("voice"): r for r in omni_preset_info(s)}
-        voices = []
-        for v in self.app._voices():
-            row = {"id": v, "label": voice_label(v),
-                   "engine": "omnivoice" if is_omni_voice(v) else "kokoro"}
-            meta = info.get(v)
-            if meta and is_omni_voice(v):
-                row.update({k: meta.get(k, "") for k in ("kind", "description", "lang")})
-            voices.append(row)
-        return {
-            "voices": voices,
-            "engine": s.engine,
-            "default_voice": active_voice(s),
-            "omnivoice_installed": omni_present(s),
-        }
-
-    def create_voice(self, args: dict) -> dict:
-        from .mcp_server import ToolError
-
-        app = self.app
-        s = app.cfg.speech
-        if not omni_present(s):
-            raise ToolError(MISSING_OMNI)
-        omni = _omni()
-        overwrite = bool(args.get("overwrite", False))
-        try:
-            name = omni.sanitize_name(args.get("name") or "")
-        except ValueError as e:
-            raise ToolError(str(e)) from e
-        if not overwrite and any(r.get("name") == name for r in omni_preset_info(s)):
-            raise ToolError(f"A voice named '{name}' already exists; pass overwrite=true to replace it")
-        seed = args.get("seed")
-        if seed is None:
-            seed = random.SystemRandom().randrange(2**31)
-        lang = args.get("lang") or "en"
-        description = args.get("description") or ""
-        log.info("MCP create_voice: name %s, description %d chars", name, len(description))
-        try:
-            clip = app._design_clip(description, int(seed), None, lang)
-            voice_id = app._save_voice(name, clip, overwrite)
-        except (ValueError, FileExistsError) as e:
-            raise ToolError(str(e)) from e
-        meta = getattr(clip, "meta", None) or {}
-        return {"voice": voice_id, "name": name, "description": meta.get("instruct", description),
-                "seed": int(seed), "lang": lang}
-
-    def delete_voice(self, args: dict) -> dict:
-        from .mcp_server import ToolError
-
-        app = self.app
-        if not omni_present(app.cfg.speech):
-            raise ToolError(MISSING_OMNI)
-        raw = str(args.get("name") or "").strip()
-        name = raw.partition(":")[2] if is_omni_voice(raw) else raw
-        if not name:
-            raise ToolError("'name' must be a voice name or an omni:<name> id")
-        try:
-            app._delete_voice(name)
-        except (ValueError, FileNotFoundError) as e:
-            raise ToolError(str(e)) from e
-        log.info("MCP delete_voice: %s", name)
-        return {"deleted": f"omni:{name}"}
+        voices = [{"id": v, "label": voice_label(v)} for v in self.app._voices()]
+        return {"voices": voices, "default_voice": self.app.cfg.speech.voice}
 
     def synthesize_batch(self, args: dict) -> dict:
         from .export import ExportRequest, format_for
@@ -1226,11 +746,9 @@ class AgentBridge:
                     raise ValueError("'text' must be a non-empty string")
                 if limit > 0 and len(text) > limit:
                     raise ValueError(f"text is too long ({len(text)} characters); the limit is {limit}")
-                voice, lang, speed = it.get("voice"), it.get("lang"), it.get("speed")
+                voice, speed = it.get("voice"), it.get("speed")
                 if voice is not None and not isinstance(voice, str):
                     raise ValueError("'voice' must be a string")
-                if lang not in (None, "en", "hr"):
-                    raise ValueError("'lang' must be 'en' or 'hr'")
                 if speed is not None and (isinstance(speed, bool) or not isinstance(speed, (int, float))
                                           or not 0.5 <= speed <= 2):
                     raise ValueError("'speed' must be a number between 0.5 and 2")
@@ -1244,8 +762,8 @@ class AgentBridge:
                 results[i] = {"output": out if isinstance(out, str) else "", "duration_s": 0.0,
                               "ok": False, "error": err}
                 continue
-            reqs.append(ExportRequest(text, Path(out), voice or None, speed, lang, fmt, None, True,
-                                      1.0, overwrite, ""))
+            reqs.append(ExportRequest(text, Path(out), voice or None, speed, fmt, None, True, 1.0,
+                                      overwrite, ""))
             slots.append(i)
         log.info("MCP synthesize_batch: %d items (%d valid)", len(items), len(reqs))
         if reqs:
@@ -1256,8 +774,8 @@ class AgentBridge:
                 "failed_count": sum(1 for r in done if not r["ok"]),
                 "total_duration_s": round(sum(r["duration_s"] for r in done), 2)}
 
-    def speak(self, text: str, voice: str | None, speed: float | None, lang: str | None,
-              wait: bool, timeout: float) -> dict:
+    def speak(self, text: str, voice: str | None, speed: float | None, wait: bool,
+              timeout: float) -> dict:
         from .mcp_server import ToolError
 
         app = self.app
@@ -1267,21 +785,21 @@ class AgentBridge:
         cfg = app.cfg
         s = cfg.speech
         self._check_voice(s, voice)
-        chunks, voice, lang, _ = plan_speech(s, text, voice, lang, cfg.selection.clean_markdown,
-                                             cfg.selection.max_chars)
+        chunks, voice = plan_speech(s, text, voice, cfg.selection.clean_markdown,
+                                    cfg.selection.max_chars)
         if not chunks:
             raise ToolError("Nothing to read in this text")
-        if not voice_ready(s, voice):
-            raise ToolError(missing_message(voice))
+        if not models_present(s):
+            raise ToolError(MISSING_MODEL)
         if speed:
             s = dataclasses.replace(s, speed=float(speed))
         log.info("MCP speak: %d chars with %s", len(text), voice)
-        req = app.speak(chunks, s, voice, lang)
+        req = app.speak(chunks, s, voice)
         done = bool(wait and req is not None and req.done.wait(timeout))
         error = req.error if done else None
         interrupted = bool(done and req.interrupted)
         return {"started": True, "completed": bool(done and not interrupted and not error),
-                "interrupted": interrupted, "error": error, "voice": voice, "lang": lang}
+                "interrupted": interrupted, "error": error, "voice": voice}
 
     def stop(self, cancel_export: bool) -> dict:
         app = self.app
@@ -1316,13 +834,13 @@ class AgentBridge:
         if fmt and suffix in (".wav", ".mp3") and suffix[1:] != fmt:
             raise ToolError(f"format '{fmt}' does not match the output file name '{output}'")
         req = ExportRequest(text, Path(output) if output else None, args.get("voice"),
-                            args.get("speed"), args.get("lang"), fmt, None, markdown,
-                            1.0, bool(args.get("overwrite", False)), title)
+                            args.get("speed"), fmt, None, markdown, 1.0,
+                            bool(args.get("overwrite", False)), title)
         log.info("MCP export: %d chars", len(text))
         result = app.export_audio(req)
         return {"path": str(result.path), "format": result.fmt,
                 "duration_seconds": round(result.seconds, 2), "chunks": result.chunks,
-                "bytes": result.bytes, "voice": result.voice, "lang": result.lang}
+                "bytes": result.bytes, "voice": result.voice}
 
 
 # ---------------------------------------------------------------- headless MCP (agents)
@@ -1335,7 +853,7 @@ class _NoSpeaker:
 
 
 class HeadlessApp:
-    """The agent-facing part of TTSApp (voices, exports, voice presets) without the tray,
+    """The agent-facing part of TTSApp (voices, exports) without the tray,
     hotkey, overlay or Settings window; what `--mcp-only` serves."""
 
     _voices = TTSApp._voices
@@ -1343,10 +861,6 @@ class HeadlessApp:
     export_batch = TTSApp.export_batch
     _export_yield = TTSApp._export_yield
     cancel_export = TTSApp.cancel_export
-    _design_clip = TTSApp._design_clip
-    _save_voice = TTSApp._save_voice
-    _delete_voice = TTSApp._delete_voice
-    _save = TTSApp._save
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -1355,9 +869,6 @@ class HeadlessApp:
         self.speaker = _NoSpeaker()
         self._export_lock = threading.Lock()
         self._export_cancel: threading.Event | None = None
-
-    def _voices_changed(self) -> None:
-        pass
 
     def stop(self) -> None:
         pass
@@ -1379,13 +890,8 @@ def run_mcp_only(cfg: Config, port: int | None = None) -> int:
             print("error: --port must be between 1024 and 65535", file=sys.stderr)
             return 2
         m.port = port
-    try:
-        options = {k: list(v) for k, v in _omni().INSTRUCT_OPTIONS.items()}
-    except Exception:
-        log.debug("INSTRUCT_OPTIONS unavailable for the MCP schema", exc_info=True)
-        options = None
     server = mcp_server.McpServer(
-        mcp_server.build_tools(AgentBridge(HeadlessApp(cfg)), int(m.max_chars), options),
+        mcp_server.build_tools(AgentBridge(HeadlessApp(cfg)), int(m.max_chars)),
         int(m.port), version=__version__, instructions=mcp_server.INSTRUCTIONS)
     try:
         server.start()
@@ -1418,27 +924,19 @@ def say(cfg: Config, text: str, out: str | None = None, title: str = "",
     s = cfg.speech
     if markdown is None:
         markdown = cfg.selection.clean_markdown
-    route = route_for(s, text)
-    voice, lang = route.voice, route.lang
-    if route.fell_back:
-        print("note: OmniVoice is not installed (Settings > OmniVoice); using "
-              f"{voice}", file=sys.stderr)
-    if not voice_ready(s, voice):
-        if route.omni:
-            print(f"error: {MISSING_OMNI} (expected in {s.omnivoice_dir})", file=sys.stderr)
-        else:
-            print(f"error: model files missing ({s.model}, {s.voices}); "
-                  "run: python -m vibetts.model_setup", file=sys.stderr)
+    if not models_present(s):
+        print(f"error: model files missing ({s.model}, {s.voices}); "
+              "run: python -m vibetts.model_setup", file=sys.stderr)
         return 1
-    chunks = textprep.prepare(text, markdown, 0, lang, long_chunks=route.omni)
+    chunks = textprep.prepare(text, markdown)
     if not chunks:
         print("error: nothing to say", file=sys.stderr)
         return 1
     t0 = time.perf_counter()
-    engine = EngineHolder().get(s, announce=False, voice=voice)  # loads the engine, warms it up
+    engine = EngineHolder().get(s, announce=False)  # loads the engine, warms it up
     print(f"model loaded in {time.perf_counter() - t0:.2f}s", flush=True)
     if out:
-        req = ExportRequest(text, Path(out), voice, None, lang, None, cfg.export.mp3_bitrate,
+        req = ExportRequest(text, Path(out), s.voice, None, None, cfg.export.mp3_bitrate,
                             markdown, s.volume, True, title)
         t0 = time.perf_counter()
         try:
@@ -1461,8 +959,8 @@ def say(cfg: Config, text: str, out: str | None = None, title: str = "",
 
     speaker = Speaker(lambda: engine, on_start=on_start,
                       on_done=lambda req, err: errors.append(err) if err else None)
-    speaker.speak_and_wait(SpeakRequest(chunks, voice, s.speed, s.sentence_pause, s.volume,
-                                        s.device, lang))
+    speaker.speak_and_wait(SpeakRequest(chunks, s.voice, s.speed, s.sentence_pause, s.volume,
+                                        s.device))
     if errors:
         print(f"error: {errors[0]}", file=sys.stderr)
         return 1
@@ -1540,8 +1038,8 @@ def main(argv: list[str] | None = None) -> int:
             inst = None
             return 0
         cfg = load_config()
-        log.info("effective hotkey=%s engine=%s voice=%s speed=%s", cfg.hotkey.read,
-                 cfg.speech.engine, cfg.speech.voice, cfg.speech.speed)
+        log.info("effective hotkey=%s voice=%s speed=%s", cfg.hotkey.read, cfg.speech.voice,
+                 cfg.speech.speed)
         TTSApp(cfg, start_hidden=args.hidden, instance=inst).run()
         return 0
     except KeyboardInterrupt:

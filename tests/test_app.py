@@ -29,19 +29,7 @@ def test_short():
     assert len(app._short("x" * 100, 10)) == 10
 
 
-# ---------------------------------------------------------------- engines / routing
-
-class FakeOmniEngine:
-    def __init__(self, model_dir, steps=6):
-        self.model_dir, self.steps, self.calls = model_dir, steps, []
-
-    def voices(self):
-        return ["omni:default", "omni:alma"]
-
-    def synth(self, text, voice, speed, lang=None):
-        self.calls.append((text, voice, speed, lang))
-        return np.zeros(10, np.float32)
-
+# ---------------------------------------------------------------- engine
 
 class FakeKokoro:
     def __init__(self, *paths):
@@ -50,241 +38,66 @@ class FakeKokoro:
     def voices(self):
         return ["af_heart"]
 
-    def synth(self, text, voice, speed, lang=None):
-        self.calls.append((text, voice, speed, lang))
+    def synth(self, text, voice, speed):
+        self.calls.append((text, voice, speed))
         return np.ones(10, np.float32)
-
-
-class FakeOmniModule:
-    def __init__(self, present=True):
-        self.present = present
-        self.OmniVoiceEngine = FakeOmniEngine
-
-    def models_present(self, model_dir):
-        return self.present
-
-    def list_presets(self, model_dir):
-        return ["omni:default", "omni:alma"]
-
-    def list_preset_info(self, model_dir):
-        return [{"name": "default", "voice": "omni:default", "kind": "default",
-                 "description": "", "lang": "hr"},
-                {"name": "alma", "voice": "omni:alma", "kind": "design",
-                 "description": "female, young adult", "lang": "en"}]
-
-    INSTRUCT_OPTIONS = {"gender": ["male", "female"]}
-
-    def sanitize_name(self, s):
-        name = "".join(c if c.isalnum() or c in "-_" else "-" for c in s.lower()).strip("-_")
-        if not name or name == "default":
-            raise ValueError("bad voice name")
-        return name
 
 
 @pytest.fixture
 def fakes(tmp_path, monkeypatch):
-    omni = FakeOmniModule()
-    monkeypatch.setattr(app, "_omni", lambda: omni)
     monkeypatch.setattr("vibetts.tts.KokoroEngine", FakeKokoro)
     model, voices = tmp_path / "m.onnx", tmp_path / "v.bin"
     model.write_bytes(b"x")
     voices.write_bytes(b"x")
-    s = SpeechConfig(model=str(model), voices=str(voices), omnivoice_dir=str(tmp_path / "omni"))
-    return s, omni
+    return SpeechConfig(model=str(model), voices=str(voices))
 
 
-def test_holder_routes_by_voice(fakes):
-    s, _ = fakes
+def test_holder_loads_once_and_reloads_on_new_files(fakes, tmp_path):
+    s = fakes
     holder = app.EngineHolder()
     assert holder.loaded is None
-    engine = holder.get(s)  # engine kokoro: Kokoro family only
-    assert engine.omni is None
-    s_hr = dataclasses.replace(s, engine="omnivoice", omni_voice="omni:alma", omnivoice_steps=9)
-    engine = holder.get(s_hr)
-    assert isinstance(engine.omni, FakeOmniEngine) and engine.omni.steps == 9
-    assert engine.kokoro is holder.get(s).kokoro  # cached, not reloaded
-    engine.synth("a", "af_heart", 1.0, "en")
-    engine.synth("b", "omni:alma", 1.2, "hr")
-    assert engine.kokoro.calls[-1] == ("a", "af_heart", 1.0, "en")
-    assert engine.omni.calls[-1] == ("b", "omni:alma", 1.2, "hr")
-    assert engine.voices() == ["af_heart", "omni:default", "omni:alma"]
+    engine = holder.get(s)
+    assert isinstance(engine, FakeKokoro) and holder.loaded is engine
+    assert engine.calls == [("Ready.", "af_heart", 1.0)]  # warm-up
+    assert holder.get(s) is engine  # cached, not reloaded
+    other = tmp_path / "m2.onnx"
+    other.write_bytes(b"x")
+    assert holder.get(dataclasses.replace(s, model=str(other))) is not engine
 
 
-def test_holder_get_with_explicit_voice(fakes):
-    s, _ = fakes
+def test_preload_loads_in_the_background(fakes):
     holder = app.EngineHolder()
-    engine = holder.get(s, voice="omni:alma")  # Croatian text under the Kokoro engine
-    assert engine.omni is not None and engine.kokoro is None
-    assert holder.get(s).kokoro is not None  # the configured engine loads on demand
-
-
-def test_holder_omni_only_does_not_load_kokoro(fakes):
-    s, _ = fakes
-    holder = app.EngineHolder()
-    engine = holder.get(dataclasses.replace(s, engine="omnivoice"))
-    assert engine.kokoro is None
-    with pytest.raises(RuntimeError, match="Download the voice model"):
-        engine.synth("x", "af_heart", 1.0)
-
-
-def test_holder_reloads_omni_when_steps_change(fakes):
-    s, _ = fakes
-    holder = app.EngineHolder()
-    cfg = dataclasses.replace(s, engine="omnivoice")
-    a = holder.get(dataclasses.replace(cfg, omnivoice_steps=6)).omni
-    b = holder.get(dataclasses.replace(cfg, omnivoice_steps=8)).omni
-    assert a is not b and b.steps == 8
-
-
-def test_holder_omni_missing(fakes):
-    s, omni = fakes
-    omni.present = False
-    with pytest.raises(RuntimeError, match="Settings > OmniVoice"):
-        app.EngineHolder().get(s, voice="omni:default")
-
-
-def test_holder_unload_omni(fakes):
-    s, _ = fakes
-    holder = app.EngineHolder()
-    first = holder.get_omni(s)
-    holder.unload_omni()
-    assert holder.loaded is None
-    assert holder.get_omni(s) is not first
-
-
-def test_preload_loads_only_the_engine_in_use(fakes):
-    s, _ = fakes
-    holder = app.EngineHolder()
-    holder.preload(dataclasses.replace(s, engine="omnivoice"))
+    holder.preload(fakes)
     for _ in range(100):
         if holder.loaded is not None:
             break
         time.sleep(0.02)
-    assert holder.loaded.omni is not None and holder.loaded.kokoro is None
+    assert isinstance(holder.loaded, FakeKokoro)
 
 
-def test_voice_ready_per_engine(fakes):
-    s, omni = fakes
-    assert app.voice_ready(s, "af_heart") and app.voice_ready(s, "omni:default")
-    assert app.voice_ready(s, "omni_hr:default")  # legacy ids still count as OmniVoice
-    omni.present = False
-    assert app.voice_ready(s, "af_heart") and not app.voice_ready(s, "omni:default")
-    assert app.missing_message("omni:default") == app.MISSING_OMNI
-    assert app.missing_message("af_heart") == app.MISSING_MODEL
-
-
-HR_TEXT = "Ovo je test čitanja na hrvatskom jeziku."
 EN_TEXT = "This is plain English text."
 
 
-def sp(**kw):
-    return dataclasses.replace(SpeechConfig(), **kw)
-
-
-@pytest.mark.parametrize("engine,text,installed,auto,expected", [
-    # engine kokoro: only Croatian text goes to OmniVoice
-    ("kokoro", EN_TEXT, True, True, ("af_heart", "en", False)),
-    ("kokoro", HR_TEXT, True, True, ("omni:alma", "hr", False)),      # croatian_voice
-    ("kokoro", HR_TEXT, False, True, ("af_heart", "en", True)),       # not installed: fall back
-    ("kokoro", HR_TEXT, True, False, ("af_heart", "en", False)),      # auto language off
-    # engine omnivoice: everything goes to OmniVoice, language per request
-    ("omnivoice", EN_TEXT, True, True, ("omni:zora", "en", False)),
-    ("omnivoice", HR_TEXT, True, True, ("omni:alma", "hr", False)),
-    ("omnivoice", HR_TEXT, True, False, ("omni:zora", "en", False)),
-    ("omnivoice", EN_TEXT, False, True, ("af_heart", "en", True)),    # not installed: Kokoro
-    ("omnivoice", HR_TEXT, False, True, ("af_heart", "en", True)),
-])
-def test_choose_voice_table(engine, text, installed, auto, expected):
-    s = sp(engine=engine, omni_voice="omni:zora", croatian_voice="omni:alma",
-           auto_language=auto)
-    assert tuple(app.choose_voice(s, text, installed)) == expected
-
-
-def test_choose_voice_croatian_voice_defaults_to_omni_voice():
-    s = sp(omni_voice="omni:zora", croatian_voice="")
-    assert app.choose_voice(s, HR_TEXT, True).voice == "omni:zora"
-    assert app.choose_voice(sp(), HR_TEXT, True).voice == "omni:default"
-
-
-def test_choose_voice_accepts_legacy_ids():
-    s = sp(engine="omnivoice", omni_voice="omni_hr:alma", croatian_voice="omni_hr:zora")
-    assert app.choose_voice(s, EN_TEXT, True).voice == "omni:alma"
-    assert app.choose_voice(s, HR_TEXT, True).voice == "omni:zora"
-    assert app.choose_voice(sp(voice="omni_hr:alma"), EN_TEXT, False).voice == "af_heart"
-
-
-def test_route_flags_and_active_voice(fakes):
-    s, omni = fakes
-    assert app.choose_voice(sp(engine="omnivoice"), EN_TEXT, True).omni
-    assert not app.choose_voice(sp(), EN_TEXT, True).omni
-    omni_cfg = dataclasses.replace(s, engine="omnivoice", omni_voice="omni:alma")
-    assert app.active_voice(omni_cfg) == "omni:alma"
-    assert app.active_voice(s) == "af_heart"
-    omni.present = False
-    assert app.active_voice(dataclasses.replace(s, engine="omnivoice")) == "af_heart"
-
-
-class SpyOmniEngine(FakeOmniEngine):
+class SpyKokoro(FakeKokoro):
     seen: list = []
 
-    def synth(self, text, voice, speed, lang=None):
-        SpyOmniEngine.seen.append((text, voice, lang))
-        return super().synth(text, voice, speed, lang)
+    def synth(self, text, voice, speed):
+        SpyKokoro.seen.append((text, voice))
+        return super().synth(text, voice, speed)
 
 
-def test_say_routes_croatian_with_lang(fakes, monkeypatch, tmp_path):
-    s, omni = fakes
-    SpyOmniEngine.seen = []
-    omni.OmniVoiceEngine = SpyOmniEngine
-    out = tmp_path / "o.wav"
-    assert app.say(Config(speech=s), HR_TEXT + " Vidi https://x.org/a", str(out)) == 0
-    assert out.exists()
-    chunks = [x for x in SpyOmniEngine.seen if x[0] != "Ready."]
-    assert chunks and all(v == "omni:default" and lang == "hr" for _, v, lang in chunks)
-    assert "poveznica" in chunks[-1][0]  # the URL word follows the language
-
-
-def test_say_english_with_omnivoice_engine(fakes, tmp_path):
-    s, omni = fakes
-    SpyOmniEngine.seen = []
-    omni.OmniVoiceEngine = SpyOmniEngine
-    cfg = Config(speech=dataclasses.replace(s, engine="omnivoice", omni_voice="omni:alma"))
+def test_say_reads_with_the_configured_voice(fakes, monkeypatch, tmp_path):
+    monkeypatch.setattr("vibetts.tts.KokoroEngine", SpyKokoro)
+    SpyKokoro.seen = []
+    cfg = Config(speech=dataclasses.replace(fakes, voice="bf_emma"))
     assert app.say(cfg, "Read https://x.org/a now.", str(tmp_path / "o.wav")) == 0
-    assert SpyOmniEngine.seen[-1] == ("Read link now.", "omni:alma", "en")
+    assert SpyKokoro.seen[-1] == ("Read link now.", "bf_emma")
 
 
-def test_say_missing_omnivoice_falls_back(fakes, tmp_path, capsys):
-    s, omni = fakes
-    omni.present = False
-    out = tmp_path / "o.wav"
-    assert app.say(Config(speech=s), HR_TEXT, str(out)) == 0  # read with Kokoro instead
-    assert "OmniVoice is not installed" in capsys.readouterr().err
-    cfg = Config(speech=dataclasses.replace(s, engine="omnivoice"))
-    assert app.say(cfg, EN_TEXT, str(out)) == 0  # engine omnivoice but not installed: Kokoro
-
-
-# ---------------------------------------------------------------- long chunks / lang plumbing
-
-def test_prepare_long_chunks_for_any_omnivoice_request():
-    from vibetts.textprep import prepare
-
-    text = " ".join(f"Sentence number {i} is short." for i in range(12))
-    short, long = prepare(text), prepare(text, long_chunks=True)
-    assert len(long) < len(short)
-    assert prepare(text, lang="hr") == short  # the language alone does not change chunking
-
-
-def test_request_route_logs_fallback_once(fakes, caplog):
-    s, omni = fakes
-    omni.present = False
-    a = object.__new__(app.TTSApp)
-    a._warned_omni_missing = False
-    cfg = dataclasses.replace(s, engine="omnivoice")
-    with caplog.at_level("WARNING"):
-        r1 = a._request_route(cfg, EN_TEXT)
-        a._request_route(cfg, EN_TEXT)
-    assert r1.fell_back and r1.voice == "af_heart"
-    assert sum("not installed" in rec.message for rec in caplog.records) == 1
+def test_say_missing_model(fakes, tmp_path, capsys):
+    s = dataclasses.replace(fakes, model=str(tmp_path / "nope.onnx"))
+    assert app.say(Config(speech=s), EN_TEXT, str(tmp_path / "o.wav")) == 1
+    assert "model files missing" in capsys.readouterr().err
 
 
 class FakeOverlayShow:
@@ -292,50 +105,24 @@ class FakeOverlayShow:
         pass
 
 
-def test_speak_passes_lang_and_voice_to_the_engine(fakes):
+def test_speak_passes_the_voice_to_the_engine(fakes):
     from vibetts.textprep import Chunk
 
-    s, _ = fakes
+    s = fakes
     a = object.__new__(app.TTSApp)
-    a._clip_engine = None
     a._current = None
     a.cfg = Config(speech=s)
     a.engine = app.EngineHolder()
     a.overlay = FakeOverlayShow()
     reqs = []
     a.speaker = type("Sp", (), {"speak": lambda self, req: reqs.append(req)})()
-    a.speak([Chunk("Bok", 0.0)], s, "omni:alma", "hr")
-    assert reqs[0].voice == "omni:alma" and reqs[0].lang == "hr"
-    engine = a._engine_for_speaker()  # loads OmniVoice for the request's voice only
-    assert engine.omni is not None and engine.kokoro is None
+    a.speak([Chunk("Hi", 0.0)], s, "bf_emma")
+    a.speak([Chunk("Hi", 0.0)], s)
+    assert [r.voice for r in reqs] == ["bf_emma", "af_heart"]  # default: speech.voice
+    assert isinstance(a._engine_for_speaker(), FakeKokoro)
 
 
-# ---------------------------------------------------------------- custom voices (hooks)
-
-class VoiceEngine(FakeOmniEngine):
-    def design_clip(self, instruct, seed, text=None, lang=None):
-        return ("design", instruct, seed, text, lang)
-
-    def clone_clip(self, wav_path, ref_text, lang=None):
-        return ("clone", wav_path, ref_text, lang)
-
-
-class VoiceModule(FakeOmniModule):
-    def __init__(self):
-        super().__init__()
-        self.OmniVoiceEngine = VoiceEngine
-        self.saved, self.deleted, self.encoders = [], [], True
-
-    def save_preset(self, model_dir, name, clip, overwrite=False):
-        self.saved.append((name, clip))
-        return f"omni:{name}"
-
-    def delete_preset(self, model_dir, name):
-        self.deleted.append(name)
-
-    def encoders_present(self, model_dir):
-        return self.encoders
-
+# ---------------------------------------------------------------- app helpers
 
 class FakeTray:
     def __init__(self):
@@ -370,7 +157,6 @@ def make_app(s):
     a.cfg = Config(speech=s)
     a.engine = app.EngineHolder()
     a.tray, a.overlay, a.settings = FakeTray(), FakeOverlay(), None
-    a._clip_engine = None
     a._current = None
     a._export_lock = threading.Lock()
     a._export_cancel = None
@@ -384,189 +170,16 @@ def make_app(s):
     return a
 
 
-@pytest.fixture
-def vapp(fakes, monkeypatch):
-    s, _ = fakes
-    omni = VoiceModule()
-    monkeypatch.setattr(app, "_omni", lambda: omni)
-    return make_app(s), omni
-
-
-def test_get_omni_loads_shared_engine_for_kokoro_engine(fakes):
-    s, _ = fakes
-    holder = app.EngineHolder()
-    holder.get(s)  # Kokoro engine configured
-    engine = holder.get_omni(s)
-    assert isinstance(engine, FakeOmniEngine)
-    assert holder.get_omni(s) is engine is holder.get(s, voice="omni:alma").omni
-
-
-def test_get_omni_missing_files(fakes):
-    s, omni = fakes
-    omni.present = False
-    with pytest.raises(RuntimeError, match="Settings > OmniVoice"):
-        app.EngineHolder().get_omni(s)
-
-
-def test_settings_hooks_wiring(vapp, monkeypatch):
-    a, omni = vapp
-    a._autostart = type("A", (), {"is_enabled": staticmethod(lambda: False)})
-    monkeypatch.setattr("vibetts.settings_ui.SettingsWindow", FakeSettingsWindow)
-    hooks = a._settings_window().hooks
-    assert hooks.design_clip("female", 3) == ("design", "female", 3, None, None)
-    assert hooks.design_clip("male", 4, None, "en") == ("design", "male", 4, None, "en")
-    assert hooks.clone_clip("a.wav", "Ovo je moj glas, hvala.") == (
-        "clone", Path("a.wav"), "Ovo je moj glas, hvala.", "hr")  # language guessed from the text
-    assert hooks.clone_clip("a.wav", "Hello there my friend.")[3] == "en"
-    assert hooks.encoders_present() is True
-    omni.encoders = False
-    assert hooks.encoders_present() is False
-    assert hooks.save_voice("ana", "clip") == "omni:ana"
-    assert omni.saved == [("ana", "clip")]
-    assert a.tray.updates == 1  # tray menu refreshed after save
-    assert hooks.omni_voices() == ["omni:default", "omni:alma"]
-    assert hooks.omni_voice_info()[0]["name"] == "default"
-
-
-def test_install_hooks_use_the_installer_contract(vapp, monkeypatch):
-    import types
-
-    a, omni = vapp
-    calls = []
-    fake = types.ModuleType("vibetts.omnivoice_setup")
-    fake.DOWNLOAD_BYTES = lambda include: 2_900_000_000 + (654_000_000 if include else 0)
-    fake.status = lambda d: {"installed": True, "encoders": False, "bytes_on_disk": 5}
-    fake.install = lambda d, include_encoders=True, progress=None, cancel=None, keep_cache=False: (
-        calls.append(("install", Path(d).name, include_encoders, progress, cancel)))
-    fake.uninstall = lambda d, keep_voices=True: calls.append(("uninstall", keep_voices))
-    monkeypatch.setattr(app.TTSApp, "_setup", staticmethod(lambda: fake))
-    monkeypatch.setattr("vibetts.settings_ui.SettingsWindow", FakeSettingsWindow)
-    a._autostart = type("A", (), {"is_enabled": staticmethod(lambda: False)})
-    a.stop = lambda: calls.append("stop")
-    a.cfg.speech.preload = False
-    hooks = a._settings_window().hooks
-    assert hooks.omni_download_bytes(True) == 3_554_000_000
-    assert hooks.omni_status() == {"installed": True, "encoders": False, "bytes_on_disk": 5}
-    marker = object()
-    hooks.omni_install(True, print, marker)
-    assert calls[-1] == ("install", "omni", True, print, marker)
-    assert a.tray.updates == 1  # menus refreshed after the install
-    a.cfg.speech.engine = "omnivoice"
-    hooks.omni_uninstall()
-    assert calls[-2:] == ["stop", ("uninstall", True)]
-    assert a.cfg.speech.engine == "kokoro" and len(a.saved_configs) == 1
-
-
-def test_install_failure_still_refreshes(vapp, monkeypatch):
-    import types
-
-    from vibetts import model_setup
-
-    a, _ = vapp
-    fake = types.ModuleType("vibetts.omnivoice_setup")
-
-    def boom(*args, **kw):
-        raise model_setup.SetupError("no network")
-    fake.install = boom
-    monkeypatch.setattr(app.TTSApp, "_setup", staticmethod(lambda: fake))
-    with pytest.raises(model_setup.SetupError):
-        a._omni_install(True, None, None)
-    assert a.tray.updates == 1
-
-
-def test_delete_voice_falls_back_to_default(vapp):
-    a, omni = vapp
-    a.cfg.speech.croatian_voice = "omni:alma"
-    a.cfg.speech.omni_voice = "omni:alma"
-    a._delete_voice("alma")
-    assert omni.deleted == ["alma"]
-    assert a.cfg.speech.croatian_voice == ""  # "same as the OmniVoice voice"
-    assert a.cfg.speech.omni_voice == "omni:default"
-    assert len(a.saved_configs) == 1 and a.tray.updates == 1
-
-
-def test_delete_other_voice_keeps_config(vapp):
-    a, omni = vapp
-    a.cfg.speech.croatian_voice = "omni:alma"
-    a._delete_voice("omni:zora")  # an id is accepted too
-    assert omni.deleted == ["zora"]
-    assert a.cfg.speech.croatian_voice == "omni:alma"
-    assert a.saved_configs == [] and a.tray.updates == 1
-
-
-def test_play_preset_plays_the_stored_wav(vapp):
-    a, omni = vapp
-    played = []
-    omni.read_wav = lambda path: (np.full(3, 0.25, np.float32), 24000)
-    a._play_clip = lambda clip: played.append(clip.audio.tolist())
-    a._play_preset("alma")
-    assert played == [[0.25, 0.25, 0.25]]
-
-
-def test_tray_set_voice_switches_engine(fakes):
-    s, _ = fakes
-    a = make_app(s)
-    a._set_voice("omni_hr:alma")  # a legacy id is normalised
-    sp_ = a.cfg.speech
-    assert (sp_.engine, sp_.omni_voice, sp_.voice) == ("omnivoice", "omni:alma", "af_heart")
-    assert a._current_voice() == "omni:alma"
+def test_tray_set_voice(fakes):
+    a = make_app(fakes)
     a._set_voice("bf_emma")
-    assert (sp_.engine, sp_.voice, sp_.omni_voice) == ("kokoro", "bf_emma", "omni:alma")
-    assert a._current_voice() == "bf_emma"
-    assert len(a.saved_configs) == 2 and a.tray.updates == 2
-
-
-def test_tray_set_engine(fakes):
-    s, omni = fakes
-    a = make_app(dataclasses.replace(s, preload=False))
-    a._set_engine("omnivoice")
-    assert a.cfg.speech.engine == "omnivoice"
-    a._set_engine("bogus")
-    assert a.cfg.speech.engine == "omnivoice"
-    a._set_engine("kokoro")
-    omni.present = False
-    a._set_engine("omnivoice")  # not installed: refused
-    assert a.cfg.speech.engine == "kokoro"
-
-
-def test_play_clip_uses_output_and_stop(vapp):
-    from vibetts.tts import Speaker
-
-    a, _ = vapp
-    written = []
-
-    class Out:
-        def __init__(self, device=""):
-            self.device = device
-
-        def write(self, block):
-            written.append(block.copy())
-
-        def drain(self):
-            pass
-
-        def abort(self):
-            pass
-
-        def close(self):
-            pass
-
-    a.cfg.speech.device = "Speakers"
-    a._speak_voice = None
-    a._speak_cfg = a.cfg.speech
-    a.speaker = Speaker(a._engine_for_speaker, Out)
-    a._play_clip(type("Clip", (), {"audio": np.full(5, 0.5, np.float32)})())
-    for _ in range(100):
-        if not a.speaker.busy:
-            break
-        time.sleep(0.02)
-    assert len(written) == 1 and written[0].tolist() == [0.5] * 5
-    a.speaker.stop(wait=1.0)
+    assert a.cfg.speech.voice == "bf_emma"
+    assert len(a.saved_configs) == 1 and a.tray.updates == 1
 
 
 # ---------------------------------------------------------------- tray menus
 
-def make_tray(engine="kokoro", omni=True, voices=None, current="af_heart"):
+def make_tray(voices=None, current="af_heart"):
     from vibetts.tray import Tray, TrayHooks
 
     calls = []
@@ -574,46 +187,29 @@ def make_tray(engine="kokoro", omni=True, voices=None, current="af_heart"):
     hooks = TrayHooks(
         is_enabled=lambda: True, set_enabled=noop, is_speaking=lambda: False, stop=noop,
         model_missing=lambda: False, download_model=noop,
-        voices=lambda: voices if voices is not None else
-        ["af_heart", "am_adam", "bf_emma", "omni:default", "omni:ana_marija"],
+        voices=lambda: voices if voices is not None else ["af_heart", "am_adam", "bf_emma"],
         current_voice=lambda: current, set_voice=lambda v: calls.append(("voice", v)),
         current_speed=lambda: 1.0, set_speed=noop, is_autostart=lambda: False,
         set_autostart=noop, open_settings=noop, open_config=noop, open_logs=noop,
-        reload_config=noop, quit=noop, current_engine=lambda: engine,
-        set_engine=lambda e: calls.append(("engine", e)), omni_available=lambda: omni)
+        reload_config=noop, quit=noop)
     return Tray(hooks), calls
 
 
-def test_tray_engine_submenu():
-    tray, calls = make_tray(engine="omnivoice", omni=False)
-    kokoro, omni = tray._engine_menu().items
-    assert (kokoro.text, omni.text) == ("Kokoro", "OmniVoice")
-    assert kokoro.radio and omni.radio
-    assert kokoro.enabled and not omni.enabled  # greyed out until installed
-    assert not kokoro.checked and omni.checked
-    tray, calls = make_tray(omni=True)
-    assert tray._engine_menu().items[1].enabled
-    tray._engine_menu().items[1](tray._icon)
-    assert calls == [("engine", "omnivoice")]
-
-
-def test_tray_voices_grouped_by_language_and_omnivoice():
-    tray, calls = make_tray(current="omni:ana_marija")
+def test_tray_voices_grouped_by_language():
+    tray, calls = make_tray(current="am_adam")
     groups = {g.text: [i.text for i in g.submenu.items] for g in tray._voice_menu().items}
-    assert groups["American English"] == ["Heart (female)", "Adam (male)"]
-    assert groups["British English"] == ["Emma (female)"]
-    assert groups["OmniVoice"] == ["Default", "Ana Marija"]
-    assert "Croatian" not in groups
-    omni_group = [g for g in tray._voice_menu().items if g.text == "OmniVoice"][0]
-    assert [i.checked for i in omni_group.submenu.items] == [False, True]
-    omni_group.submenu.items[0](tray._icon)  # picking a voice goes through set_voice
-    assert calls == [("voice", "omni:default")]
+    assert groups == {"American English": ["Heart (female)", "Adam (male)"],
+                      "British English": ["Emma (female)"]}
+    us = tray._voice_menu().items[0]
+    assert [i.checked for i in us.submenu.items] == [False, True]
+    us.submenu.items[0](tray._icon)  # picking a voice goes through set_voice
+    assert calls == [("voice", "af_heart")]
 
 
-def test_tray_menu_has_engine_and_voice_entries():
+def test_tray_menu_has_voice_entry():
     tray, _ = make_tray()
     texts = [getattr(i, "text", "") for i in tray._menu_items()]
-    assert "Engine" in texts and "Voice" in texts
+    assert "Voice" in texts and "Engine" not in texts
     tray, _ = make_tray(voices=[])
     assert "Voice" not in [getattr(i, "text", "") for i in tray._menu_items()]
 
@@ -627,37 +223,15 @@ def _wav_frames(path):
         return w.getnframes()
 
 
-def test_plan_speech_auto_route(fakes):
-    s, _ = fakes
-    chunks, voice, lang, omni = app.plan_speech(s, EN_TEXT)
-    assert (voice, lang, omni) == ("af_heart", "en", False) and chunks
-    chunks, voice, lang, omni = app.plan_speech(sp(croatian_voice="omni:alma",
-                                                   omnivoice_dir=s.omnivoice_dir), HR_TEXT)
-    assert (voice, lang, omni) == ("omni:alma", "hr", True)
-
-
-def test_plan_speech_lang_override(fakes):
-    s, omni = fakes
-    assert app.plan_speech(s, EN_TEXT, lang="hr")[1:3] == ("omni:default", "hr")
-    assert app.plan_speech(s, HR_TEXT, lang="en")[1:3] == ("af_heart", "en")
-    omni.present = False
-    assert app.plan_speech(s, EN_TEXT, lang="hr")[1:3] == ("af_heart", "en")
-
-
-def test_plan_speech_explicit_voices(fakes):
-    s, _ = fakes
-    _, voice, lang, omni = app.plan_speech(s, "Ovo je test.", voice="bf_emma", lang="en")
-    assert (voice, lang, omni) == ("bf_emma", "en", False)
-    _, voice, lang, omni = app.plan_speech(s, HR_TEXT, voice="bf_emma")
-    assert (voice, lang, omni) == ("bf_emma", "hr", False)  # language only steers text prep
-    _, voice, lang, omni = app.plan_speech(s, EN_TEXT, voice="omni_hr:alma")
-    assert (voice, lang, omni) == ("omni:alma", "en", True)  # legacy id normalized
-    _, voice, lang, _ = app.plan_speech(s, EN_TEXT, voice="omni:alma", lang="hr")
-    assert (voice, lang) == ("omni:alma", "hr")
+def test_plan_speech_voice(fakes):
+    s = fakes
+    chunks, voice = app.plan_speech(s, EN_TEXT)
+    assert voice == "af_heart" and chunks
+    assert app.plan_speech(s, EN_TEXT, voice="bf_emma")[1] == "bf_emma"
 
 
 def test_plan_speech_max_chars_and_markdown(fakes):
-    s, _ = fakes
+    s = fakes
     text = "First sentence here. Second sentence here. Third one is here too."
     assert len(app.plan_speech(s, text, voice="af_heart", max_chars=25)[0]) \
         < len(app.plan_speech(s, text, voice="af_heart")[0])
@@ -668,8 +242,7 @@ def test_plan_speech_max_chars_and_markdown(fakes):
 def test_run_export_writes_wav(fakes, tmp_path):
     from vibetts.export import ExportProgress, ExportRequest
 
-    s, _ = fakes
-    s = dataclasses.replace(s, sentence_pause=0.0)
+    s = dataclasses.replace(fakes, sentence_pause=0.0)
     kokoro = FakeKokoro()
     progress = []
     req = ExportRequest("One sentence. Another sentence.", Path("a.wav"), speed=1.3)
@@ -683,7 +256,7 @@ def test_run_export_writes_wav(fakes, tmp_path):
 def test_run_export_default_format_and_errors(fakes, tmp_path):
     from vibetts.export import ExportRequest
 
-    s, omni = fakes
+    s = fakes
     res = app.run_export(FakeKokoro(), s, ExportRequest("Hello there.", title="My doc"),
                          tmp_path, fmt_default="wav")
     assert res.path == tmp_path / "My doc.wav"
@@ -694,9 +267,9 @@ def test_run_export_default_format_and_errors(fakes, tmp_path):
     with pytest.raises(FileExistsError):
         app.run_export(FakeKokoro(), s, ExportRequest("Hi.", Path("My doc.wav")), tmp_path,
                        fmt_default="wav")
-    omni.present = False
-    with pytest.raises(RuntimeError, match="Settings > OmniVoice"):
-        app.run_export(FakeKokoro(), s, ExportRequest("Hi.", voice="omni:alma"), tmp_path)
+    missing = dataclasses.replace(s, model=str(tmp_path / "nope.onnx"))
+    with pytest.raises(RuntimeError, match="Download the voice model"):
+        app.run_export(FakeKokoro(), missing, ExportRequest("Hi."), tmp_path)
     with pytest.raises(ValueError, match="Nothing to read"):
         app.run_export(FakeKokoro(), s, ExportRequest("  "), tmp_path)
 
@@ -705,7 +278,7 @@ def test_run_export_mp3(fakes, tmp_path):
     pytest.importorskip("lameenc")
     from vibetts.export import ExportRequest
 
-    s, _ = fakes
+    s = fakes
     res = app.run_export(FakeKokoro(), s, ExportRequest("Hello there.", fmt="mp3"), tmp_path,
                          bitrate_default=32)
     assert res.fmt == "mp3" and res.path.suffix == ".mp3" and res.bytes > 0
@@ -726,8 +299,7 @@ class FakeSpeaker:
 
 @pytest.fixture
 def eapp(fakes, tmp_path):
-    s, _ = fakes
-    a = make_app(dataclasses.replace(s, sentence_pause=0.0))
+    a = make_app(dataclasses.replace(fakes, sentence_pause=0.0))
     a.cfg.export.folder = str(tmp_path / "exports")
     a.cfg.export.format = "wav"
     a.speaker = FakeSpeaker()
@@ -820,21 +392,16 @@ def test_export_audio_pauses_for_the_speaker(eapp):
 
 @pytest.fixture
 def bridge(eapp):
-    eapp._voices = lambda: ["af_heart", "bf_emma", "omni:default", "omni:alma"]
+    eapp._voices = lambda: ["af_heart", "bf_emma"]
     return app.AgentBridge(eapp), eapp
 
 
 def test_bridge_list_voices(bridge):
     b, a = bridge
-    out = b.list_voices()
-    assert out["engine"] == "kokoro" and out["default_voice"] == "af_heart"
-    assert out["omnivoice_installed"] is True
-    assert {"id": "af_heart", "label": "Heart (American English, female)",
-            "engine": "kokoro"} in out["voices"]
-    assert [v["engine"] for v in out["voices"]][-2:] == ["omnivoice", "omnivoice"]
-    alma = out["voices"][-1]
-    assert alma == {"id": "omni:alma", "label": alma["label"], "engine": "omnivoice",
-                    "kind": "design", "description": "female, young adult", "lang": "en"}
+    assert b.list_voices() == {
+        "voices": [{"id": "af_heart", "label": "Heart (American English, female)"},
+                   {"id": "bf_emma", "label": "Emma (British English, female)"}],
+        "default_voice": "af_heart"}
 
 
 def test_bridge_speak_waits_for_the_real_speaker(bridge):
@@ -858,13 +425,13 @@ def test_bridge_speak_waits_for_the_real_speaker(bridge):
         def close(self):
             pass
 
-    a._speak_cfg, a._speak_voice = a.cfg.speech, None
+    a._speak_cfg = a.cfg.speech
     a.speaker = Speaker(a._engine_for_speaker, Out)
-    out = b.speak("Hello there.", None, 1.4, None, True, 5.0)
+    out = b.speak("Hello there.", None, 1.4, True, 5.0)
     assert out == {"started": True, "completed": True, "interrupted": False, "error": None,
-                   "voice": "af_heart", "lang": "en"}
+                   "voice": "af_heart"}
     assert a._speak_cfg.speed == 1.4 and a.cfg.speech.speed != 1.4  # a copy, config untouched
-    out = b.speak("Hello there.", "bf_emma", None, None, False, 5.0)  # fire and forget
+    out = b.speak("Hello there.", "bf_emma", None, False, 5.0)  # fire and forget
     assert out["started"] and not out["completed"] and out["voice"] == "bf_emma"
     a.speaker.stop(wait=2.0)
 
@@ -877,7 +444,7 @@ def test_bridge_speak_reports_interruption_and_error(bridge, monkeypatch):
         req = types.SimpleNamespace(done=threading.Event(), interrupted=interrupted, error=error)
         req.done.set()
         monkeypatch.setattr(a, "speak", lambda *args, req=req: req)
-        out = b.speak("Hello there.", None, None, None, True, 1.0)
+        out = b.speak("Hello there.", None, None, True, 1.0)
         assert (out["completed"], out["interrupted"], out["error"]) == (False, interrupted, error)
 
 
@@ -887,87 +454,25 @@ def test_bridge_speak_wait_times_out(bridge, monkeypatch):
     b, a = bridge
     req = types.SimpleNamespace(done=threading.Event(), interrupted=False, error=None)
     monkeypatch.setattr(a, "speak", lambda *args: req)
-    out = b.speak("Hello there.", None, None, None, True, 0.05)
+    out = b.speak("Hello there.", None, None, True, 0.05)
     assert out["started"] and not out["completed"]
 
 
-def test_bridge_speak_refusals(bridge, fakes):
+def test_bridge_speak_refusals(bridge, tmp_path):
     from vibetts.mcp_server import ToolError
 
     b, a = bridge
     a.enabled = False
     with pytest.raises(ToolError, match="turned off"):
-        b.speak("Hello.", None, None, None, False, 1.0)
+        b.speak("Hello.", None, None, False, 1.0)
     a.enabled = True
     with pytest.raises(ToolError, match="Unknown voice 'zz_nobody'.*list_voices"):
-        b.speak("Hello.", "zz_nobody", None, None, False, 1.0)
+        b.speak("Hello.", "zz_nobody", None, False, 1.0)
     with pytest.raises(ToolError, match="Nothing to read"):
-        b.speak("   ", None, None, None, False, 1.0)
-    _, omni = fakes
-    omni.present = False
-    with pytest.raises(ToolError, match="not installed"):
-        b.speak("Hello.", "omni:alma", None, None, False, 1.0)
-
-
-@pytest.fixture
-def designer(bridge, monkeypatch):
-    import types
-
-    b, a = bridge
-    st = types.SimpleNamespace(designed=[], saved=[], error=None)
-
-    def design(instruct, seed, text=None, lang=None):
-        st.designed.append((instruct, seed, text, lang))
-        if st.error:
-            raise st.error
-        return types.SimpleNamespace(meta={"instruct": instruct.strip().lower()})
-
-    def save(name, clip, overwrite=False):
-        st.saved.append((name, overwrite))
-        return "omni:" + name
-
-    monkeypatch.setattr(a, "_design_clip", design)
-    monkeypatch.setattr(a, "_save_voice", save)
-    return b, a, st
-
-
-def test_bridge_create_voice_success(designer):
-    b, a, st = designer
-    before = (a.cfg.speech.omni_voice, a.cfg.speech.croatian_voice)
-    out = b.create_voice({"name": "Nova", "description": " Female ", "seed": 7, "lang": "hr"})
-    assert out == {"voice": "omni:nova", "name": "nova", "description": "female",
-                   "seed": 7, "lang": "hr"}
-    assert st.designed == [(" Female ", 7, None, "hr")] and st.saved == [("nova", False)]
-    assert (a.cfg.speech.omni_voice, a.cfg.speech.croatian_voice) == before
-
-
-def test_bridge_create_voice_random_seed_and_defaults(designer):
-    b, a, st = designer
-    out = b.create_voice({"name": "rnd"})
-    seed = out["seed"]
-    assert isinstance(seed, int) and 0 <= seed < 2**31
-    assert st.designed == [("", seed, None, "en")] and out["lang"] == "en"
-
-
-def test_bridge_create_voice_refusals(designer, fakes):
-    from vibetts.mcp_server import ToolError
-
-    b, a, st = designer
-    with pytest.raises(ToolError, match="already exists.*overwrite=true"):
-        b.create_voice({"name": "Alma"})
-    assert st.designed == [] and st.saved == []
-    b.create_voice({"name": "alma", "overwrite": True})
-    assert st.saved == [("alma", True)]
-    with pytest.raises(ToolError, match="bad voice name"):
-        b.create_voice({"name": "default"})
-    st.error = ValueError("'robot' (unsupported)")
-    with pytest.raises(ToolError, match="robot"):
-        b.create_voice({"name": "fresh", "description": "robot"})
-    assert len(st.saved) == 1
-    _, omni = fakes
-    omni.present = False
-    with pytest.raises(ToolError, match="not installed"):
-        b.create_voice({"name": "fresh"})
+        b.speak("   ", None, None, False, 1.0)
+    a.cfg.speech.model = str(tmp_path / "nope.onnx")
+    with pytest.raises(ToolError, match="Download the voice model"):
+        b.speak("Hello.", "af_heart", None, False, 1.0)
 
 
 def test_bridge_stop(bridge):
@@ -982,7 +487,7 @@ def test_bridge_synthesize_text_and_file(bridge, tmp_path):
     b, a = bridge
     out = b.synthesize_to_file({"text": "Hello there.", "output": "talk.wav"})
     assert out["path"] == str(tmp_path / "exports" / "talk.wav")
-    assert out["format"] == "wav" and out["voice"] == "af_heart" and out["lang"] == "en"
+    assert out["format"] == "wav" and out["voice"] == "af_heart"
     assert out["chunks"] == 1 and out["bytes"] > 0 and out["duration_seconds"] >= 0
     doc = tmp_path / "My Notes.txt"
     doc.write_text("A short note. Nothing more.", encoding="utf-8")
@@ -1060,7 +565,7 @@ def test_sync_mcp_start_noop_restart_stop(mapp):
     a._sync_mcp()
     (first,) = FakeMcpServer.instances
     assert first.started and first.port == 7800 and first.kw["version"]
-    assert {t.name for t in first.tools} == {"synthesize_to_file", "speak", "list_voices", "create_voice", "delete_voice",
+    assert {t.name for t in first.tools} == {"synthesize_to_file", "speak", "list_voices",
                                            "synthesize_batch", "stop"}
     assert a.mcp_status() == {"enabled": True, "running": True,
                               "url": "http://127.0.0.1:7800/mcp", "error": ""}
@@ -1120,20 +625,6 @@ def test_quit_stops_mcp_and_cancels_export(mapp):
     assert server.stopped and cancel.is_set()
 
 
-def test_omni_uninstall_cancels_export(vapp, monkeypatch):
-    import types
-
-    a, _ = vapp
-    a._export_lock = threading.Lock()
-    a._export_cancel = threading.Event()
-    a.speaker = FakeSpeaker()
-    fake = types.ModuleType("vibetts.omnivoice_setup")
-    fake.uninstall = lambda d, keep_voices=True: None
-    monkeypatch.setattr(app.TTSApp, "_setup", staticmethod(lambda: fake))
-    a._omni_uninstall()
-    assert a._export_cancel.is_set()
-
-
 # ---------------------------------------------------------------- hooks / tray
 
 def test_settings_hooks_include_export_and_mcp(mapp, monkeypatch, tmp_path):
@@ -1186,8 +677,7 @@ def test_tray_menu_has_export_item_after_settings():
 
 @pytest.fixture
 def cli(fakes, tmp_path, monkeypatch):
-    s, _ = fakes
-    cfg = Config(speech=dataclasses.replace(s, sentence_pause=0.0))
+    cfg = Config(speech=dataclasses.replace(fakes, sentence_pause=0.0))
     monkeypatch.setattr(app, "setup_logging", lambda console=False: tmp_path / "log.txt")
     monkeypatch.setattr(app, "load_config", lambda: cfg)
     return cfg
@@ -1251,7 +741,7 @@ def test_say_never_prints_the_text(cli, tmp_path, capsys):
     assert "Confidential" not in captured.out + captured.err
 
 
-# ---------------------------------------------------------------- batch, delete_voice, headless
+# ---------------------------------------------------------------- batch, headless
 
 def test_bridge_synthesize_batch(bridge, tmp_path):
     b, a = bridge
@@ -1263,19 +753,18 @@ def test_bridge_synthesize_batch(bridge, tmp_path):
         {"text": "", "output": str(out_dir / "c.wav")},                      # empty text
         {"text": "Rel.", "output": "rel.wav"},                               # not absolute
         {"text": "Bad.", "output": str(out_dir / "d.ogg")},                  # bad extension
-        {"text": "Hi.", "output": str(out_dir / "e.wav"), "lang": "de"},    # bad lang
         {"text": "Hi.", "output": str(out_dir / "f.wav"), "voice": "zz_nobody"},
         {"text": "Hi.", "output": str(tmp_path / "nodir" / "g.wav")},        # folder missing
     ]
     out = b.synthesize_batch({"items": items})
     r = out["results"]
-    assert [x["ok"] for x in r] == [True, True, False, False, False, False, False, False]
+    assert [x["ok"] for x in r] == [True, True, False, False, False, False, False]
     assert r[0]["output"] == str(out_dir / "a.wav") and r[0]["duration_s"] >= 0
     assert (out_dir / "a.wav").exists() and (out_dir / "b.wav").exists()
     assert "non-empty" in r[2]["error"] and "absolute" in r[3]["error"]
-    assert ".wav and .mp3" in r[4]["error"] and "'lang'" in r[5]["error"]
-    assert "Unknown voice" in r[6]["error"] and "does not exist" in r[7]["error"]
-    assert out["ok_count"] == 2 and out["failed_count"] == 6
+    assert ".wav and .mp3" in r[4]["error"]
+    assert "Unknown voice" in r[5]["error"] and "does not exist" in r[6]["error"]
+    assert out["ok_count"] == 2 and out["failed_count"] == 5
     assert not a._export_lock.locked() and a._export_cancel is None
     # existing files fail unless overwrite is set
     again = b.synthesize_batch({"items": items[:1]})
@@ -1317,46 +806,18 @@ def test_export_batch_cancel_marks_rest(eapp, tmp_path):
     assert seen == [(1, 2), (2, 2)] and not eapp._export_lock.locked()
 
 
-def test_bridge_delete_voice(bridge, fakes):
-    from vibetts.mcp_server import ToolError
-
-    b, a = bridge
-    _, omni = fakes
-    deleted = []
-
-    def delete_preset(model_dir, name):
-        if name == "default":
-            raise ValueError("The 'default' voice cannot be deleted.")
-        if name == "ghost":
-            raise FileNotFoundError("No voice named 'ghost'.")
-        deleted.append(name)
-
-    omni.delete_preset = delete_preset
-    assert b.delete_voice({"name": "alma"}) == {"deleted": "omni:alma"}
-    assert b.delete_voice({"name": "omni:alma"}) == {"deleted": "omni:alma"}
-    assert deleted == ["alma", "alma"]
-    with pytest.raises(ToolError, match="cannot be deleted"):
-        b.delete_voice({"name": "default"})
-    with pytest.raises(ToolError, match="No voice named"):
-        b.delete_voice({"name": "ghost"})
-    omni.present = False
-    with pytest.raises(ToolError, match="not installed"):
-        b.delete_voice({"name": "alma"})
-
-
 def test_headless_app_serves_exports_and_refuses_speech(fakes, tmp_path):
-    s, _ = fakes
-    cfg = Config(speech=dataclasses.replace(s, sentence_pause=0.0))
+    cfg = Config(speech=dataclasses.replace(fakes, sentence_pause=0.0))
     cfg.export.folder = str(tmp_path / "exports")
     cfg.export.format = "wav"
     h = app.HeadlessApp(cfg)
-    h._voices = lambda: ["af_heart", "omni:default"]
+    h._voices = lambda: ["af_heart"]
     b = app.AgentBridge(h)
     assert b.list_voices()["voices"][0]["id"] == "af_heart"
     out = b.synthesize_batch({"items": [{"text": "Hello there.", "output": str(tmp_path / "h.wav")}]})
     assert out["ok_count"] == 1
     with pytest.raises(RuntimeError, match="headless"):
-        b.speak("Hello.", None, None, None, False, 1.0)
+        b.speak("Hello.", None, None, False, 1.0)
     assert b.stop(False) == {"stopped": True, "export_cancelled": False}
 
 

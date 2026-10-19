@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "vibetts"
 dynamic = ["version"]
-description = "Read selected text aloud on Windows with a local Kokoro voice (and Croatian with OmniVoice)"
+description = "Read selected text aloud on Windows with a local Kokoro voice"
 requires-python = ">=3.11"
 dependencies = [
     "pynput",
@@ -18,8 +18,6 @@ dependencies = [
     "tomli-w",
     "sv-ttk",
     "kokoro-onnx",
-    "tokenizers",
-    "soxr",
     "pypdf>=4",
     "lameenc>=1.7",
 ]
