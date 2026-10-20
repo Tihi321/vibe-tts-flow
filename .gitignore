@@ -2,6 +2,7 @@ config.toml
 .env
 models/
 logs/
+library/
 .venv/
 __pycache__/
 *.pyc

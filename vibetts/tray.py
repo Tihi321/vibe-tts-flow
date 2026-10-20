@@ -49,6 +49,11 @@ class TrayHooks:
     supertonic_available: Callable[[], bool] = lambda: False
     current_other_voice: Callable[[], str] = lambda: ""            # supertonic:F1
     set_other_voice: Callable[[str], None] = lambda voice: None
+    # book reader (VTF-07): the menu item shows only while the reader server runs
+    reader_running: Callable[[], bool] = lambda: False
+    open_reader: Callable[[], None] = lambda: None
+    is_paused: Callable[[], bool] = lambda: False
+    toggle_pause: Callable[[], None] = lambda: None
 
 
 def make_icon(color: str) -> Image.Image:
@@ -178,9 +183,12 @@ class Tray:
         items = [
             M("Settings…", act(h.open_settings), default=True),
             M("Export audio…", act(h.open_export)),
+            M("Open reader", act(h.open_reader), visible=lambda item: bool(h.reader_running())),
             M("Download voice model…", act(h.download_model),
               visible=lambda item: bool(h.model_missing())),
             M("Enabled", act(lambda: h.set_enabled(not h.is_enabled())), checked=chk(h.is_enabled)),
+            M(lambda item: "Resume" if h.is_paused() else "Pause", act(h.toggle_pause),
+              enabled=lambda item: bool(h.is_speaking())),
             M("Stop reading", act(h.stop), enabled=lambda item: bool(h.is_speaking())),
             pystray.Menu.SEPARATOR,
         ]

@@ -300,3 +300,125 @@ def test_write_wav_roundtrip(tmp_path):
     with wave.open(str(path)) as w:
         assert w.getnframes() == 3 and w.getframerate() == SAMPLE_RATE == 44100
         assert np.frombuffer(w.readframes(3), "<i2").tolist() == [0, 16383, -32767]
+
+
+# ---------------------------------------------------------------- on_chunk, pause, resume
+
+def wait_for(cond, timeout=3.0):
+    deadline = time.monotonic() + timeout
+    while not cond() and time.monotonic() < deadline:
+        time.sleep(0.005)
+    return cond()
+
+
+def tagged_req(texts, pause=0.5, on_chunk=None):
+    """One chunk per text (tag = index): 0.05 s of speech + `pause` s of silence, except the last."""
+    chunks = [Chunk(t, 1.0, i) for i, t in enumerate(texts)]
+    chunks[-1].pause_after = 0.0
+    return SpeakRequest(chunks, "af_heart", 1.0, pause, 1.0, "spk", None, on_chunk)
+
+
+def test_on_chunk_in_order_when_each_chunk_starts():
+    seen = []
+    events = []
+    sp = make(FakeEngine(), events)
+    r = tagged_req(["one", "two", "three"], pause=0.0,
+                   on_chunk=lambda c: seen.append(
+                       (c.text, c.tag, len(FakeOutput.instances[0].frames))))
+    sp.speak_and_wait(r, timeout=5)
+    assert [s[:2] for s in seen] == [("one", 0), ("two", 1), ("three", 2)]
+    assert [s[2] for s in seen] == [0, 1, 2]  # called before the chunk's first write
+    assert [e[0] for e in events] == ["start", "done"]
+
+
+def test_on_chunk_error_does_not_break_playback():
+    def boom(chunk):
+        raise RuntimeError("callback")
+
+    r = tagged_req(["one", "two"], pause=0.0, on_chunk=boom)
+    make(FakeEngine(), []).speak_and_wait(r, timeout=5)
+    assert r.done.is_set() and r.error is None and not r.interrupted
+
+
+def test_pause_stops_writes_and_resume_continues_without_losing_samples():
+    events = []
+    sp = make(FakeEngine(), events)
+    r = tagged_req(["one", "two"])
+    total = 2 * int(0.05 * SAMPLE_RATE) + int(0.5 * SAMPLE_RATE)  # the last chunk has no gap
+    assert not sp.paused and not sp.pause() and not sp.resume()  # nothing playing
+    sp.speak(r)
+    assert wait_for(lambda: FakeOutput.instances and FakeOutput.instances[0].frames)
+    assert sp.pause() and sp.paused and not sp.pause()
+    assert wait_for(lambda: FakeOutput.instances[0].closed)
+    first = FakeOutput.instances[0]
+    assert first.aborted and not first.drained  # the device is released
+    written = sum(len(b) for b in first.frames)
+    time.sleep(0.3)
+    assert sum(len(b) for b in first.frames) == written and len(FakeOutput.instances) == 1
+    assert not r.done.is_set()
+    assert sp.resume() and not sp.paused and not sp.resume()
+    assert r.done.wait(5) and not r.interrupted and r.error is None
+    assert len(FakeOutput.instances) == 2  # reopened for the rest
+    assert sum(len(b) for o in FakeOutput.instances for b in o.frames) == total
+    assert FakeOutput.instances[1].drained and FakeOutput.instances[1].device == "spk"
+    assert [e[0] for e in events] == ["start", "done"]  # on_start once
+
+
+def test_pause_after_the_request_ended_does_nothing():
+    sp = make(FakeEngine(), [])
+    r = tagged_req(["one"], pause=0.0)
+    sp.speak_and_wait(r, timeout=5)
+    assert sp.pause() is False and not sp.paused and len(FakeOutput.instances) == 1
+
+
+def test_on_chunk_not_repeated_after_resume():
+    seen = []
+    sp = make(FakeEngine(), [])
+    r = tagged_req(["one", "two"], on_chunk=lambda c: seen.append(c.tag))
+    sp.speak(r)
+    assert wait_for(lambda: FakeOutput.instances and FakeOutput.instances[0].frames)
+    assert sp.pause()
+    assert wait_for(lambda: FakeOutput.instances[0].closed)
+    assert sp.resume()
+    assert r.done.wait(5)
+    assert seen == [0, 1]
+
+
+def test_stop_while_paused_releases_and_ends():
+    events = []
+    sp = make(FakeEngine(), events)
+    r = tagged_req(["one", "two"])
+    sp.speak(r)
+    assert wait_for(lambda: FakeOutput.instances and FakeOutput.instances[0].frames)
+    assert sp.pause()
+    assert wait_for(lambda: FakeOutput.instances[0].closed)
+    sp.stop(wait=3)
+    assert not sp.busy and not sp.paused
+    assert r.done.is_set() and r.interrupted and r.error is None
+    assert events[-1][0] == "done" and events[-1][2] is None
+    assert len(FakeOutput.instances) == 1  # not reopened just to stop
+
+
+def test_new_speak_while_paused_plays_normally():
+    sp = make(FakeEngine(), [])
+    first = tagged_req(["a", "b"])
+    sp.speak(first)
+    assert wait_for(lambda: FakeOutput.instances and FakeOutput.instances[0].frames)
+    assert sp.pause()
+    second = tagged_req(["c"], pause=0.0)
+    sp.speak_and_wait(second, timeout=5)
+    assert first.done.is_set() and first.interrupted
+    assert second.done.is_set() and not second.interrupted and second.error is None
+    assert not sp.paused and not sp.resume()
+
+
+def test_pause_before_the_first_audio_holds_until_resume():
+    sp = make(FakeEngine(delay=0.3), [])
+    r = tagged_req(["one"], pause=0.0)
+    sp.speak(r)
+    assert sp.pause()
+    time.sleep(0.6)  # the chunk is ready by now
+    assert not FakeOutput.instances and not r.done.is_set()
+    assert sp.resume()
+    assert r.done.wait(5) and not r.interrupted
+    assert sum(len(b) for b in FakeOutput.instances[0].frames) == int(0.05 * SAMPLE_RATE)

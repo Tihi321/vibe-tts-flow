@@ -113,6 +113,9 @@ class Recorder:
         self.config = Config()
         self.mp3 = True
         self.mcp = {"enabled": False, "running": False, "url": "", "error": ""}
+        self.reader = {"enabled": False, "running": False, "url": "", "error": ""}
+        self.registered: list[str] = []
+        self.register_error: Exception | None = None
         self.doc = Document("Hello there.", True, "notes")
         self.exports, self.export_error = [], None
         self.st_dir = Path("st-models")
@@ -138,9 +141,25 @@ class Recorder:
             cancel_export=lambda: self.calls.append("cancel_export"),
             mp3_available=lambda: self.mp3,
             mcp_status=lambda: dict(self.mcp),
+            reader_status=lambda: dict(self.reader),
+            open_reader=lambda: self.calls.append("open_reader"),
+            extension_folder=lambda: Path("ext-dir"),
+            registered_exts=lambda: list(self.registered),
+            register_files=self._register_files, unregister_files=self._unregister_files,
+            open_default_apps=lambda: self.calls.append("default_apps"),
             open_folder=lambda p: self.calls.append(("open_folder", p)),
             supertonic_dir=lambda: self.st_dir, supertonic_present=lambda: self.st_present,
             supertonic_changed=self._st_changed)
+
+    def _register_files(self, exts):
+        self.calls.append(("register", list(exts)))
+        if self.register_error:
+            raise self.register_error
+        self.registered = sorted(set(self.registered) | set(exts))
+
+    def _unregister_files(self):
+        self.calls.append("unregister")
+        self.registered = []
 
     def _st_changed(self):
         self.st_changed += 1
@@ -196,10 +215,10 @@ def state(widget):
 
 
 def test_tabs(tk_root):
-    assert TABS == ("general", "voice", "export", "kokoro", "supertonic", "mcp", "about")
+    assert TABS == ("general", "voice", "export", "kokoro", "supertonic", "mcp", "reader", "about")
     win = make_window(tk_root, Recorder())
     assert [win._nb.tab(i, "text") for i in range(len(TABS))] == [
-        "General", "Voice", "Export", "Kokoro", "Supertonic", "Agents (MCP)", "About"]
+        "General", "Voice", "Export", "Kokoro", "Supertonic", "Agents (MCP)", "Reader", "About"]
 
 
 def test_voice_combo(tk_root):
@@ -751,4 +770,138 @@ def test_mcp_fields_save_and_dirty(tk_root):
     assert win._is_dirty()
     assert win.save() is True
     assert rec.config.mcp.enabled and rec.config.mcp.port == 8123
+    assert not win._is_dirty()
+
+
+# ---------------------------------------------------------------- reader tab (VTF-07)
+
+READER_ID = "injaiiefkhoimpkeandbjfbnnjddaceh"
+
+
+def test_reader_form_round_trip():
+    cfg = Config()
+    form = form_from_config(cfg)
+    assert form["reader_enabled"] is True and form["reader_port"] == "7724"
+    assert form["reader_library_folder"] == "library" and form["reader_extension_ids"] == READER_ID
+    assert config_from_form(cfg, form) == cfg
+    cfg.reader.enabled, cfg.reader.port, cfg.reader.max_chars = False, 8124, 0
+    cfg.reader.library_folder = "D:/books"
+    cfg.reader.extension_ids = [READER_ID, "a" * 32]
+    assert config_from_form(Config(), form_from_config(cfg)) == cfg
+    cfg.reader.extension_ids = []
+    assert config_from_form(Config(), form_from_config(cfg)) == cfg
+
+
+def test_reader_form_extension_ids_parsing_and_errors():
+    form = form_from_config(Config())
+    form["reader_extension_ids"] = f" {READER_ID.upper()};{'b' * 32}  {READER_ID}"
+    assert config_from_form(Config(), form).reader.extension_ids == [READER_ID, "b" * 32]
+    for key, value in (("reader_port", "80"), ("reader_port", "x"), ("reader_max_chars", "-1"),
+                       ("reader_library_folder", "  "), ("reader_extension_ids", "short")):
+        bad = form_from_config(Config())
+        bad[key] = value
+        with pytest.raises(ValueError):
+            config_from_form(Config(), bad)
+    bad = form_from_config(Config())
+    bad["reader_extension_ids"] = "nope"
+    with pytest.raises(ValueError, match="Extension id 'nope' is not valid"):
+        config_from_form(Config(), bad)
+
+
+def test_reader_tab_builds_and_only_config_keys_are_vars(tk_root):
+    win = make_window(tk_root, Recorder())
+    win.show("reader")
+    assert win._nb.index(win._nb.select()) == TABS.index("reader")
+    assert {k for k in win._vars if k.startswith("reader_")} == {
+        "reader_enabled", "reader_port", "reader_library_folder", "reader_max_chars",
+        "reader_extension_ids"}
+    assert set(win._assoc_vars) == {".epub", ".txt"} and not set(win._assoc_vars) & set(win._vars)
+    assert not win._is_dirty()
+    win._assoc_vars[".txt"].set(True)  # UI state only: does not make the form dirty
+    assert not win._is_dirty()
+
+
+@pytest.mark.parametrize("status,enabled,expected,button", [
+    ({"enabled": True, "running": True, "url": "http://127.0.0.1:7724/", "error": ""}, True,
+     "Running at http://127.0.0.1:7724/", "normal"),
+    ({"enabled": False, "running": False, "url": "", "error": ""}, False, "Off", "disabled"),
+    ({"enabled": True, "running": False, "url": "", "error": "Port 7724 is busy"}, True,
+     "Error: Port 7724 is busy", "disabled"),
+    ({"enabled": False, "running": False, "url": "", "error": ""}, True,
+     "Enabled \u2014 save to start", "disabled"),
+])
+def test_reader_status_text_and_open_button(tk_root, status, enabled, expected, button):
+    rec = Recorder()
+    rec.reader = status
+    rec.config.reader.enabled = enabled
+    win = make_window(tk_root, rec)
+    assert win._reader_status.cget("text") == expected
+    assert state(win._reader_open_btn) == button
+
+
+def test_reader_open_reader_and_folder_hooks(tk_root):
+    rec = Recorder()
+    rec.reader = {"enabled": True, "running": True, "url": "http://127.0.0.1:7724/", "error": ""}
+    win = make_window(tk_root, rec)
+    win._reader_open_btn.invoke()
+    assert rec.calls[-1] == "open_reader"
+    win._reader_open_library()
+    assert rec.calls[-1] == ("open_folder", settings_ui.resolve_path("library"))
+
+
+def test_reader_register_and_remove_fire_hooks(tk_root):
+    rec = Recorder()
+    win = make_window(tk_root, rec)
+    assert win._assoc_status.cget("text") == "Not registered"
+    assert win._assoc_vars[".epub"].get() and not win._assoc_vars[".txt"].get()
+    win._assoc_register()
+    assert rec.calls[-1] == ("register", [".epub"])
+    assert win._assoc_status.cget("text") == "Registered for .epub"
+    win._assoc_vars[".txt"].set(True)
+    win._assoc_register()
+    assert rec.calls[-1] == ("register", [".epub", ".txt"])
+    assert win._assoc_status.cget("text") == "Registered for .epub, .txt"
+    win._assoc_remove()
+    assert rec.calls[-1] == "unregister"
+    assert win._assoc_status.cget("text") == "Not registered"
+
+
+def test_reader_register_needs_a_tick_and_reports_errors(tk_root):
+    rec = Recorder()
+    win = make_window(tk_root, rec)
+    win._assoc_vars[".epub"].set(False)
+    win._assoc_register()
+    assert not any(isinstance(c, tuple) and c[0] == "register" for c in rec.calls)
+    assert "Tick" in win._assoc_status.cget("text")
+    win._assoc_vars[".epub"].set(True)
+    rec.register_error = OSError("access denied")
+    win._assoc_register()
+    assert win._assoc_status.cget("text") == "Failed: access denied"
+
+
+def test_reader_ticks_follow_the_registration_on_show(tk_root):
+    rec = Recorder()
+    rec.registered = [".txt"]
+    win = make_window(tk_root, rec)
+    assert not win._assoc_vars[".epub"].get() and win._assoc_vars[".txt"].get()
+    assert win._assoc_status.cget("text") == "Registered for .txt"
+
+
+def test_reader_default_apps_and_extension_folder_buttons(tk_root):
+    rec = Recorder()
+    win = make_window(tk_root, rec)
+    win._safe_call(lambda: win.hooks.open_default_apps())()
+    assert rec.calls[-1] == "default_apps"
+    win._safe_call(lambda: win.hooks.open_folder(win.hooks.extension_folder()))()
+    assert rec.calls[-1] == ("open_folder", Path("ext-dir"))
+
+
+def test_reader_fields_save_and_dirty(tk_root):
+    rec = Recorder()
+    win = make_window(tk_root, rec)
+    win._vars["reader_port"].set("8124")
+    win._vars["reader_extension_ids"].set("")
+    assert win._is_dirty()
+    assert win.save() is True
+    assert rec.config.reader.port == 8124 and rec.config.reader.extension_ids == []
     assert not win._is_dirty()

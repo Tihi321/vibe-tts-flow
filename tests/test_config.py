@@ -151,6 +151,47 @@ def test_export_mcp_invalid_values_fall_back():
     assert config_from_dict({"mcp": {"port": 70000}}).mcp.port == 7723
 
 
+PINNED_ID = "injaiiefkhoimpkeandbjfbnnjddaceh"
+
+
+def test_reader_defaults():
+    r = Config().reader
+    assert (r.enabled, r.port, r.library_folder, r.max_chars) == (True, 7724, "library", 500000)
+    assert r.extension_ids == [PINNED_ID]
+    assert Config().reader.extension_ids is not Config().reader.extension_ids  # not shared
+
+
+def test_reader_round_trip(tmp_path):
+    cfg = Config()
+    cfg.reader.enabled = False
+    cfg.reader.port = 8124
+    cfg.reader.library_folder = "D:/books"
+    cfg.reader.max_chars = 0
+    cfg.reader.extension_ids = [PINNED_ID, "a" * 32]
+    path = tmp_path / "config.toml"
+    save_config(cfg, path)
+    assert load_config(path) == cfg
+    cfg.reader.extension_ids = []
+    save_config(cfg, path)
+    assert load_config(path).reader.extension_ids == []
+
+
+def test_reader_invalid_values_fall_back(caplog):
+    cfg = config_from_dict({"reader": {"port": 80, "max_chars": -1}})
+    assert cfg.reader.port == 7724
+    assert cfg.reader.max_chars == 0
+    assert config_from_dict({"reader": {"port": 70000}}).reader.port == 7724
+    bad = config_from_dict({"reader": {"extension_ids": "nope"}})
+    assert bad.reader.extension_ids == [PINNED_ID]  # wrong type: default kept
+    some = config_from_dict({"reader": {"extension_ids": [PINNED_ID, "short", "B" * 32]}})
+    assert some.reader.extension_ids == [PINNED_ID, "b" * 32]  # invalid dropped, case folded
+    dupes = config_from_dict({"reader": {"extension_ids": ["b" * 32, "b" * 32]}})
+    assert dupes.reader.extension_ids == ["b" * 32]
+    mixed = config_from_dict({"reader": {"extension_ids": [PINNED_ID, 5]}})
+    assert mixed.reader.extension_ids == [PINNED_ID]  # not all strings: default kept
+    assert "not a Chrome extension id" in caplog.text
+
+
 def test_export_folder_default_and_relative(tmp_path):
     cfg = Config()
     assert export_folder(cfg) == Path.home() / "Documents" / "VibeTTS"

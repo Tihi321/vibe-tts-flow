@@ -5,7 +5,7 @@ import zipfile
 import pytest
 
 from vibetts import docload
-from vibetts.docload import DocumentError, decode_bytes, extract_text, reflow
+from vibetts.docload import DocumentError, decode_bytes, extract_book, extract_text, reflow
 
 
 # ---- text / markdown --------------------------------------------------------------------------
@@ -155,6 +155,181 @@ def test_epub_fallback_without_spine(tmp_path):
         zf.writestr("z.xhtml", xhtml("<p>Zed</p>"))
         zf.writestr("b.html", xhtml("<p>Bee</p>"))
     assert extract_text(p).text == "Bee\n\nZed"
+
+
+CONTAINER = ('<?xml version="1.0"?><container xmlns="urn:oasis:names:tc:opendocument:xmlns:container">'
+             '<rootfiles><rootfile full-path="OEBPS/content.opf"/></rootfiles></container>')
+NAV = ('<?xml version="1.0"?><html xmlns="http://www.w3.org/1999/xhtml" '
+       'xmlns:epub="http://www.idpf.org/2007/ops"><body>'
+       '<nav epub:type="landmarks"><ol><li><a href="c1.xhtml">Landmark</a></li></ol></nav>'
+       '<nav epub:type="toc"><ol>'
+       '<li><a href="c1.xhtml">One</a></li><li><a href="c2.xhtml#sec">Two</a></li>'
+       '<li><a href="c2.xhtml#other">Two again</a></li></ol></nav></body></html>')
+NCX = ('<?xml version="1.0"?><ncx xmlns="http://www.daisy.org/z3986/2005/ncx/"><navMap>'
+       '<navPoint id="n1"><navLabel><text>One</text></navLabel><content src="c1.xhtml"/></navPoint>'
+       '<navPoint id="n2"><navLabel><text>Two</text></navLabel><content src="c2.xhtml#x"/></navPoint>'
+       '</navMap></ncx>')
+XH = "application/xhtml+xml"
+NCX_TYPE = "application/x-dtbncx+xml"
+
+
+def make_epub(path, files, manifest, spine, spine_attrs="", meta=""):
+    items = "".join(f'<item id="{i}" href="{h}" media-type="{m}" {a}/>' for i, h, m, a in manifest)
+    refs = "".join(f'<itemref idref="{i}"/>' for i in spine)
+    opf = ('<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf">'
+           f'<metadata xmlns:dc="http://purl.org/dc/elements/1.1/">{meta}</metadata>'
+           f'<manifest>{items}</manifest><spine {spine_attrs}>{refs}</spine></package>')
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("META-INF/container.xml", CONTAINER)
+        zf.writestr("OEBPS/content.opf", opf)
+        for name, body in files.items():
+            zf.writestr("OEBPS/" + name, body)
+    return path
+
+
+CHAPTER_FILES = {"c1.xhtml": xhtml("<h1>Heading one</h1><p>Alpha</p>"),
+                 "c2.xhtml": xhtml("<h2>Heading two</h2><p>Bravo</p>"),
+                 "c3.xhtml": xhtml("<p>Charlie</p>")}
+CHAPTER_ITEMS = [("c1", "c1.xhtml", XH, ""), ("c2", "c2.xhtml", XH, ""), ("c3", "c3.xhtml", XH, "")]
+
+
+def test_epub_book_nav_toc_title_author_and_merge(tmp_path):
+    meta = "<dc:title>The Book</dc:title><dc:creator>Ann Author</dc:creator><dc:creator>Other</dc:creator>"
+    p = make_epub(tmp_path / "b.epub", {**CHAPTER_FILES, "nav.xhtml": NAV},
+                  CHAPTER_ITEMS + [("nav", "nav.xhtml", XH, 'properties="nav"')],
+                  ["c1", "c2", "c3"], meta=meta)
+    book = extract_book(p)
+    assert (book.title, book.author) == ("The Book", "Ann Author")
+    # c3 has no TOC entry: merged into "Two"; the first title for c2 wins
+    assert [c.title for c in book.chapters] == ["One", "Two"]
+    assert book.chapters[0].text == "Heading one\n\nAlpha"
+    assert book.chapters[1].text == "Heading two\n\nBravo\n\nCharlie"
+
+
+def test_epub_book_ncx_toc(tmp_path):
+    p = make_epub(tmp_path / "b.epub", {**CHAPTER_FILES, "toc.ncx": NCX},
+                  CHAPTER_ITEMS + [("ncx", "toc.ncx", NCX_TYPE, "")],
+                  ["c1", "c2", "c3"], spine_attrs='toc="ncx"')
+    book = extract_book(p)
+    assert (book.title, book.author) == ("b", "")
+    assert [c.title for c in book.chapters] == ["One", "Two"]
+    assert "Charlie" in book.chapters[1].text
+
+
+def test_epub_book_ncx_found_by_media_type(tmp_path):
+    p = make_epub(tmp_path / "b.epub", {**CHAPTER_FILES, "toc.ncx": NCX},
+                  CHAPTER_ITEMS + [("ncx", "toc.ncx", NCX_TYPE, "")], ["c1", "c2", "c3"])
+    assert [c.title for c in extract_book(p).chapters] == ["One", "Two"]
+
+
+def test_epub_book_front_matter(tmp_path):
+    files = {**CHAPTER_FILES, "cover.xhtml": xhtml("<p>Dedication</p>"), "toc.ncx": NCX}
+    p = make_epub(tmp_path / "b.epub", files,
+                  [("cv", "cover.xhtml", XH, "")] + CHAPTER_ITEMS + [("ncx", "toc.ncx", NCX_TYPE, "")],
+                  ["cv", "c1", "c2", "c3"], spine_attrs='toc="ncx"')
+    book = extract_book(p)
+    assert [c.title for c in book.chapters] == ["Front matter", "One", "Two"]
+    assert book.chapters[0].text == "Dedication"
+
+
+def test_epub_book_without_toc_uses_headings(tmp_path):
+    files = {**CHAPTER_FILES, "c4.xhtml": xhtml("<p>   </p>")}
+    p = make_epub(tmp_path / "b.epub", files, CHAPTER_ITEMS + [("c4", "c4.xhtml", XH, "")],
+                  ["c1", "c2", "c3", "c4"])
+    book = extract_book(p)
+    # the empty spine item is dropped; the untitled one is "Section N" by its chapter number
+    assert [c.title for c in book.chapters] == ["Heading one", "Heading two", "Section 3"]
+
+
+def test_epub_book_drops_empty_toc_chapter(tmp_path):
+    files = {"c1.xhtml": xhtml("<p></p>"), "c2.xhtml": xhtml("<p>Bravo</p>"), "toc.ncx": NCX}
+    p = make_epub(tmp_path / "b.epub", files,
+                  CHAPTER_ITEMS[:2] + [("ncx", "toc.ncx", NCX_TYPE, "")], ["c1", "c2"])
+    assert [c.title for c in extract_book(p).chapters] == ["Two"]
+
+
+def test_epub_book_fallback_without_opf(tmp_path):
+    p = tmp_path / "f.epub"
+    with zipfile.ZipFile(p, "w") as zf:
+        zf.writestr("z.xhtml", xhtml("<p>Zed</p>"))
+        zf.writestr("b.html", xhtml("<h1>Bee</h1><p>Buzz</p>"))
+    book = extract_book(p)
+    assert book.title == "f"
+    assert [(c.title, c.text) for c in book.chapters] == [("Bee", "Bee\n\nBuzz"), ("Section 2", "Zed")]
+
+
+def test_epub_book_no_text(tmp_path):
+    p = make_epub(tmp_path / "b.epub", {"c1.xhtml": xhtml("<p></p>")}, CHAPTER_ITEMS[:1], ["c1"])
+    with pytest.raises(DocumentError):
+        extract_book(p)
+
+
+def test_extract_text_still_joins_epub(tmp_path):
+    p = make_epub(tmp_path / "b.epub", CHAPTER_FILES, CHAPTER_ITEMS, ["c1", "c2", "c3"])
+    assert extract_text(p).text == "Heading one\n\nAlpha\n\nHeading two\n\nBravo\n\nCharlie"
+
+
+# ---- txt books --------------------------------------------------------------------------------
+
+def test_txt_book_headings(tmp_path):
+    intro = "A long enough introduction. " * 10
+    p = tmp_path / "novel.txt"
+    p.write_text(f"{intro}\n\nChapter 1\n\nFirst body.\n\nMore first.\n\n"
+                 "II.\n\nSecond body.\n\nEPILOGUE\n\nThe end.", encoding="utf-8")
+    book = extract_book(p)
+    assert (book.title, book.author) == ("novel", "")
+    assert [c.title for c in book.chapters] == ["Opening", "Chapter 1", "II.", "EPILOGUE"]
+    assert book.chapters[1].text == "First body.\n\nMore first."
+    assert book.chapters[3].text == "The end."
+
+
+def test_txt_book_short_preamble_is_not_a_chapter(tmp_path):
+    p = tmp_path / "n.txt"
+    p.write_text("My Title\n\nChapter 1\n\nOne.\n\nChapter 2\n\nTwo.", encoding="utf-8")
+    assert [c.title for c in extract_book(p).chapters] == ["Chapter 1", "Chapter 2"]
+
+
+def test_txt_book_single_chapter_when_short(tmp_path):
+    p = tmp_path / "short.txt"
+    p.write_text("Chapter 1\n\nJust one heading.\n\nText.", encoding="utf-8")
+    book = extract_book(p)
+    assert [c.title for c in book.chapters] == ["short"]
+    assert book.chapters[0].text == "Chapter 1\n\nJust one heading.\n\nText."
+
+
+def test_txt_book_part_fallback(tmp_path):
+    p = tmp_path / "long.txt"
+    para = "Words go here and there. " * 40   # 1000 chars
+    p.write_text("\n\n".join([para.strip()] * 45), encoding="utf-8")
+    book = extract_book(p)
+    assert [c.title for c in book.chapters] == ["Part 1", "Part 2", "Part 3"]
+    assert all(len(c.text) < 21000 for c in book.chapters)
+    assert sum(c.text.count("\n\n") + 1 for c in book.chapters) == 45
+
+
+def test_other_types_are_one_chapter(tmp_path):
+    p = tmp_path / "page.html"
+    p.write_text("<p>One</p><p>Two</p>", encoding="utf-8")
+    book = extract_book(p)
+    assert (book.title, book.author) == ("page", "")
+    assert [(c.title, c.text) for c in book.chapters] == [("page", "One\n\nTwo")]
+
+
+def test_extract_book_errors(tmp_path):
+    with pytest.raises(DocumentError):
+        extract_book(tmp_path / "missing.txt")
+    bad = tmp_path / "x.xyz"
+    bad.write_text("a")
+    with pytest.raises(DocumentError):
+        extract_book(bad)
+    empty = tmp_path / "e.txt"
+    empty.write_text("   ")
+    with pytest.raises(DocumentError):
+        extract_book(empty)
+    notzip = tmp_path / "n.epub"
+    notzip.write_bytes(b"nope")
+    with pytest.raises(DocumentError):
+        extract_book(notzip)
 
 
 # ---- pdf --------------------------------------------------------------------------------------

@@ -1,0 +1,70 @@
+:root {
+  color-scheme: light dark;
+  --bg: #ffffff;
+  --fg: #1d1d1f;
+  --muted: #6b6b73;
+  --border: #d4d4dc;
+  --accent: #7c5cf0;
+  --accent-fg: #ffffff;
+  --btn: #f1f1f5;
+  --err: #c0392b;
+  --ok: #2e9e5b;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1f1f24;
+    --fg: #ececf1;
+    --muted: #a0a0ab;
+    --border: #3a3a44;
+    --accent: #a78bfa;
+    --accent-fg: #1a1230;
+    --btn: #2c2c34;
+    --err: #ff7a6b;
+    --ok: #55d08a;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  width: 320px;
+  margin: 0;
+  padding: 12px 14px 14px;
+  background: var(--bg);
+  color: var(--fg);
+  font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+header { display: flex; align-items: center; justify-content: space-between; }
+h1 { margin: 0; font-size: 15px; }
+.dot { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); }
+.dot.on { background: var(--ok); }
+.dot.off { background: var(--err); }
+.conn, .state { margin: 6px 0 0; color: var(--muted); }
+.state { min-height: 1.4em; color: var(--fg); }
+.error { margin: 6px 0 0; color: var(--err); }
+.row { display: flex; gap: 8px; margin-top: 10px; }
+.row button { flex: 1; }
+button {
+  padding: 7px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--btn);
+  color: var(--fg);
+  font: inherit;
+  cursor: pointer;
+}
+button:hover:not(:disabled) { border-color: var(--accent); }
+button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+#read-page { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+button:disabled, select:disabled, input:disabled { opacity: 0.5; cursor: not-allowed; }
+.transport button { font-size: 16px; }
+.settings { margin-top: 12px; display: grid; gap: 8px; }
+label { display: grid; gap: 3px; color: var(--muted); }
+select, input[type="number"] {
+  width: 100%;
+  padding: 5px 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg);
+  font: inherit;
+}
+input[type="range"] { width: 100%; accent-color: var(--accent); }

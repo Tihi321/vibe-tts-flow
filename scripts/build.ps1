@@ -1,6 +1,7 @@
 <#
 .SYNOPSIS
-  Builds the portable VibeTTS app (PyInstaller one-folder) and two zips:
+  Builds the portable VibeTTS app (PyInstaller one-folder) and three zips:
+    dist\VibeTTS-chrome-extension-<version>.zip   the Chrome extension (load unpacked)
     dist\VibeTTS-<version>-win64.zip             app only; the model is downloaded from Settings
     dist\VibeTTS-<version>-win64-with-model.zip  app + int8 model + voices, works offline
 .EXAMPLE
@@ -73,6 +74,8 @@ Invoke-Native "PyInstaller" {
 
 # --- 5. extras ---------------------------------------------------------------
 Copy-Item -Path (Join-Path $root 'README.md') -Destination $appDir -Force
+# the Chrome extension, to load unpacked from chrome://extensions (Settings > Reader opens it)
+Copy-Item -Path (Join-Path $root 'extension') -Destination (Join-Path $appDir 'extension') -Recurse -Force
 $modelsDir = Join-Path $appDir 'models'
 New-Item -ItemType Directory -Force -Path $modelsDir | Out-Null
 
@@ -80,9 +83,15 @@ $versionLine = Select-String -Path (Join-Path $root 'vibetts\__init__.py') -Patt
 if (-not $versionLine) { throw "Could not read __version__ from vibetts/__init__.py" }
 $version = $versionLine.Matches[0].Groups[1].Value
 
+# --- 5b. Chrome extension zip (the contents of extension\ at the zip root) ---------------
+$extZip = Join-Path $dist "VibeTTS-chrome-extension-$version.zip"
+if (Test-Path $extZip) { Remove-Item -Force $extZip }
+Write-Host "== Creating $extZip" -ForegroundColor Cyan
+Compress-Archive -Path (Join-Path $root 'extension\*') -DestinationPath $extZip -CompressionLevel Optimal
+
 # --- 6. app-only zip ---------------------------------------------------------
-$zips = @(Join-Path $dist "VibeTTS-$version-win64.zip")
-New-Zip $appDir $zips[0]
+$zips = @($extZip, (Join-Path $dist "VibeTTS-$version-win64.zip"))
+New-Zip $appDir $zips[1]
 
 # --- 7. model (cached) + with-model zip --------------------------------------
 if (-not $NoModel) {
@@ -92,7 +101,7 @@ if (-not $NoModel) {
     Copy-Item -Path (Join-Path $cache 'kokoro-v1.0.int8.onnx') -Destination $modelsDir -Force
     Copy-Item -Path (Join-Path $cache 'voices-v1.0.bin') -Destination $modelsDir -Force
     $zips += Join-Path $dist "VibeTTS-$version-win64-with-model.zip"
-    New-Zip $appDir $zips[1]
+    New-Zip $appDir $zips[2]
 }
 
 Write-Host ""

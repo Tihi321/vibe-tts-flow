@@ -163,7 +163,8 @@ def write_wav(path: Path, samples: np.ndarray) -> None:
 
 class SpeakRequest:
     def __init__(self, chunks: list[Chunk], voice: str, speed: float, pause: float,
-                 volume: float = 1.0, device: str = "", lang: str | None = None):
+                 volume: float = 1.0, device: str = "", lang: str | None = None,
+                 on_chunk: Callable[[Chunk], None] | None = None):
         self.chunks = chunks
         self.voice = voice
         self.lang = lang  # Supertonic language code (None = English); Kokoro ignores it
@@ -171,6 +172,7 @@ class SpeakRequest:
         self.pause = pause
         self.volume = volume
         self.device = device
+        self.on_chunk = on_chunk  # called (player thread) when a chunk's audio starts playing
         self.done = threading.Event()  # set once playback has ended (any way)
         self.error: str | None = None  # why it failed (valid once done is set)
         self.interrupted = False  # stopped / replaced before every chunk was played
@@ -184,6 +186,7 @@ class Speaker:
 
     Callbacks run on worker threads: on_start(req) when the first audio plays,
     on_done(req, error) when playback ends (error is None after a normal end or a stop).
+    pause() holds playback and releases the audio device; resume() reopens it and goes on.
     """
 
     def __init__(self, engine: Callable[[], Engine],
@@ -196,6 +199,9 @@ class Speaker:
         self.on_done = on_done
         self._lock = threading.Lock()
         self._stop: threading.Event | None = None
+        self._gate = threading.Event()  # set while playback may run; cleared while paused
+        self._gate.set()
+        self._paused = False
         self._threads: list[threading.Thread] = []
 
     @property
@@ -203,9 +209,34 @@ class Speaker:
         with self._lock:
             return any(t.is_alive() for t in self._threads)
 
+    @property
+    def paused(self) -> bool:
+        with self._lock:
+            return self._paused
+
+    def pause(self) -> bool:
+        """Hold the playing request (the output is closed once the player notices, within
+        about 100 ms). False if nothing is playing or it is paused already."""
+        with self._lock:
+            if self._paused or not any(t.is_alive() for t in self._threads):
+                return False
+            self._paused = True
+            self._gate.clear()
+            return True
+
+    def resume(self) -> bool:
+        with self._lock:
+            if not self._paused:
+                return False
+            self._paused = False
+            self._gate.set()
+            return True
+
     def stop(self, wait: float = 0.0) -> None:
         with self._lock:
             stop, threads = self._stop, list(self._threads)
+            self._paused = False
+            self._gate.set()  # a paused player wakes up and sees the stop
         if stop is not None:
             stop.set()
         if wait:
@@ -216,13 +247,17 @@ class Speaker:
     def speak(self, req: SpeakRequest) -> None:
         self.stop(wait=2.0)
         stop = threading.Event()
+        gate = threading.Event()  # per request: an old player must not see the new gate
+        gate.set()
         audio: queue.Queue = queue.Queue(maxsize=2)  # one playing, one ready
         producer = threading.Thread(target=self._produce, args=(req, audio, stop),
                                     name="vibetts-synth", daemon=True)
-        player = threading.Thread(target=self._play, args=(req, audio, stop),
+        player = threading.Thread(target=self._play, args=(req, audio, stop, gate),
                                   name="vibetts-play", daemon=True)
         with self._lock:
             self._stop = stop
+            self._gate = gate
+            self._paused = False
             self._threads = [producer, player]
         producer.start()
         player.start()
@@ -258,7 +293,7 @@ class Speaker:
                 gap = int(req.pause * chunk.pause_after * SAMPLE_RATE)
                 if gap > 0:
                     samples = np.concatenate([samples, np.zeros(gap, dtype=np.float32)])
-                if not self._put(q, samples, stop):
+                if not self._put(q, (chunk, samples), stop):
                     return
         except Exception as e:  # noqa: BLE001
             log.exception("speech synthesis failed")
@@ -266,11 +301,30 @@ class Speaker:
             return
         self._put(q, _END, stop)
 
-    def _play(self, req: SpeakRequest, q: queue.Queue, stop: threading.Event) -> None:
+    def _play(self, req: SpeakRequest, q: queue.Queue, stop: threading.Event,
+              gate: threading.Event) -> None:
         out: Output | None = None
+        started = False
         error: str | None = None
+
+        def hold() -> None:
+            """While paused: release the device, wait for resume() or stop."""
+            nonlocal out
+            if gate.is_set():
+                return
+            if out is not None:
+                try:
+                    out.abort()
+                    out.close()
+                except Exception:
+                    log.debug("closing audio output failed", exc_info=True)
+                out = None
+            while not gate.is_set() and not stop.is_set():
+                gate.wait(0.1)
+
         try:
             while not stop.is_set():
+                hold()
                 try:
                     item = q.get(timeout=0.1)
                 except queue.Empty:
@@ -280,14 +334,25 @@ class Speaker:
                 if isinstance(item, Exception):
                     error = str(item) or item.__class__.__name__
                     break
-                if out is None:
+                chunk, samples = item
+                if out is None and not stop.is_set():
                     out = self._output(req.device)
+                if not started:
+                    started = True
                     self._safe(lambda: self.on_start(req))
-                samples = item * float(req.volume) if req.volume != 1.0 else item
-                for i in range(0, len(samples), BLOCK_FRAMES):
+                if req.on_chunk is not None:
+                    self._safe(lambda: req.on_chunk(chunk))
+                if req.volume != 1.0:
+                    samples = samples * float(req.volume)
+                i = 0
+                while i < len(samples):
+                    hold()
                     if stop.is_set():
                         break
+                    if out is None:
+                        out = self._output(req.device)
                     out.write(samples[i:i + BLOCK_FRAMES])
+                    i += BLOCK_FRAMES
         except Exception as e:  # noqa: BLE001
             log.exception("audio playback failed")
             error = str(e) or e.__class__.__name__

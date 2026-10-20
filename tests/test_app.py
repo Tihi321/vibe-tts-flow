@@ -1,4 +1,5 @@
 import dataclasses
+import re
 import threading
 import time
 import types
@@ -200,6 +201,8 @@ def make_app(s):
     a._export_lock = threading.Lock()
     a._export_cancel = None
     a._mcp, a._mcp_key, a._mcp_error = None, None, None
+    a._reader, a._reader_bridge, a._reader_key, a._reader_error = None, None, None, None
+    a.cfg.reader.enabled = False  # tests that need the reader turn it on (with a fake server)
     a.enabled = True
     a.flashes = []
     a._flash = lambda kind, text, seconds=1.5: a.flashes.append((kind, text))
@@ -1398,3 +1401,465 @@ def test_say_supertonic_only_missing_message(fakes, tmp_path, capsys):
     cfg.speech.model = str(tmp_path / "nope.onnx")  # even Kokoro is gone: the fallback fails too
     assert app.say(cfg, EN_LONG, str(tmp_path / "x.wav")) == 1
     assert "model files missing" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------- speak speed / on_chunk, pause
+
+def test_speak_speed_and_on_chunk(fakes):
+    from vibetts.textprep import Chunk
+
+    s = dataclasses.replace(fakes, speed=1.3)
+    a = make_app(s)
+    reqs = []
+    a.speaker = type("Sp", (), {"speak": lambda self, req: reqs.append(req)})()
+    seen = []
+    a.speak([Chunk("Hi", 0.0)], s)
+    a.speak([Chunk("Hi", 0.0)], s, speed=0.8, on_chunk=seen.append)
+    assert [r.speed for r in reqs] == [1.3, 0.8]
+    assert reqs[0].on_chunk is None
+    reqs[1].on_chunk("chunk")
+    assert seen == ["chunk"]
+
+
+class FakePausable:
+    def __init__(self, can=True):
+        self.can = can
+        self.paused = False
+        self.busy = True
+
+    def pause(self):
+        if not self.can or self.paused:
+            return False
+        self.paused = True
+        return True
+
+    def resume(self):
+        if not self.paused:
+            return False
+        self.paused = False
+        return True
+
+
+class FakeReading:
+    def __init__(self):
+        self.calls = []
+
+    def notify_paused(self, paused):
+        self.calls.append(paused)
+
+
+class RecordingOverlay(FakeOverlay):
+    def __init__(self):
+        self.shown = []
+
+    def show(self, kind, text, ticking=False):
+        self.shown.append((kind, text))
+
+
+def test_app_pause_resume_toggle(fakes):
+    a = make_app(fakes)
+    a.speaker, a.reading, a.overlay = FakePausable(), FakeReading(), RecordingOverlay()
+    assert a.pause() is True and a.speaker.paused
+    assert a.overlay.shown[-1] == ("speaking", "Paused · Esc to stop") and a.reading.calls == [True]
+    assert a.pause() is False and a.reading.calls == [True]  # already paused
+    assert a.resume() is True and not a.speaker.paused
+    assert a.overlay.shown[-1][1].startswith("Reading") and a.reading.calls == [True, False]
+    assert a.resume() is False and a.reading.calls == [True, False]
+    a.toggle_pause()
+    assert a.speaker.paused and a.reading.calls[-1] is True
+    a.toggle_pause()
+    assert not a.speaker.paused and a.reading.calls[-1] is False
+
+
+def test_app_pause_when_nothing_is_playing(fakes):
+    a = make_app(fakes)
+    a.speaker, a.reading, a.overlay = FakePausable(can=False), FakeReading(), RecordingOverlay()
+    assert a.pause() is False
+    a.toggle_pause()
+    assert a.reading.calls == [] and a.overlay.shown == []
+
+
+# ---------------------------------------------------------------- reader lifecycle (VTF-07)
+
+class FakeReaderServer:
+    instances: list = []
+    fail: Exception | None = None
+
+    def __init__(self, api, port, extension_ids=(), max_chars=500_000, web_root=None):
+        self.api, self.port, self.extension_ids, self.max_chars = api, port, extension_ids, max_chars
+        self.started = self.stopped = False
+        FakeReaderServer.instances.append(self)
+
+    @property
+    def url(self):
+        return f"http://127.0.0.1:{self.port}/"
+
+    def start(self):
+        if FakeReaderServer.fail:
+            raise FakeReaderServer.fail
+        self.started = True
+
+    def stop(self):
+        self.stopped = True
+
+
+@pytest.fixture
+def rapp(eapp, monkeypatch):
+    FakeReaderServer.instances, FakeReaderServer.fail = [], None
+    monkeypatch.setattr("vibetts.reader_server.ReaderServer", FakeReaderServer)
+    eapp.cfg.reader.enabled = True
+    eapp.cfg.reader.library_folder = str(Path(eapp.cfg.export.folder).parent / "books")
+    return eapp
+
+
+def test_sync_reader_start_noop_restart_stop(rapp):
+    a = rapp
+    a.cfg.reader.enabled = False
+    a._sync_reader()
+    assert FakeReaderServer.instances == [] and a.reader_status()["running"] is False
+    a.cfg.reader.enabled, a.cfg.reader.port = True, 7800
+    a._sync_reader()
+    (first,) = FakeReaderServer.instances
+    assert first.started and first.port == 7800 and first.max_chars == 500000
+    assert first.extension_ids == ("injaiiefkhoimpkeandbjfbnnjddaceh",)
+    assert isinstance(first.api, app.ReaderBridge) and first.api.version
+    assert a.reader_status() == {"enabled": True, "running": True,
+                                 "url": "http://127.0.0.1:7800/", "error": ""}
+    a._sync_reader()  # unchanged: nothing happens
+    assert len(FakeReaderServer.instances) == 1 and not first.stopped
+    a.cfg.reader.port = 7801
+    a._sync_reader()
+    assert first.stopped and FakeReaderServer.instances[1].started
+    a.cfg.reader.extension_ids = ["a" * 32]
+    a._sync_reader()
+    assert FakeReaderServer.instances[2].extension_ids == ("a" * 32,)
+    a.cfg.reader.max_chars = 10
+    a._sync_reader()
+    assert len(FakeReaderServer.instances) == 4 and FakeReaderServer.instances[3].max_chars == 10
+    a.cfg.reader.library_folder = "elsewhere"
+    a._sync_reader()
+    assert len(FakeReaderServer.instances) == 5
+    a.cfg.reader.enabled = False
+    a._sync_reader()
+    assert FakeReaderServer.instances[4].stopped
+    assert a.reader_status()["running"] is False and a.reader_status()["error"] == ""
+
+
+def test_sync_reader_port_busy(rapp):
+    a = rapp
+    FakeReaderServer.fail = OSError("address in use")
+    a._sync_reader()
+    st = a.reader_status()
+    assert st["running"] is False and "7724 is busy" in st["error"]
+    assert a.flashes and a.flashes[-1][0] == "error"
+    FakeReaderServer.fail = None
+    a._sync_reader()  # retried on the next apply: the error clears
+    assert a.reader_status()["running"] is True and a.reader_status()["error"] == ""
+    a.cfg.reader.enabled = False
+    a._sync_reader()
+    assert a.reader_status()["error"] == ""
+
+
+def test_apply_config_syncs_reader(rapp):
+    a = rapp
+    a.cfg.reader.enabled = False
+    a.listener = type("L", (), {"set_bindings": lambda self, b: None})()
+    new = Config(speech=dataclasses.replace(a.cfg.speech, model="nope.onnx"))
+    a.apply_config(new)
+    assert len(FakeReaderServer.instances) == 1 and FakeReaderServer.instances[0].started
+
+
+def test_quit_stops_reader(rapp):
+    a = rapp
+    a._sync_reader()
+    server = FakeReaderServer.instances[0]
+    a._quit_lock, a._quit_done, a._instance = threading.Lock(), False, None
+    noop = type("N", (), {"stop": lambda self, *x: None, "quit": lambda self: None})()
+    a.speaker, a.listener, a.tray, a.overlay = noop, noop, noop, noop
+    a.quit()
+    assert server.stopped and a.reader_status()["running"] is False
+
+
+def test_open_reader_opens_the_browser_or_explains(rapp, monkeypatch):
+    opened = []
+    monkeypatch.setattr(app.webbrowser, "open", lambda url: opened.append(url))
+    with pytest.raises(RuntimeError, match="turned off"):
+        rapp.open_reader()
+    rapp._sync_reader()
+    rapp.open_reader()
+    assert opened == ["http://127.0.0.1:7724/"]
+
+
+def test_reader_bridge_library_follows_the_folder(rapp, tmp_path):
+    b = app.ReaderBridge(rapp)
+    rapp.cfg.reader.library_folder = str(tmp_path / "one")
+    first = b.library
+    assert b.library is first and first.folder == tmp_path / "one"
+    rapp.cfg.reader.library_folder = str(tmp_path / "two")
+    assert b.library is not first and b.library.folder == tmp_path / "two"
+
+
+def test_reader_bridge_list_voices_and_session(rapp):
+    rapp._voices = lambda: ["af_heart"]
+    rapp.reading = object()
+    b = app.ReaderBridge(rapp)
+    assert b.session is rapp.reading
+    assert [v["id"] for v in b.list_voices()["voices"]] == ["af_heart"]
+
+
+def test_reader_bridge_open_book_returns_url_and_opens_browser(rapp, tmp_path, monkeypatch):
+    opened = []
+    monkeypatch.setattr(app.webbrowser, "open", lambda url: opened.append(url))
+    book = tmp_path / "story.txt"
+    book.write_text("Chapter 1\n\nOnce upon a time there was a book.\n", encoding="utf-8")
+    rapp._sync_reader()
+    out = rapp._reader_bridge.open_book(str(book))
+    assert re.fullmatch(r"[0-9a-f]{16}", out["id"]) and out["title"]
+    assert out["url"] == f"http://127.0.0.1:7724/#/book/{out['id']}"
+    assert opened == [out["url"]]
+    assert rapp._reader_bridge.library.list()[0]["id"] == out["id"]
+
+
+def test_reader_bridge_open_book_errors(rapp, tmp_path, monkeypatch):
+    from vibetts.library import LibraryError
+
+    monkeypatch.setattr(app.webbrowser, "open", lambda url: pytest.fail("no browser"))
+    b = app.ReaderBridge(rapp)
+    with pytest.raises(RuntimeError, match="not running"):
+        b.open_book(str(tmp_path / "x.txt"))
+    rapp._sync_reader()
+    with pytest.raises(LibraryError):
+        rapp._reader_bridge.open_book(str(tmp_path / "missing.epub"))
+
+
+class FakeNotifyTray:
+    def __init__(self):
+        self.notes = []
+
+    def update_menu(self):
+        pass
+
+    def notify(self, title, message):
+        self.notes.append((title, message))
+
+
+def test_open_book_on_start_ok_and_errors(rapp, tmp_path, monkeypatch):
+    monkeypatch.setattr(app.webbrowser, "open", lambda url: None)
+    a = rapp
+    a.tray = FakeNotifyTray()
+    book = tmp_path / "story.txt"
+    book.write_text("Hello there, this is a short book.\n", encoding="utf-8")
+    a._open_book(str(book))  # reader not running yet
+    assert a.flashes[-1][0] == "error" and "turned off" in a.tray.notes[-1][1]
+    a.flashes.clear()
+    a._sync_reader()
+    a._open_book(str(book))
+    assert a.flashes == [] and len(a.tray.notes) == 1
+    a._open_book(str(tmp_path / "missing.epub"))
+    assert a.flashes[-1][0] == "error" and "missing.epub" in a.tray.notes[-1][1]
+
+
+def test_settings_hooks_include_reader(rapp, monkeypatch):
+    a = rapp
+    a._autostart = type("A", (), {"is_enabled": staticmethod(lambda: False)})
+    monkeypatch.setattr("vibetts.settings_ui.SettingsWindow", FakeSettingsWindow)
+    hooks = a._settings_window().hooks
+    assert hooks.reader_status == a.reader_status and hooks.open_reader == a.open_reader
+    assert hooks.extension_folder() == app.ROOT / "extension"
+    calls = []
+    monkeypatch.setattr("vibetts.fileassoc.register", lambda exts: calls.append(("register", exts)))
+    monkeypatch.setattr("vibetts.fileassoc.unregister", lambda: calls.append("unregister"))
+    monkeypatch.setattr("vibetts.fileassoc.registered_exts", lambda: [".epub"])
+    monkeypatch.setattr("vibetts.fileassoc.open_default_apps", lambda: calls.append("defaults"))
+    hooks.register_files([".epub", ".txt"])
+    hooks.unregister_files()
+    hooks.open_default_apps()
+    assert hooks.registered_exts() == [".epub"]
+    assert calls == [("register", [".epub", ".txt"]), "unregister", "defaults"]
+
+
+def test_tray_menu_has_reader_and_pause_items():
+    tray, calls = make_tray()
+    names = [getattr(i, "text", "") for i in tray._menu_items()]
+    assert "Open reader" in names and "Pause" in names
+    assert names.index("Open reader") == names.index("Export audio…") + 1
+
+
+def test_tray_reader_item_visibility_and_pause_label():
+    from vibetts.tray import Tray, TrayHooks
+
+    state = {"running": False, "paused": False, "speaking": False}
+    calls = []
+    noop = lambda *a: None  # noqa: E731
+    hooks = TrayHooks(
+        is_enabled=lambda: True, set_enabled=noop, is_speaking=lambda: state["speaking"],
+        stop=noop, model_missing=lambda: False, download_model=noop, voices=lambda: [],
+        current_voice=lambda: "af_heart", set_voice=noop, current_speed=lambda: 1.0,
+        set_speed=noop, is_autostart=lambda: False, set_autostart=noop, open_settings=noop,
+        open_config=noop, open_logs=noop, reload_config=noop, quit=noop,
+        reader_running=lambda: state["running"], open_reader=lambda: calls.append("reader"),
+        is_paused=lambda: state["paused"], toggle_pause=lambda: calls.append("pause"))
+    tray = Tray(hooks)
+    items = {getattr(i, "text", ""): i for i in tray._menu_items()}
+    reader = items["Open reader"]
+    assert reader.visible is False
+    state["running"] = True
+    assert reader.visible is True
+    reader(tray._icon)
+    pause = items["Pause"]
+    assert pause.enabled is False
+    state["speaking"] = True
+    assert pause.enabled is True
+    pause(tray._icon)
+    state["paused"] = True
+    assert pause.text == "Resume"
+    assert calls == ["reader", "pause"]
+
+
+# ---------------------------------------------------------------- forward_open / --open
+
+@pytest.fixture
+def open_server():
+    """A tiny local HTTP server standing in for the running instance's /api/open."""
+    import http.server
+    import json as _json
+
+    seen = {}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        status = 200
+
+        def do_POST(self):
+            body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            seen.update(path=self.path, body=_json.loads(body), headers=dict(self.headers))
+            data = b"{}"
+            self.send_response(type(self).status)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *a):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield server, Handler, seen
+    server.shutdown()
+    server.server_close()
+
+
+def test_forward_open_posts_the_absolute_path_without_origin(open_server, tmp_path):
+    server, handler, seen = open_server
+    book = tmp_path / "b.epub"
+    assert app.forward_open(server.server_address[1], str(book)) is True
+    assert seen["path"] == "/api/open" and seen["body"] == {"path": str(book.resolve())}
+    assert "Origin" not in seen["headers"]
+    assert seen["headers"]["Content-Type"] == "application/json"
+
+
+def test_forward_open_failures(open_server, tmp_path, caplog):
+    server, handler, seen = open_server
+    handler.status = 400
+    assert app.forward_open(server.server_address[1], str(tmp_path / "b.epub")) is False
+    assert "refused" in caplog.text
+    handler.status = 200
+    port = server.server_address[1]
+    server.shutdown()
+    server.server_close()
+    assert app.forward_open(port, str(tmp_path / "b.epub")) is False  # nothing listens
+
+
+class FakeInstance:
+    def __init__(self, first):
+        self.first = first
+        self.shown = self.closed = 0
+
+    def acquire(self):
+        return self.first
+
+    def signal_show(self):
+        self.shown += 1
+
+    def close(self):
+        self.closed += 1
+
+
+@pytest.fixture
+def second_launch(cli, monkeypatch):
+    inst = FakeInstance(first=False)
+    monkeypatch.setattr("vibetts.single_instance.SingleInstance", lambda: inst)
+    monkeypatch.setattr(app, "_set_dpi_aware", lambda: None)
+    return inst
+
+
+def test_main_open_forwards_to_the_running_instance(second_launch, monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(app, "forward_open", lambda port, path: calls.append((port, path)) or True)
+    assert app.main(["--open", str(tmp_path / "b.epub")]) == 0
+    assert calls == [(7724, str(tmp_path / "b.epub"))]
+    assert second_launch.shown == 0 and second_launch.closed == 1
+
+
+@pytest.mark.parametrize("forwarded,enabled", [(False, True), (True, False)])
+def test_main_open_falls_back_to_showing_the_window(second_launch, cli, monkeypatch, tmp_path,
+                                                    forwarded, enabled):
+    cli.reader.enabled = enabled
+    monkeypatch.setattr(app, "forward_open", lambda port, path: forwarded)
+    assert app.main(["--open", str(tmp_path / "b.epub")]) == 0
+    assert second_launch.shown == 1
+
+
+def test_main_second_launch_without_open_just_signals(second_launch, monkeypatch):
+    monkeypatch.setattr(app, "forward_open", lambda *a: pytest.fail("no --open given"))
+    assert app.main([]) == 0
+    assert second_launch.shown == 1
+
+
+def test_main_first_instance_passes_open_path_to_the_app(cli, monkeypatch):
+    inst = FakeInstance(first=True)
+    monkeypatch.setattr("vibetts.single_instance.SingleInstance", lambda: inst)
+    monkeypatch.setattr(app, "_set_dpi_aware", lambda: None)
+    made = {}
+
+    class FakeTTSApp:
+        def __init__(self, cfg, start_hidden=False, instance=None, open_path=None):
+            made.update(open_path=open_path, instance=instance)
+
+        def run(self):
+            made["ran"] = True
+
+    monkeypatch.setattr(app, "TTSApp", FakeTTSApp)
+    assert app.main(["--open", "relative.epub"]) == 0
+    assert made["ran"] and made["open_path"] == str(Path("relative.epub").resolve())
+    assert made["instance"] is inst
+
+
+def test_main_open_argument_conflicts(cli):
+    for extra in (["--say", "x"], ["--doc", "d"], ["--mcp-only"]):
+        with pytest.raises(SystemExit):
+            app.main(["--open", "b.epub", *extra])
+
+
+def test_start_skips_the_settings_window_when_opening_a_book(fakes):
+    a = make_app(fakes)
+    opened = []
+    a.cfg.ui.show_settings_on_start = True
+    a._start_hidden, a._open_path, a._instance = False, "b.epub", None
+    a._startup_errors = []
+    noop = type("N", (), {"start": lambda self: None, "notify": lambda self, *x: None})()
+    a.listener, a.tray = noop, noop
+    a._autostart = type("A", (), {"sync": staticmethod(lambda: None)})
+    a.open_settings = lambda *args, **kw: opened.append(args)
+    a._preload = lambda: None
+    a._sync_mcp = lambda: None
+    a._sync_reader = lambda: None
+    started = []
+    a._open_book = lambda path: started.append(path)
+    a._start()
+    assert opened == []  # the voice is installed (fakes) and a book is opening
+    deadline = time.time() + 2
+    while not started and time.time() < deadline:
+        time.sleep(0.01)
+    assert started == ["b.epub"] and a._open_path is None
+    a._start()
+    assert opened == [()]

@@ -9,6 +9,8 @@ from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
 ROOT = os.path.abspath(os.path.join(SPECPATH, os.pardir))
 
 datas = [(os.path.join(ROOT, "config.example.toml"), ".")]
+# VTF-07: the web reader (served by vibetts.reader_server from vibetts/web)
+datas += [(os.path.join(ROOT, "vibetts", "web"), "vibetts/web")]
 datas += collect_data_files("sv_ttk")
 datas += collect_data_files("kokoro_onnx")       # config.json (vocabulary)
 datas += collect_data_files("espeakng_loader")   # espeak-ng-data (phoneme rules)
@@ -34,6 +36,11 @@ hiddenimports = [
     "vibetts.mcp_server",
     "lameenc",
     "pypdf",
+    # VTF-07: book reader, library, reader API server, "Open with" registration (all lazy)
+    "vibetts.reading",
+    "vibetts.library",
+    "vibetts.reader_server",
+    "vibetts.fileassoc",
 ]
 
 a = Analysis(

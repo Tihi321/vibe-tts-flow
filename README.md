@@ -12,6 +12,7 @@ Sister app of [VibeFlow](https://github.com/Tihi321/vibe-whisper-flow) (voice â†
 - All audio is 44.1 kHz mono (Supertonic natively, Kokoro resampled up from 24 kHz)
 - Speed, pause between sentences, volume, output device
 - Export to an audio file (WAV or MP3, 44.1 kHz): type or paste text, or open a .txt, .md, .html, .docx, .epub or .pdf document (Settings > Export)
+- Book reader in your browser (.epub and .txt): chapters, the sentence being read is highlighted, your place is remembered; a Chrome extension reads web pages aloud the same way
 - Local MCP server so AI agents (Claude Code and others) can speak text or turn text and documents into audio files (off by default)
 - Cleans markdown before reading (no "asterisk asterisk", web addresses become "link")
 - Restores your clipboard after copying the selection (text, images, files, rich text)
@@ -46,6 +47,7 @@ python run.pyw --console   # prints the log to the terminal
 python -m vibetts --say "Hello there"                 # speak once, no tray
 python -m vibetts --say "Hello there" --out out.mp3   # write an audio file instead (.wav or .mp3; --wav still works)
 python -m vibetts --doc C:\path\to\book.epub --out book.mp3   # a whole document to an audio file
+python -m vibetts --open C:\path\to\book.epub        # open a book in the reader (starts the app if needed)
 ```
 
 A speaker icon appears in the tray. Left-click it for Settings, right-click for the menu (language, voices, speed, stop, launch at login, quit). `--hidden` starts without opening the Settings window (used by launch at login). The first start opens Settings on the Kokoro tab when the model is missing: click **Download voice** (see below).
@@ -92,6 +94,48 @@ The same setting as `.mcp.json`: `{"mcpServers": {"vibetts": {"type": "http", "u
 - **Where files go.** An `output` path can be absolute; a bare file name goes into the export folder. Only `.wav` and `.mp3` are written, and an existing file is only replaced with `overwrite = true`.
 - **Size limit.** `[mcp] max_chars` (default 200000) limits the text of one call.
 
+## Book reader
+
+VibeTTS serves a small reader page on your own computer (`http://127.0.0.1:7724/`, on by default). The browser only shows the text; the voice plays through VibeTTS on your speakers, like the hotkey.
+
+- **Open it:** tray > **Open reader** (or Settings > Reader > **Open reader**).
+- **Add books:** drag a `.epub`, `.txt` (or `.md`, `.html`, `.docx`, `.pdf`) file onto the page, or use the file picker. Books are copied into the `library` folder next to the app (`[reader] library_folder`); the same file is only stored once.
+- **Read:** the book opens with its chapter list on the left. Press play, or click a sentence to start there. The sentence being read is highlighted and scrolled into view, and the next chapter starts when one ends.
+- **Resume:** the chapter and sentence are saved as you go; reopening a book continues from there.
+- **Controls:** play/pause, previous/next sentence and chapter, voice (default: as configured), speed, font size, light or dark theme.
+- **Keyboard:** **Space** plays or pauses, **Left** / **Right** move one sentence, **Esc** stops.
+- **Pause from the tray:** tray > **Pause** / **Resume** works for any reading, including the hotkey.
+- Pressing the hotkey (or an agent using `speak`) while a book is playing replaces it; the page then shows that it is playing elsewhere.
+
+## Open books from Windows
+
+Settings > **Reader** > **Open books with VibeTTS**: tick `.epub` (and `.txt` if you want it), press **Register**. This only adds VibeTTS to the **Open with** list for your user (no admin rights, nothing outside your own registry). Windows does not allow an app to make itself the default, so then either:
+
+- right-click a book in Explorer > **Open with** > **VibeTTS** > **Always**, or
+- press **Choose default appâ€¦** and pick VibeTTS in Windows Settings.
+
+The book is imported and opened in the reader, whether VibeTTS was running or not (`VibeTTS.exe --open "C:\books\story.epub"` does the same from a shell). **Remove** undoes the registration. Your `.txt` default is never changed by VibeTTS.
+
+## Chrome extension
+
+The extension in the `extension` folder (also `dist\VibeTTS-chrome-extension-<version>.zip` after a build) reads web pages aloud through the running VibeTTS app and highlights the sentence being read.
+
+1. Open `chrome://extensions` and turn on **Developer mode**.
+2. Choose **Load unpacked** and pick the `extension` folder (Settings > Reader > **Open extension folder** opens it).
+3. VibeTTS must be running with the reader turned on. The extension id is fixed (`injaiiefkhoimpkeandbjfbnnjddaceh`) and is already allowed in `[reader] extension_ids`.
+
+Use it from the right-click menu:
+
+| Menu item | What it reads |
+|---|---|
+| **Read selection** | Only the selected text |
+| **Read article from here** | The article, starting at the sentence you clicked or selected |
+| **Read whole article** | The whole article (the main text of the page, without menus and sidebars) |
+
+Shortcuts (change them at `chrome://extensions/shortcuts`): **Alt+Shift+R** reads the selection or the article, **Alt+Shift+P** pauses or resumes, **Alt+Shift+S** stops. The toolbar popup shows whether VibeTTS is reachable and has play/pause, stop, previous/next sentence, **Read this page**, voice, speed and the port.
+
+Only the extension with an id in `[reader] extension_ids` and pages served by the reader itself can call the API (see Security below).
+
 ## How to use
 
 | Action | Result |
@@ -103,6 +147,19 @@ The same setting as `.mcp.json`: `{"mcpServers": {"vibetts": {"type": "http", "u
 | Tray > **English voice** / **Croatian voice** (named after your other language) / **Speed** | Change the voices or speed (applies to the next read) |
 
 Pill colours: blue animated dots = starting / loading the model, violet = reading, green = done, red text = error.
+
+## Reader settings
+
+```toml
+[reader]
+enabled = true               # local book reader and Chrome extension API (127.0.0.1 only)
+port = 7724                  # 1024 .. 65535
+library_folder = "library"   # imported books; relative paths are next to the app
+max_chars = 500000           # longest text one read request may carry; 0 = no limit
+extension_ids = ["injaiiefkhoimpkeandbjfbnnjddaceh"]   # Chrome extensions allowed to call the API
+```
+
+**Security.** The reader listens on `127.0.0.1` only and refuses requests whose `Host` is not localhost (DNS rebinding). A request that carries an `Origin` header must come from the reader page itself or from `chrome-extension://<id>` with an id in `extension_ids`; changing requests without an allowed `Origin` are refused, except `POST /api/open`, which a second `VibeTTS --open` launch uses (browsers always send `Origin` on cross-site posts, so a web page cannot use it). There is no password: any program on this computer can use the API while it is on. Logs record lengths and counts, never the text. Set `enabled = false` to turn it off.
 
 ## Hotkey
 
@@ -163,6 +220,7 @@ One run produces:
 | Output | Size | Contents |
 |---|---|---|
 | `dist\VibeTTS\VibeTTS.exe` | | Ready to run, model included |
+| `dist\VibeTTS-chrome-extension-<version>.zip` | small | The Chrome extension (also copied to `dist\VibeTTS\extension`) |
 | `dist\VibeTTS-<version>-win64.zip` | ~56 MB | App only: the first start offers **Download voice** (about 121 MB); Supertonic is downloaded from Settings when you want it |
 | `dist\VibeTTS-<version>-win64-with-model.zip` | ~140 MB | App + int8 model + voices, works offline |
 
@@ -193,7 +251,7 @@ Supertonic has its own **Supertonic** tab with the same download, delete and sta
 
 ## Privacy
 
-Everything runs locally; the only network access is the optional model download from Hugging Face. Selected text is never written to disk (only its length goes to the log). Export writes only the audio file you choose; the text is not stored. The MCP server is off by default and only listens on 127.0.0.1. No telemetry.
+Everything runs locally; the only network access is the optional model download from Hugging Face. Selected text is never written to disk (only its length goes to the log). Export writes only the audio file you choose; the text is not stored. The MCP server is off by default and only listens on 127.0.0.1. The book reader (on by default) also listens on 127.0.0.1 only and keeps your books and reading positions in the `library` folder next to the app. No telemetry.
 
 ## Project layout
 
@@ -203,10 +261,14 @@ config.example.toml      copied to config.toml on first run
 scripts/build.ps1        builds the portable exe + zip
 packaging/VibeTTS.spec   PyInstaller spec
 vibetts/
-  app.py                 wiring: hotkey -> selection -> speech; tray and settings hooks; export, MCP bridge; --say/--doc CLI
+  app.py                 wiring: hotkey -> selection -> speech; tray and settings hooks; export, MCP and reader bridges; --say/--doc/--open CLI
   export.py              streaming export to WAV / MP3 (lameenc), 44.1 kHz
-  docload.py             text from .txt .md .html .docx .epub .pdf
+  docload.py             text (and chapters) from .txt .md .html .docx .epub .pdf
   mcp_server.py          local MCP server (stdlib HTTP, JSON-RPC) and its tools
+  reader_server.py       local reader API (stdlib HTTP): web reader files, playback, library, /api/open
+  reading.py             reading session: items, current sentence, pause/seek, long-poll status
+  library.py             book library: stored files, parsed chapters, reading positions
+  fileassoc.py           "Open with VibeTTS" registration for .epub / .txt (HKCU)
   hotkeys.py             global hotkey listener (named bindings), chord parsing
   selection.py           copy the selection, snapshot and restore the clipboard
   textprep.py            markdown cleanup, sentence chunking, English-or-not guess
@@ -219,6 +281,8 @@ vibetts/
   config.py              config handling, frozen-aware paths
   autostart.py           Run-key launch at login
   single_instance.py     one running copy; second launch shows the window
+  web/                   the web reader (HTML, CSS, JS; no build step)
+extension/               Chrome extension (Manifest V3, load unpacked)
 tests/
 ```
 
