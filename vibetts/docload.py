@@ -10,6 +10,7 @@ import codecs
 import posixpath
 import re
 import zipfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
@@ -30,6 +31,19 @@ class Document:
     text: str
     markdown: bool   # text may contain markdown (clean it before speaking)
     title: str       # file stem, used for the default output file name
+
+
+@dataclass
+class Chapter:
+    title: str
+    text: str        # paragraphs separated by blank lines
+
+
+@dataclass
+class Book:
+    title: str
+    author: str
+    chapters: list[Chapter]
 
 
 def decode_bytes(data: bytes) -> str:
@@ -175,33 +189,180 @@ def _docx_text(path: Path) -> str:
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
+def _epub_member(base: str, href: str) -> str:
+    """Zip member name for an href relative to the folder `base`, without the #fragment."""
+    return posixpath.normpath(posixpath.join(base, unquote(href).split("#", 1)[0]))
+
+
+def _epub_spine(zf: zipfile.ZipFile) -> tuple[list[str], ET.Element | None, str, dict[str, ET.Element]]:
+    """Spine members in reading order, plus the parsed OPF, its folder and the manifest items by id.
+
+    Without a usable spine every html member is returned in name order (and the OPF is None).
+    """
+    names = set(zf.namelist())
+    order: list[str] = []
+    opf: ET.Element | None = None
+    base = ""
+    items: dict[str, ET.Element] = {}
+    try:
+        container = ET.fromstring(_read_member(zf, "META-INF/container.xml"))
+        opf_path = next(el.get("full-path") for el in container.iter()
+                        if _local(el.tag) == "rootfile" and el.get("full-path"))
+        opf = ET.fromstring(_read_member(zf, opf_path))
+        base = posixpath.dirname(opf_path)
+        items = {el.get("id"): el for el in opf.iter()
+                 if _local(el.tag) == "item" and el.get("href")}
+        for el in opf.iter():
+            if _local(el.tag) == "itemref" and el.get("idref") in items:
+                order.append(_epub_member(base, items[el.get("idref")].get("href")))
+    except (StopIteration, ET.ParseError, DocumentError):
+        order, opf, base, items = [], None, "", {}
+    order = [n for n in order if n in names]
+    if not order:  # no usable spine: every html member in name order
+        order = sorted(n for n in names if n.lower().endswith((".xhtml", ".html", ".htm")))
+    return order, opf, base, items
+
+
 def _epub_text(path: Path) -> str:
     with zipfile.ZipFile(path) as zf:
-        names = set(zf.namelist())
-        order: list[str] = []
-        try:
-            container = ET.fromstring(_read_member(zf, "META-INF/container.xml"))
-            opf_path = next(el.get("full-path") for el in container.iter()
-                            if _local(el.tag) == "rootfile" and el.get("full-path"))
-            opf = ET.fromstring(_read_member(zf, opf_path))
-            base = posixpath.dirname(opf_path)
-            manifest = {el.get("id"): el.get("href") for el in opf.iter()
-                        if _local(el.tag) == "item" and el.get("href")}
-            for el in opf.iter():
-                if _local(el.tag) == "itemref" and manifest.get(el.get("idref")):
-                    href = unquote(manifest[el.get("idref")]).split("#", 1)[0]
-                    order.append(posixpath.normpath(posixpath.join(base, href)))
-        except (StopIteration, ET.ParseError, DocumentError):
-            order = []
-        order = [n for n in order if n in names]
-        if not order:  # no usable spine: every html member in name order
-            order = sorted(n for n in names if n.lower().endswith((".xhtml", ".html", ".htm")))
+        order = _epub_spine(zf)[0]
         texts = []
         for name in order:
             t = _html_to_text(_decode_html(_read_member(zf, name)))
             if t:
                 texts.append(t)
     return "\n\n".join(texts)
+
+
+_OPS_TYPE = "{http://www.idpf.org/2007/ops}type"
+
+
+def _epub_toc(zf: zipfile.ZipFile, opf: ET.Element, base: str,
+              items: dict[str, ET.Element]) -> dict[str, str]:
+    """Chapter titles by zip member name, from the EPUB3 nav document or the EPUB2 NCX.
+
+    The first title seen for a member wins. A missing or unreadable TOC gives an empty dict.
+    """
+    names = set(zf.namelist())
+    nav = next((it for it in items.values() if "nav" in (it.get("properties") or "").split()), None)
+    ncx = None
+    spine = next((el for el in opf.iter() if _local(el.tag) == "spine"), None)
+    if spine is not None and spine.get("toc") in items:
+        ncx = items[spine.get("toc")]
+    if ncx is None:
+        ncx = next((it for it in items.values()
+                    if it.get("media-type") == "application/x-dtbncx+xml"), None)
+    toc: dict[str, str] = {}
+
+    def add(src: str, href: str | None, title: str) -> None:
+        title = " ".join(title.split())
+        if href and title:
+            target = _epub_member(posixpath.dirname(src), href)
+            toc.setdefault(target, title)
+
+    for item, kind in ((nav, "nav"), (ncx, "ncx")):
+        if item is None:
+            continue
+        src = _epub_member(base, item.get("href"))
+        if src not in names:
+            continue
+        try:
+            root = ET.fromstring(_read_member(zf, src))
+        except (ET.ParseError, DocumentError):
+            continue
+        if kind == "nav":
+            for nav_el in root.iter():
+                if _local(nav_el.tag) == "nav" and "toc" in (nav_el.get(_OPS_TYPE) or "").split():
+                    for a in nav_el.iter():
+                        if _local(a.tag) == "a":
+                            add(src, a.get("href"), "".join(a.itertext()))
+                    break
+        else:
+            for point in root.iter():
+                if _local(point.tag) != "navPoint":
+                    continue
+                label = next((t for lab in point if _local(lab.tag) == "navLabel"
+                              for t in lab if _local(t.tag) == "text"), None)
+                content = next((c for c in point if _local(c.tag) == "content"), None)
+                if label is not None and content is not None:
+                    add(src, content.get("src"), "".join(label.itertext()))
+        if toc:
+            break
+    return toc
+
+
+_HEADING = re.compile(r"<h[1-3]\b[^>]*>(.*?)</h[1-3]>", re.IGNORECASE | re.DOTALL)
+
+
+def _first_heading(html: str) -> str:
+    m = _HEADING.search(html)
+    return " ".join(_html_to_text(m.group(1)).split()) if m else ""
+
+
+def _epub_book(path: Path) -> Book:
+    with zipfile.ZipFile(path) as zf:
+        order, opf, base, items = _epub_spine(zf)
+        title, author = path.stem, ""
+        toc: dict[str, str] = {}
+        if opf is not None:
+            found_title = False
+            for el in opf.iter():
+                text = " ".join("".join(el.itertext()).split())
+                if _local(el.tag) == "title" and text and not found_title:
+                    title, found_title = text, True
+                elif _local(el.tag) == "creator" and text and not author:
+                    author = text
+            toc = _epub_toc(zf, opf, base, items)
+        pages = [(name, _decode_html(_read_member(zf, name))) for name in order]
+    texts = [(name, html, _html_to_text(html)) for name, html in pages]
+    chapters: list[Chapter] = []
+    if any(name in toc for name, _, _ in texts):
+        for name, _, text in texts:
+            if name in toc:
+                chapters.append(Chapter(toc[name], text))
+            elif chapters:
+                last = chapters[-1]
+                last.text = "\n\n".join(t for t in (last.text, text) if t)
+            else:
+                chapters.append(Chapter("Front matter", text))
+    else:
+        for name, html, text in texts:
+            if text:
+                chapters.append(Chapter(_first_heading(html) or f"Section {len(chapters) + 1}", text))
+    return Book(title=title, author=author, chapters=[c for c in chapters if c.text.strip()])
+
+
+_TXT_HEADING = re.compile(r"^(?:(?:chapter|part|book|prologue|epilogue)\b|(?:[ivxlc]+|\d+)\.?$)",
+                          re.IGNORECASE)
+_PART_CHARS = 20_000
+_OPENING_MIN_CHARS = 200  # text before the first heading is a chapter only if it is more than a title page
+
+
+def _txt_chapters(text: str, title: str) -> list[Chapter]:
+    paras = [p.strip() for p in re.split(r"\n[ \t]*\n", text) if p.strip()]
+    heads = [i for i, p in enumerate(paras) if len(p) <= 80 and _TXT_HEADING.match(p)]
+    if len(heads) < 2:
+        parts: list[list[str]] = [[]]
+        size = 0
+        for p in paras:
+            if parts[-1] and size + len(p) > _PART_CHARS:
+                parts.append([])
+                size = 0
+            parts[-1].append(p)
+            size += len(p)
+        if len(parts) == 1:
+            return [Chapter(title, "\n\n".join(parts[0]))]
+        return [Chapter(f"Part {n}", "\n\n".join(ps)) for n, ps in enumerate(parts, 1)]
+    chapters: list[Chapter] = []
+    opening = "\n\n".join(paras[:heads[0]])
+    if len(opening) >= _OPENING_MIN_CHARS:
+        chapters.append(Chapter("Opening", opening))
+    for k, i in enumerate(heads):
+        end = heads[k + 1] if k + 1 < len(heads) else len(paras)
+        body = "\n\n".join(paras[i + 1:end])
+        if body:
+            chapters.append(Chapter(paras[i], body))
+    return chapters
 
 
 def _pdf_text(path: Path) -> str:
@@ -223,8 +384,8 @@ def _pdf_text(path: Path) -> str:
 
 # ---- entry point ------------------------------------------------------------------------------
 
-def extract_text(path: str | Path) -> Document:
-    p = Path(path)
+def _check_file(p: Path) -> str:
+    """Validate the path (exists, supported, size) and return the lower-case suffix."""
     if not p.is_file():
         raise DocumentError(f"File not found: {p.name or p}")
     suffix = p.suffix.lower()
@@ -237,8 +398,50 @@ def extract_text(path: str | Path) -> Document:
     if size > MAX_FILE_BYTES:
         raise DocumentError(f"File is too large ({size // (1024 * 1024)} MB, "
                             f"limit {MAX_FILE_BYTES // (1024 * 1024)} MB)")
-    markdown = suffix in (".md", ".markdown")
+    return suffix
+
+
+@contextmanager
+def _guarded(p: Path, suffix: str):
+    """Turn whatever a format reader raises into a DocumentError."""
     try:
+        yield
+    except DocumentError:
+        raise
+    except zipfile.BadZipFile:
+        raise DocumentError(f"{p.name} is not a valid {suffix[1:]} file") from None
+    except OSError as e:
+        raise DocumentError(f"Cannot read {p.name}: {e.strerror or e}") from None
+    except Exception as e:  # parser internals (pypdf, xml, ...) vary widely
+        raise DocumentError(f"Could not read {p.name}: {e}") from None
+
+
+def extract_book(path: str | Path) -> Book:
+    """Like extract_text but keeps chapters: EPUB (TOC or spine) and .txt (headings) are split."""
+    p = Path(path)
+    suffix = _check_file(p)
+    if suffix not in (".epub", ".txt"):
+        doc = extract_text(p)
+        return Book(title=doc.title, author="", chapters=[Chapter(doc.title, doc.text)])
+    with _guarded(p, suffix):
+        if suffix == ".epub":
+            book = _epub_book(p)
+        else:
+            text = decode_bytes(p.read_bytes()).replace("\r\n", "\n").replace("\r", "\n")
+            if _looks_hard_wrapped(text):
+                text = reflow(text)
+            chapters = _txt_chapters(text, p.stem) if text.strip() else []
+            book = Book(title=p.stem, author="", chapters=chapters)
+    if not book.chapters:
+        raise DocumentError(f"No text found in {p.name}.")
+    return book
+
+
+def extract_text(path: str | Path) -> Document:
+    p = Path(path)
+    suffix = _check_file(p)
+    markdown = suffix in (".md", ".markdown")
+    with _guarded(p, suffix):
         if suffix in (".txt", ".md", ".markdown"):
             text = decode_bytes(p.read_bytes())
             if suffix == ".txt" and _looks_hard_wrapped(text):
@@ -251,14 +454,6 @@ def extract_text(path: str | Path) -> Document:
             text = _epub_text(p)
         else:
             text = _pdf_text(p)
-    except DocumentError:
-        raise
-    except zipfile.BadZipFile:
-        raise DocumentError(f"{p.name} is not a valid {suffix[1:]} file") from None
-    except OSError as e:
-        raise DocumentError(f"Cannot read {p.name}: {e.strerror or e}") from None
-    except Exception as e:  # parser internals (pypdf, xml, ...) vary widely
-        raise DocumentError(f"Could not read {p.name}: {e}") from None
     text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
     if not text:
         hint = " It may be scanned images without a text layer." if suffix == ".pdf" else ""

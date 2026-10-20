@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import Any
 
 FIRST_CHUNK_CHARS = 100   # split the first sentence at a comma when it is longer
 MAX_CHUNK_CHARS = 400     # split any sentence longer than this
@@ -72,6 +73,7 @@ def clean_text(text: str, markdown: bool = True) -> str:
 class Chunk:
     text: str
     pause_after: float = 1.0  # multiple of the sentence pause (paragraph ends use more)
+    tag: Any = None  # reader sessions: index of the item the chunk came from
 
 
 def _split_long(sentence: str, limit: int, words: bool = True) -> list[str]:
@@ -104,8 +106,9 @@ def _split_long(sentence: str, limit: int, words: bool = True) -> list[str]:
     return result
 
 
-def split_chunks(text: str) -> list[Chunk]:
-    """Split cleaned text into speakable chunks (sentences; line breaks also end one)."""
+def split_chunks(text: str, short_first: bool = True) -> list[Chunk]:
+    """Split cleaned text into speakable chunks (sentences; line breaks also end one).
+    `short_first`: cut the very first chunk short (it sets the start delay)."""
     chunks: list[Chunk] = []
     paragraphs = [p for p in text.split("\n\n") if p.strip()]
     for pi, para in enumerate(paragraphs):
@@ -123,7 +126,7 @@ def split_chunks(text: str) -> list[Chunk]:
                 merged.append(s)
         for si, s in enumerate(merged):
             parts = _split_long(s, MAX_CHUNK_CHARS)
-            if not chunks:
+            if short_first and not chunks:
                 # the very first piece sets the start delay: cut it at a clause mark
                 # (never mid-phrase) when one comes early enough; rejoin the rest
                 head = _split_long(parts[0], FIRST_CHUNK_CHARS, words=False)
@@ -151,6 +154,24 @@ def prepare(text: str, markdown: bool = True, max_chars: int = 0) -> list[Chunk]
         cut = text.rfind(" ", 0, max_chars)
         text = text[: cut if cut > 0 else max_chars]
     return split_chunks(text)
+
+
+def prepare_items(items: list[tuple[str, str]], markdown: bool = False) -> list[Chunk]:
+    """Chunks of reader items, each tagged with its index in `items`. `items` are
+    (text, pause) pairs; the pause after an item is a sentence ("sentence") or a paragraph
+    ("paragraph") long. Items with nothing to say give no chunks; the other indices stay."""
+    chunks: list[Chunk] = []
+    for index, (text, pause) in enumerate(items):
+        part = split_chunks(clean_text(text, markdown), short_first=not chunks)
+        if not part:
+            continue
+        for c in part:
+            c.tag = index
+        part[-1].pause_after = 2.0 if pause == "paragraph" else 1.0
+        chunks.extend(part)
+    if chunks:
+        chunks[-1].pause_after = 0.0
+    return chunks
 
 
 

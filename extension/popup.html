@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>VibeTTS Reader</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header>
+    <h1>VibeTTS Reader</h1>
+    <span id="dot" class="dot" aria-hidden="true"></span>
+  </header>
+  <p id="conn" class="conn" role="status" aria-live="polite">Connecting...</p>
+  <p id="state" class="state" aria-live="polite"></p>
+  <p id="error" class="error" role="alert" hidden></p>
+
+  <section class="row">
+    <button id="read-page" type="button">Read page</button>
+    <button id="read-selection" type="button">Read selection</button>
+  </section>
+
+  <section class="row transport">
+    <button id="prev" type="button" aria-label="Previous sentence" title="Previous sentence">&#9198;</button>
+    <button id="toggle" type="button" aria-label="Play or pause" title="Pause / resume">&#9654;&#65039;</button>
+    <button id="stop" type="button" aria-label="Stop" title="Stop">&#9209;</button>
+    <button id="next" type="button" aria-label="Next sentence" title="Next sentence">&#9197;</button>
+  </section>
+
+  <section class="settings">
+    <label>Voice
+      <select id="voice"><option value="">Auto</option></select>
+    </label>
+    <label>Language
+      <select id="lang"><option value="">Auto</option></select>
+    </label>
+    <label>Speed <output id="speed-out">1.00</output>
+      <input id="speed" type="range" min="0.5" max="2" step="0.05" value="1">
+    </label>
+    <label>App port
+      <input id="port" type="number" min="1" max="65535" step="1" value="7724">
+    </label>
+  </section>
+
+  <script src="popup.js"></script>
+</body>
+</html>

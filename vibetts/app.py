@@ -5,11 +5,14 @@ import argparse
 import copy
 import ctypes
 import dataclasses
+import http.client
+import json
 import logging
 import os
 import sys
 import threading
 import time
+import webbrowser
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -38,6 +41,7 @@ if TYPE_CHECKING:  # pragma: no cover
 log = logging.getLogger(__name__)
 
 _MCP_LOCK = threading.RLock()  # serializes _sync_mcp / stop (Tk thread, tray thread, quit)
+_READER_LOCK = threading.RLock()  # the same for _sync_reader
 
 MISSING_MODEL = "Download the voice model to start reading aloud"
 MISSING_SUPERTONIC = "Supertonic is not installed: download it in Settings > Supertonic"
@@ -380,16 +384,19 @@ class EngineHolder:
 
 
 class TTSApp:
-    def __init__(self, cfg: Config, start_hidden: bool = False, instance: Any = None):
+    def __init__(self, cfg: Config, start_hidden: bool = False, instance: Any = None,
+                 open_path: str | None = None):
         from . import autostart
         from .hotkeys import HotkeyListener, parse_chord
         from .overlay import Overlay
+        from .reading import ReadingSession
         from .tray import Tray, TrayHooks
         from .tts import SoundDeviceOutput, Speaker
 
         self.cfg = cfg
         self._start_hidden = start_hidden
         self._instance = instance
+        self._open_path = open_path  # `--open PATH`: a book to open once the reader runs
         self._autostart = autostart
         self.settings: Any = None
         self.enabled = True
@@ -406,6 +413,10 @@ class TTSApp:
         self._mcp: Any = None  # the running McpServer
         self._mcp_key: tuple | None = None  # (enabled, port, max_chars) it was started with
         self._mcp_error: str | None = None
+        self._reader: Any = None  # the running ReaderServer
+        self._reader_bridge: Any = None  # its ReaderApi
+        self._reader_key: tuple | None = None  # (port, extension_ids, max_chars, folder)
+        self._reader_error: str | None = None
 
         try:
             chord = parse_chord(cfg.hotkey.read)
@@ -421,6 +432,7 @@ class TTSApp:
                                on_start=self._on_speak_start, on_done=self._on_speak_done)
         self._speak_cfg: SpeechConfig = cfg.speech
         self._speak_voice: str | None = None  # voice of the request being spoken
+        self.reading = ReadingSession(self)  # reader / extension playback state
         self.listener = HotkeyListener({"read": chord}, self._on_hotkey, self._on_escape)
 
         hooks = TrayHooks(
@@ -446,6 +458,10 @@ class TTSApp:
             set_autostart=self._set_autostart,
             open_settings=lambda: self.open_settings(),
             open_export=lambda: self.open_settings("export"),
+            reader_running=lambda: self.reader_status()["running"],
+            open_reader=self.open_reader,
+            is_paused=lambda: self.speaker.paused,
+            toggle_pause=self.toggle_pause,
             open_config=self._open_config,
             open_logs=self._open_logs,
             reload_config=self.reload_config,
@@ -485,9 +501,15 @@ class TTSApp:
             self.open_settings(setup_tab(primary))  # its tab has the Download panel
         else:
             self._preload()
-            if self.cfg.ui.show_settings_on_start and not self._start_hidden:
+            if (self.cfg.ui.show_settings_on_start and not self._start_hidden
+                    and not self._open_path):  # opening a book: just the reader
                 self.open_settings()
         self._sync_mcp()
+        self._sync_reader()
+        if self._open_path:
+            path, self._open_path = self._open_path, None
+            threading.Thread(target=self._open_book, args=(path,), name="vibetts-open",
+                             daemon=True).start()
         for msg in self._startup_errors:
             self._flash("error", "Error: " + _short(msg, 53))
             self.tray.notify("VibeTTS", msg)
@@ -499,7 +521,7 @@ class TTSApp:
                 return
             self._quit_done = True
         log.info("quitting")
-        steps = [self.cancel_export, self._stop_mcp, self.speaker.stop, self.listener.stop,
+        steps = [self.cancel_export, self._stop_mcp, self._stop_reader, self.speaker.stop, self.listener.stop,
                  self.tray.stop]
         if self._instance is not None:
             steps.append(self._instance.close)
@@ -567,14 +589,17 @@ class TTSApp:
 
     # -- speaking
     def speak(self, chunks: list, s: SpeechConfig, voice: str | None = None,
-              lang: str | None = None) -> Any:
+              lang: str | None = None, speed: float | None = None,
+              on_chunk: Any = None) -> Any:
         """Start reading `chunks` (voice: default the Kokoro English voice; lang: Supertonic
-        language code); returns the SpeakRequest (its `done` event, `error` and `interrupted`
-        tell how it ended). Safe to call from any thread."""
+        language code; speed: default s.speed; on_chunk(chunk): called as each chunk starts
+        playing); returns the SpeakRequest (its `done` event, `error` and `interrupted` tell
+        how it ended). Safe to call from any thread."""
         from .tts import SpeakRequest
 
         voice = voice or kokoro_voice_of(s)
-        req = SpeakRequest(chunks, voice, s.speed, s.sentence_pause, s.volume, s.device, lang)
+        req = SpeakRequest(chunks, voice, speed if speed is not None else s.speed,
+                           s.sentence_pause, s.volume, s.device, lang, on_chunk)
         self._speak_cfg = s
         self._speak_voice = voice
         self._current = req
@@ -591,6 +616,25 @@ class TTSApp:
             self.speaker.stop()
             self.tray.set_speaking(False)
             self._flash("ok", "Stopped", 0.8)
+
+    def pause(self) -> bool:
+        """Pause the reading (the audio device is released); False if nothing is playing."""
+        if not self.speaker.pause():
+            return False
+        self.overlay.show("speaking", "Paused · Esc to stop")
+        self.reading.notify_paused(True)
+        return True
+
+    def resume(self) -> bool:
+        if not self.speaker.resume():
+            return False
+        self.overlay.show("speaking", "Reading · Esc to stop", ticking=True)
+        self.reading.notify_paused(False)
+        return True
+
+    def toggle_pause(self) -> None:
+        if not self.resume():
+            self.pause()
 
     def _on_speak_start(self, req: Any) -> None:
         if req is not self._current:
@@ -780,6 +824,118 @@ class TTSApp:
         return {"enabled": bool(self.cfg.mcp.enabled), "running": running, "url": url,
                 "error": self._mcp_error or ""}
 
+    # -- book reader server (web reader + Chrome extension)
+    def _sync_reader(self) -> None:
+        """Start, stop or restart the reader server to match [reader] (no-op when unchanged)."""
+        from . import reader_server
+
+        r = self.cfg.reader
+        key = (int(r.port), tuple(r.extension_ids), int(r.max_chars),
+               r.library_folder) if r.enabled else None
+        with _READER_LOCK:
+            if key == self._reader_key:
+                if key is None:
+                    self._reader_error = None
+                return
+            self._stop_reader_locked()
+            if key is None:
+                self._reader_error = None
+                self._tray_refresh()
+                return
+            bridge = ReaderBridge(self)
+            try:
+                server = reader_server.ReaderServer(
+                    bridge, key[0], extension_ids=key[1], max_chars=key[2])
+                server.start()
+            except OSError as e:
+                self._reader_error = f"Port {key[0]} is busy: {e}"
+                log.error("reader server did not start: %s", self._reader_error)
+                self._flash("error", "Error: " + _short(self._reader_error, 53))
+                self._tray_refresh()
+                return
+            self._reader, self._reader_bridge = server, bridge
+            self._reader_key, self._reader_error = key, None
+        self._tray_refresh()
+
+    def _stop_reader_locked(self) -> None:
+        server, self._reader, self._reader_key = self._reader, None, None
+        self._reader_bridge = None
+        if server is not None:
+            try:
+                server.stop()
+            except Exception:
+                log.exception("stopping the reader server failed")
+
+    def _stop_reader(self) -> None:
+        with _READER_LOCK:
+            self._stop_reader_locked()
+
+    def _tray_refresh(self) -> None:
+        try:
+            self.tray.update_menu()
+        except Exception:
+            log.debug("tray refresh failed", exc_info=True)
+
+    def reader_status(self) -> dict:
+        """{'enabled', 'running', 'url', 'error'} for the Settings Reader tab and the tray."""
+        server = self._reader
+        running = server is not None
+        url = server.url if server is not None else f"http://127.0.0.1:{self.cfg.reader.port}/"
+        return {"enabled": bool(self.cfg.reader.enabled), "running": running, "url": url,
+                "error": self._reader_error or ""}
+
+    def open_reader(self) -> None:
+        """Open the web reader in the default browser."""
+        st = self.reader_status()
+        if not st["running"]:
+            raise RuntimeError(self._reader_error or "The book reader is turned off "
+                               "(Settings > Reader)")
+        webbrowser.open(st["url"])
+
+    def _open_book(self, path: str) -> None:
+        """`--open PATH` on a fresh start (worker thread): import the book and open it in the
+        browser; problems are shown as a flash and a tray notification."""
+        bridge = self._reader_bridge
+        try:
+            if bridge is None:
+                raise RuntimeError(self._reader_error or "The book reader is turned off "
+                                   "(Settings > Reader)")
+            summary = bridge.open_book(path)
+            log.info("opened book %s from the command line", summary.get("id"))
+        except Exception as e:
+            msg = str(e) or e.__class__.__name__
+            log.warning("could not open %s: %s", Path(path).name, msg)
+            self._flash("error", "Error: " + _short(msg, 53), 3.0)
+            self.tray.notify("VibeTTS", f"Could not open {Path(path).name}: {msg}")
+
+    @staticmethod
+    def _extension_folder() -> Path:
+        return ROOT / "extension"  # in the repo, and next to the exe (build.ps1 copies it)
+
+    @staticmethod
+    def _registered_exts() -> list[str]:
+        from . import fileassoc
+
+        return fileassoc.registered_exts()
+
+    @staticmethod
+    def _register_files(exts: list[str]) -> None:
+        from . import fileassoc
+
+        fileassoc.register(exts)
+
+    @staticmethod
+    def _unregister_files() -> None:
+        from . import fileassoc
+
+        fileassoc.unregister()
+
+    @staticmethod
+    def _open_default_apps() -> None:
+        from . import fileassoc
+
+        fileassoc.open_default_apps()
+
     # -- overlay helper
     def _flash(self, kind: str, text: str, seconds: float = 1.5) -> None:
         self._flash_until = time.monotonic() + seconds
@@ -815,6 +971,13 @@ class TTSApp:
                 mp3_available=self._mp3_available,
                 mcp_status=self.mcp_status,
                 open_folder=self._open_folder,
+                reader_status=self.reader_status,
+                open_reader=self.open_reader,
+                extension_folder=self._extension_folder,
+                registered_exts=self._registered_exts,
+                register_files=self._register_files,
+                unregister_files=self._unregister_files,
+                open_default_apps=self._open_default_apps,
                 version=__version__,
             )
             self.settings = SettingsWindow(self.overlay.root, hooks, self.overlay.call_soon)
@@ -904,6 +1067,7 @@ class TTSApp:
         self.cfg = new
         self.overlay.cfg = new.ui
         self._sync_mcp()  # before any early return: MCP settings apply anyway
+        self._sync_reader()
         try:
             self.listener.set_bindings({"read": parse_chord(new.hotkey.read)})
         except ValueError as e:
@@ -1178,6 +1342,67 @@ class AgentBridge:
                 "bytes": result.bytes, "voice": result.voice, "lang": result.lang}
 
 
+# ---------------------------------------------------------------- book reader
+
+class ReaderBridge:
+    """What the reader server does inside the app (reader_server.ReaderApi on top of TTSApp).
+    Methods run on the server's request threads."""
+
+    version = __version__
+
+    def __init__(self, app: TTSApp):
+        self.app = app
+        self._library: Any = None
+        self._folder: Path | None = None
+
+    @property
+    def session(self) -> Any:
+        return self.app.reading
+
+    @property
+    def library(self) -> Any:
+        """The Library of [reader] library_folder (a new one when the setting changes)."""
+        from .library import Library
+
+        folder = resolve_path(self.app.cfg.reader.library_folder)
+        if self._library is None or folder != self._folder:
+            self._library, self._folder = Library(folder), folder
+        return self._library
+
+    def list_voices(self) -> dict:
+        return AgentBridge(self.app).list_voices()
+
+    def open_book(self, path: str) -> dict:
+        """Import a local file into the library and open it in the browser; returns the
+        summary plus the url. LibraryError for a bad file."""
+        server = self.app._reader
+        if server is None:
+            raise RuntimeError("The book reader is not running")
+        summary = self.library.add_path(path)
+        url = f"{server.url}#/book/{summary['id']}"
+        webbrowser.open(url)
+        return {**summary, "url": url}
+
+
+def forward_open(port: int, path: str, timeout: float = 10.0) -> bool:
+    """Ask the running instance's reader (POST /api/open, no Origin header: a local process)
+    to import and open `path`. True on success; any failure is logged and returns False."""
+    body = json.dumps({"path": str(Path(path).resolve())}).encode("utf-8")
+    conn = http.client.HTTPConnection("127.0.0.1", int(port), timeout=timeout)
+    try:
+        conn.request("POST", "/api/open", body, {"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        resp.read()
+        if 200 <= resp.status < 300:
+            return True
+        log.warning("the running instance refused --open (HTTP %d)", resp.status)
+    except (OSError, http.client.HTTPException) as e:
+        log.warning("could not reach the running instance on port %s: %s", port, e)
+    finally:
+        conn.close()
+    return False
+
+
 # ---------------------------------------------------------------- headless MCP (agents)
 
 class _NoSpeaker:
@@ -1337,6 +1562,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="speak a document (.txt .md .html .docx .epub .pdf) and exit")
     parser.add_argument("--out", "--wav", dest="out", metavar="PATH",
                         help="with --say / --doc: write an audio file (.wav or .mp3) instead")
+    parser.add_argument("--open", metavar="PATH",
+                        help="open a book (.epub .txt ...) in the reader; used by the Windows "
+                             "Open with registration")
     parser.add_argument("--mcp-only", action="store_true",
                         help="headless: serve the MCP tools for agents (no tray, hotkey or UI; "
                              "MCP is forced on) until Ctrl+C")
@@ -1347,6 +1575,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--port needs --mcp-only")
     if args.mcp_only and (args.say is not None or args.doc is not None):
         parser.error("--mcp-only cannot be combined with --say or --doc")
+    if args.open is not None and (args.mcp_only or args.say is not None or args.doc is not None):
+        parser.error("--open cannot be combined with --mcp-only, --say or --doc")
     if args.say is not None and args.doc is not None:
         parser.error("use either --say or --doc")
     if args.out and args.say is None and args.doc is None:
@@ -1377,6 +1607,14 @@ def main(argv: list[str] | None = None) -> int:
         from .single_instance import SingleInstance
         inst = SingleInstance()
         if not inst.acquire():
+            if args.open is not None:
+                reader = load_config().reader
+                if reader.enabled and forward_open(reader.port, args.open):
+                    log.info("another VibeTTS instance is running; it opens the book")
+                    inst.close()
+                    inst = None
+                    return 0
+                log.warning("could not hand the book to the running instance; showing its window")
             log.info("another VibeTTS instance is running; asked it to show settings")
             inst.signal_show()
             inst.close()
@@ -1386,7 +1624,8 @@ def main(argv: list[str] | None = None) -> int:
         log.info("effective hotkey=%s english=%s other=%s/%s mode=%s speed=%s", cfg.hotkey.read,
                  english_voice_of(cfg.speech), cfg.speech.other_language,
                  other_voice_of(cfg.speech), cfg.speech.language_mode, cfg.speech.speed)
-        TTSApp(cfg, start_hidden=args.hidden, instance=inst).run()
+        TTSApp(cfg, start_hidden=args.hidden, instance=inst,
+               open_path=str(Path(args.open).resolve()) if args.open else None).run()
         return 0
     except KeyboardInterrupt:
         return 0

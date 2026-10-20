@@ -1,0 +1,40 @@
+{
+  "manifest_version": 3,
+  "name": "VibeTTS Reader",
+  "version": "0.1.0",
+  "description": "Read web pages aloud with the local VibeTTS app, with sentence highlighting.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtMJxUvQneCKRQGrumd1fCDi4dkktxzGc10HRiDg0evpBCJm+NuQ050F/ugqOeJ0J17doDj9jB5v65BQR+faLiOpQK3uOyPrPDjn0uBINIKSlhfpj53Uxo9d2wCniAKqSNR2jFi9zGQXZu5SyAg3fFApRIMQLpZ/4nYwTll28bxFyriI6FwpKy4f4e17ws5TaheLifldYHABuBiboSQUoPa9c+msdT2IPKw4HdeZ1DpdepboUscxFbu1oPXxNxsqW653NljjWEpGiTPfsHpxWrqFs54lfILFy1/8IpLcc4NnHJai0Kg8INmJjBAIMJcWnT2hvHshGrrew6KtM/enSUwIDAQAB",
+  "permissions": ["contextMenus", "activeTab", "scripting", "storage"],
+  "host_permissions": ["http://127.0.0.1/*", "http://localhost/*"],
+  "background": { "service_worker": "background.js", "type": "module" },
+  "action": {
+    "default_title": "VibeTTS Reader",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "commands": {
+    "read": {
+      "suggested_key": { "default": "Alt+Shift+R" },
+      "description": "Read the selection, or the article from the caret"
+    },
+    "toggle-pause": {
+      "suggested_key": { "default": "Alt+Shift+P" },
+      "description": "Pause or resume reading"
+    },
+    "stop": {
+      "suggested_key": { "default": "Alt+Shift+S" },
+      "description": "Stop reading"
+    }
+  }
+}

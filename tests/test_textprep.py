@@ -1,7 +1,7 @@
 import pytest
 
-from vibetts.textprep import (FIRST_CHUNK_CHARS, clean_text, looks_english, prepare,
-                              split_chunks)
+from vibetts.textprep import (FIRST_CHUNK_CHARS, Chunk, clean_text, looks_english, prepare,
+                              prepare_items, split_chunks)
 
 
 def test_markdown_cleanup():
@@ -142,3 +142,47 @@ def test_looks_english_mostly_foreign_script_with_english_name():
 def test_looks_english_ignores_markup_and_case():
     assert looks_english("# THE TITLE\n\n- the first item and the second item") is True
     assert looks_english("**Ovo** je _tekst_ koji je pisan na hrvatskom jeziku, bez engleskog.") is False
+
+
+# ---------------------------------------------------------------- reader items
+
+def test_chunk_tag_defaults_to_none():
+    assert Chunk("x").tag is None and Chunk("x", 1.0, 3).tag == 3
+
+
+def test_prepare_items_tags_and_pauses():
+    chunks = prepare_items([("First one.", "sentence"), ("Second one here.", "paragraph"),
+                            ("Third one.", "sentence")])
+    assert [(c.text, c.tag) for c in chunks] == [("First one.", 0), ("Second one here.", 1),
+                                                 ("Third one.", 2)]
+    assert [c.pause_after for c in chunks] == [1.0, 2.0, 0.0]  # the very last one has none
+
+
+def test_prepare_items_several_chunks_in_one_item():
+    chunks = prepare_items([("This sentence is long enough to stand alone here. "
+                             "Another sentence follows it right after that.", "paragraph"),
+                            ("Next.", "sentence")])
+    assert [c.tag for c in chunks] == [0, 0, 1]
+    assert [c.pause_after for c in chunks] == [1.0, 2.0, 0.0]  # only the item's last chunk
+
+
+def test_prepare_items_skips_unspeakable_items_without_shifting_indices():
+    chunks = prepare_items([("---", "sentence"), ("", "sentence"), ("Real text here.", "sentence")])
+    assert [(c.text, c.tag) for c in chunks] == [("Real text here.", 2)]
+    assert prepare_items([("...", "sentence")]) == [] and prepare_items([]) == []
+
+
+def test_prepare_items_short_first_chunk_only_for_the_first_chunk():
+    long = ("Alpha beta gamma delta, " * 6).strip() + "."  # longer than FIRST_CHUNK_CHARS
+    assert len(long) > FIRST_CHUNK_CHARS
+    chunks = prepare_items([(long, "sentence"), (long, "sentence")])
+    first, second = [c for c in chunks if c.tag == 0], [c for c in chunks if c.tag == 1]
+    assert len(first) > 1 and len(first[0].text) <= FIRST_CHUNK_CHARS
+    assert len(second) == 1  # not cut at a clause mark
+    skipped = prepare_items([("", "sentence"), (long, "sentence")])
+    assert len(skipped) > 1 and skipped[0].tag == 1  # the first speakable chunk is the short one
+
+
+def test_prepare_items_markdown_off_by_default():
+    assert prepare_items([("A *star* here.", "sentence")])[0].text == "A *star* here."
+    assert prepare_items([("A *star* here.", "sentence")], markdown=True)[0].text == "A star here."

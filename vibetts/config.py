@@ -4,6 +4,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -100,6 +101,9 @@ class UiConfig:
 EXPORT_FORMATS = ("wav", "mp3")
 MP3_BITRATES = (32, 48, 64, 96, 128, 160, 192, 256, 320)  # kbps; MPEG-1 Layer III at 44.1 kHz
 MCP_DEFAULT_PORT = 7723
+READER_DEFAULT_PORT = 7724
+EXTENSION_ID_RE = re.compile(r"^[a-p]{32}$")  # Chrome extension ids use the letters a..p
+DEFAULT_EXTENSION_ID = "injaiiefkhoimpkeandbjfbnnjddaceh"  # pinned by extension/manifest.json
 
 
 @dataclass
@@ -117,6 +121,15 @@ class McpConfig:
 
 
 @dataclass
+class ReaderConfig:
+    enabled: bool = True              # local book reader + Chrome extension API (127.0.0.1 only)
+    port: int = READER_DEFAULT_PORT   # 1024 .. 65535
+    library_folder: str = "library"   # imported books; relative paths are next to the app
+    max_chars: int = 500000           # longest text one read request may carry; 0 = no limit
+    extension_ids: list[str] = field(default_factory=lambda: [DEFAULT_EXTENSION_ID])
+
+
+@dataclass
 class Config:
     hotkey: HotkeyConfig = field(default_factory=HotkeyConfig)
     speech: SpeechConfig = field(default_factory=SpeechConfig)
@@ -124,6 +137,7 @@ class Config:
     ui: UiConfig = field(default_factory=UiConfig)
     export: ExportConfig = field(default_factory=ExportConfig)
     mcp: McpConfig = field(default_factory=McpConfig)
+    reader: ReaderConfig = field(default_factory=ReaderConfig)
 
 
 def config_path() -> Path:
@@ -174,6 +188,10 @@ def _coerce(value: Any, default: Any) -> Any:
         if not isinstance(value, str):
             raise TypeError("expected a string")
         return value
+    if isinstance(default, list):
+        if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+            raise TypeError("expected a list of strings")
+        return list(value)
     raise TypeError("unsupported type")
 
 
@@ -230,6 +248,7 @@ def config_from_dict(d: dict) -> Config:
     _validate_speech(cfg.speech)
     _validate_export(cfg.export)
     _validate_mcp(cfg.mcp)
+    _validate_reader(cfg.reader)
     return cfg
 
 
@@ -260,6 +279,25 @@ def _validate_mcp(m: McpConfig) -> None:
     if m.max_chars < 0:
         log.warning("config: mcp.max_chars %d is negative; using 0 (no limit)", m.max_chars)
         m.max_chars = 0
+
+
+def _validate_reader(r: ReaderConfig) -> None:
+    if not 1024 <= r.port <= 65535:
+        log.warning("config: reader.port %d out of range 1024..65535; using %d", r.port,
+                    READER_DEFAULT_PORT)
+        r.port = READER_DEFAULT_PORT
+    if r.max_chars < 0:
+        log.warning("config: reader.max_chars %d is negative; using 0 (no limit)", r.max_chars)
+        r.max_chars = 0
+    ids: list[str] = []
+    for raw in r.extension_ids:
+        ext_id = raw.strip().lower()
+        if not EXTENSION_ID_RE.match(ext_id):
+            log.warning("config: reader.extension_ids entry %r is not a Chrome extension id "
+                        "(32 letters a..p); ignored", raw)
+        elif ext_id not in ids:
+            ids.append(ext_id)
+    r.extension_ids = ids
 
 
 def config_to_dict(cfg: Config) -> dict:

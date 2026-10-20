@@ -14,10 +14,11 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Any, Callable
 
 from . import docload, model_setup
-from .config import (ENGINES, EXPORT_FORMATS, LANGUAGE_MODES, MCP_DEFAULT_PORT, MP3_BITRATES,
-                     ROOT, SUPERTONIC_LANGUAGE_NAMES, SUPERTONIC_LANGUAGES, SUPERTONIC_PREFIX,
-                     SUPERTONIC_STEPS_RANGE, SUPERTONIC_VOICES, Config, export_folder,
-                     is_supertonic_voice, snap_bitrate)
+from .config import (ENGINES, EXPORT_FORMATS, EXTENSION_ID_RE, LANGUAGE_MODES, MCP_DEFAULT_PORT,
+                     MP3_BITRATES, READER_DEFAULT_PORT, ROOT, SUPERTONIC_LANGUAGE_NAMES,
+                     SUPERTONIC_LANGUAGES, SUPERTONIC_PREFIX, SUPERTONIC_STEPS_RANGE,
+                     SUPERTONIC_VOICES, Config, export_folder, is_supertonic_voice,
+                     resolve_path, snap_bitrate)
 from .export import ExportBusy, ExportCancelled, ExportProgress, ExportRequest
 from .hotkeys import parse_chord
 from .tts import voice_label
@@ -29,10 +30,11 @@ except ImportError:  # pragma: no cover
 
 log = logging.getLogger(__name__)
 
-TABS = ("general", "voice", "export", "kokoro", "supertonic", "mcp", "about")
+TABS = ("general", "voice", "export", "kokoro", "supertonic", "mcp", "reader", "about")
 TAB_TITLES = {"general": "General", "voice": "Voice", "export": "Export", "kokoro": "Kokoro",
-              "supertonic": "Supertonic", "mcp": "Agents (MCP)", "about": "About"}
-SCROLL_TABS = ("voice", "export")
+              "supertonic": "Supertonic", "mcp": "Agents (MCP)", "reader": "Reader",
+              "about": "About"}
+SCROLL_TABS = ("voice", "export", "reader")
 PILL_POSITIONS = ("top", "bottom")
 SAMPLE_TEXT = ("Hello! This is how VibeTTS sounds. Select any text, press the hotkey, "
                "and I will read it aloud.")
@@ -77,6 +79,36 @@ def mcp_command(url: str) -> str:
 
 def mcp_snippet(url: str) -> str:
     return '{"mcpServers": {"vibetts": {"type": "http", "url": "' + url + '"}}}'
+
+
+READER_NOTE = ("Reads books (.epub, .txt) in your browser and plays them on this PC. "
+               "Listens on 127.0.0.1 only.")
+EXTENSION_STEPS = ("To read web pages aloud with the Chrome extension: 1. open chrome://extensions, "
+                   "2. turn on Developer mode, 3. choose Load unpacked and pick the extension "
+                   "folder.")
+ASSOC_NOTE = ("Windows does not let an app make itself the default. After registering, right-click "
+              "a book in Explorer, choose Open with > VibeTTS > Always, or pick the default app "
+              "yourself.")
+ASSOC_EXTS = (".epub", ".txt")
+
+
+def reader_url(port: Any) -> str:
+    return f"http://127.0.0.1:{str(port).strip() or READER_DEFAULT_PORT}/"
+
+
+def parse_extension_ids(text: Any) -> list[str]:
+    """'id1, id2' -> ['id1', 'id2'] (lower case, no duplicates); ValueError for a bad id."""
+    ids: list[str] = []
+    for part in str(text or "").replace(";", ",").replace(" ", ",").split(","):
+        ext_id = part.strip().lower()
+        if not ext_id:
+            continue
+        if not EXTENSION_ID_RE.match(ext_id):
+            raise ValueError(f"Extension id {part.strip()!r} is not valid "
+                             "(32 letters a..p, as shown on chrome://extensions)")
+        if ext_id not in ids:
+            ids.append(ext_id)
+    return ids
 
 
 def estimate_text(text: str, speed: float = 1.0) -> str:
@@ -171,6 +203,11 @@ def form_from_config(cfg: Config) -> dict[str, Any]:
         "mcp_enabled": bool(cfg.mcp.enabled),
         "mcp_port": str(cfg.mcp.port),
         "mcp_max_chars": str(cfg.mcp.max_chars),
+        "reader_enabled": bool(cfg.reader.enabled),
+        "reader_port": str(cfg.reader.port),
+        "reader_library_folder": cfg.reader.library_folder,
+        "reader_max_chars": str(cfg.reader.max_chars),
+        "reader_extension_ids": ", ".join(cfg.reader.extension_ids),
     }
 
 
@@ -272,6 +309,14 @@ def config_from_form(base: Config, form: dict[str, Any]) -> Config:
     cfg.mcp.enabled = bool(form.get("mcp_enabled"))
     cfg.mcp.port = _int(form, "mcp_port", "MCP port", 1024, 65535)
     cfg.mcp.max_chars = _int(form, "mcp_max_chars", "MCP maximum characters", 0)
+    cfg.reader.enabled = bool(form.get("reader_enabled"))
+    cfg.reader.port = _int(form, "reader_port", "Reader port", 1024, 65535)
+    folder = str(form.get("reader_library_folder", "")).strip()
+    if not folder:
+        raise ValueError("Library folder must not be empty")
+    cfg.reader.library_folder = folder
+    cfg.reader.max_chars = _int(form, "reader_max_chars", "Reader maximum characters", 0)
+    cfg.reader.extension_ids = parse_extension_ids(form.get("reader_extension_ids", ""))
     return cfg
 
 
@@ -304,6 +349,15 @@ class SettingsHooks:
     mcp_status: Callable[[], dict] = lambda: {"enabled": False, "running": False, "url": "",
                                               "error": ""}
     open_folder: Callable[[Path], None] = lambda path: None
+    # book reader, Chrome extension and "Open with" registration (VTF-07)
+    reader_status: Callable[[], dict] = lambda: {"enabled": False, "running": False, "url": "",
+                                                 "error": ""}
+    open_reader: Callable[[], None] = lambda: None
+    extension_folder: Callable[[], Path] = lambda: ROOT / "extension"
+    registered_exts: Callable[[], list[str]] = lambda: []
+    register_files: Callable[[list[str]], None] = lambda exts: None
+    unregister_files: Callable[[], None] = lambda: None
+    open_default_apps: Callable[[], None] = lambda: None
     # Supertonic model files (download / delete run from the Supertonic tab)
     supertonic_dir: Callable[[], Path] = lambda: ROOT / "models" / "supertonic-3"
     supertonic_present: Callable[[], bool] = lambda: False
@@ -442,6 +496,7 @@ class SettingsWindow:
             self._safe_ui(self._load_voices)
             self._safe_ui(self._refresh_export)
             self._safe_ui(self._refresh_mcp)
+            self._safe_ui(self._refresh_reader)
 
     def _follow_config(self) -> None:
         form = form_from_config(self.hooks.get_config())
@@ -551,6 +606,7 @@ class SettingsWindow:
         self._build_kokoro(frames["kokoro"])
         self._build_supertonic(frames["supertonic"])
         self._build_mcp(frames["mcp"])
+        self._build_reader(frames["reader"])
         self._build_about(frames["about"])
         top.update_idletasks()
         self._win32_polish()
@@ -1123,6 +1179,127 @@ class SettingsWindow:
             text = "Off"
         self._mcp_status.configure(text=text)
 
+    # -- Reader ------------------------------------------------------------------
+    def _build_reader(self, f: ttk.Frame) -> None:
+        box = ttk.LabelFrame(f, text="Book reader", padding=10)
+        box.pack(fill="x")
+        self._check(box, 0, "Turn on the book reader and the Chrome extension API", "reader_enabled")
+        self._entry(box, 1, "Port", "reader_port", 8, hint="1024 .. 65535")
+        self._entry(box, 2, "Library folder", "reader_library_folder", 36)
+        ttk.Button(box, text="Open folder", command=self._reader_open_library).grid(
+            row=2, column=2, sticky="w", padx=8)
+        self._entry(box, 3, "Maximum characters", "reader_max_chars", 10,
+                    hint="per read request, 0 = no limit")
+        row = ttk.Frame(box)
+        row.grid(row=4, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        self._reader_open_btn = ttk.Button(row, text="Open reader", command=self._safe_call(
+            lambda: self.hooks.open_reader()))
+        self._reader_open_btn.pack(side="left")
+        self._reader_status = ttk.Label(row, text="", wraplength=440, justify="left")
+        self._reader_status.pack(side="left", padx=10)
+        ttk.Label(box, text=READER_NOTE, foreground="gray", wraplength=580,
+                  justify="left").grid(row=5, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+        ext = ttk.LabelFrame(f, text="Chrome extension", padding=10)
+        ext.pack(fill="x", pady=(10, 0))
+        self._entry(ext, 0, "Allowed extension ids", "reader_extension_ids", 40)
+        ttk.Label(ext, text="Comma separated; the default is the id of the bundled extension.",
+                  foreground="gray", wraplength=580, justify="left").grid(
+            row=1, column=0, columnspan=3, sticky="w")
+        ttk.Button(ext, text="Open extension folder", command=self._safe_call(
+            lambda: self.hooks.open_folder(self.hooks.extension_folder()))).grid(
+            row=2, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        ttk.Label(ext, text=EXTENSION_STEPS, foreground="gray", wraplength=580,
+                  justify="left").grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+        files = ttk.LabelFrame(f, text="Open books with VibeTTS", padding=10)
+        files.pack(fill="x", pady=(10, 0))
+        # UI state only (not config keys): which extensions Register adds
+        self._assoc_vars = {ext_: tk.BooleanVar(value=ext_ == ".epub") for ext_ in ASSOC_EXTS}
+        row = ttk.Frame(files)
+        row.pack(anchor="w")
+        for ext_, var in self._assoc_vars.items():
+            ttk.Checkbutton(row, text=ext_, variable=var).pack(side="left", padx=(0, 12))
+        row = ttk.Frame(files)
+        row.pack(anchor="w", pady=(8, 0))
+        ttk.Button(row, text="Register", command=self._assoc_register).pack(side="left")
+        ttk.Button(row, text="Remove", command=self._assoc_remove).pack(side="left", padx=8)
+        ttk.Button(row, text="Choose default app…", command=self._safe_call(
+            lambda: self.hooks.open_default_apps())).pack(side="left")
+        self._assoc_status = ttk.Label(files, text="", wraplength=580, justify="left")
+        self._assoc_status.pack(anchor="w", pady=(6, 0))
+        ttk.Label(files, text=ASSOC_NOTE, foreground="gray", wraplength=580,
+                  justify="left").pack(anchor="w", pady=(6, 0))
+        self._vars["reader_port"].trace_add("write", lambda *_: self._safe_ui(self._refresh_reader))
+        self._vars["reader_enabled"].trace_add("write",
+                                               lambda *_: self._safe_ui(self._refresh_reader))
+        self._refresh_reader(init_ticks=True)
+
+    def _reader_open_library(self) -> None:
+        folder = str(self._vars["reader_library_folder"].get()).strip() or "library"
+        self._safe_call(lambda: self.hooks.open_folder(resolve_path(folder)))()
+
+    def _refresh_reader(self, init_ticks: bool = False) -> None:
+        url = reader_url(self._vars["reader_port"].get())
+        try:
+            st = dict(self.hooks.reader_status())
+        except Exception:
+            log.debug("reader status failed", exc_info=True)
+            st = {}
+        wanted = bool(self._vars["reader_enabled"].get())
+        if st.get("running"):
+            text = f"Running at {st.get('url') or url}"
+        elif st.get("error"):
+            text = f"Error: {st['error']}"
+        elif wanted and not st.get("enabled"):
+            text = "Enabled \u2014 save to start"
+        elif st.get("enabled"):
+            text = "Starting…"
+        else:
+            text = "Off"
+        self._reader_status.configure(text=text)
+        self._reader_open_btn.configure(state="normal" if st.get("running") else "disabled")
+        self._refresh_assoc(init_ticks)
+
+    def _refresh_assoc(self, init_ticks: bool = False) -> None:
+        try:
+            exts = list(self.hooks.registered_exts())
+        except Exception:
+            log.debug("registered_exts failed", exc_info=True)
+            exts = []
+        if init_ticks and exts:
+            for ext_, var in self._assoc_vars.items():
+                var.set(ext_ in exts)
+        self._assoc_status.configure(
+            text=f"Registered for {', '.join(exts)}" if exts else "Not registered")
+
+    def _assoc_register(self) -> None:
+        exts = [ext_ for ext_, var in self._assoc_vars.items() if var.get()]
+        if not exts:
+            self._assoc_status.configure(text="Tick .epub and/or .txt first.")
+            return
+        self._assoc_run(lambda: self.hooks.register_files(exts))
+
+    def _assoc_remove(self) -> None:
+        self._assoc_run(lambda: self.hooks.unregister_files())
+
+    def _assoc_run(self, action: Callable[[], None]) -> None:
+        def run() -> None:
+            error = ""
+            try:
+                action()
+            except Exception as e:  # noqa: BLE001
+                log.exception("file association change failed")
+                error = str(e) or e.__class__.__name__
+
+            def finish() -> None:
+                self._refresh_assoc()
+                if error:
+                    self._assoc_status.configure(text=f"Failed: {error}")
+            self._post(lambda: self._safe_ui(finish))
+
+        self._spawn(run)
+
     # -- Kokoro -----------------------------------------------------------------
     def _build_kokoro(self, f: ttk.Frame) -> None:
         # shown only while the active model or the voices file is missing
@@ -1561,6 +1738,7 @@ class SettingsWindow:
         self._refresh_supertonic()
         self._refresh_export()
         self._refresh_mcp()
+        self._refresh_reader(init_ticks=True)
         try:
             self._device_combo.configure(values=["", *self.hooks.output_devices()])
         except Exception:

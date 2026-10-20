@@ -46,3 +46,12 @@ mp3_bitrate = 64             # 32 | 48 | 64 | 96 | 128 | 160 | 192 | 256 | 320 k
 enabled = false              # local MCP server so AI agents can export audio (opt-in)
 port = 7723                  # 1024 .. 65535, listens on 127.0.0.1 only
 max_chars = 200000           # longest text one tool call may read; 0 = no limit
+
+[reader]
+enabled = true               # local book reader and Chrome extension API (127.0.0.1 only)
+port = 7724                  # 1024 .. 65535
+library_folder = "library"   # imported books; relative paths are next to the app
+max_chars = 500000           # longest text one read request may carry; 0 = no limit
+# Chrome extensions allowed to call the API (the id shown on chrome://extensions).
+# The default is the id of the extension in the "extension" folder.
+extension_ids = ["injaiiefkhoimpkeandbjfbnnjddaceh"]
