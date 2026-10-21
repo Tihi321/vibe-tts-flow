@@ -1,6 +1,6 @@
 # VibeTTS
 
-Read selected text aloud on Windows with a local voice. Select text in any app, press **Alt+Win**, and it is spoken right away; press again (or **Esc**) to stop. Runs [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) (English) and [Supertonic 3](https://huggingface.co/Supertone/supertonic-3) (31 languages, including Croatian) on the CPU through ONNX Runtime: no GPU, no account, no cloud.
+Read selected text aloud on Windows with a local voice. Select text in any app, press **Alt+Win**, and it is spoken right away; press again (or **Esc**) to stop. Runs [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) (English, Spanish, French, Hindi, Italian, Portuguese) and [Supertonic 3](https://huggingface.co/Supertone/supertonic-3) (31 languages, including Croatian) on the CPU through ONNX Runtime: no GPU, no account, no cloud.
 
 Sister app of [VibeFlow](https://github.com/Tihi321/vibe-whisper-flow) (voice → text). VibeTTS goes the other way (text → voice); text translation is planned next.
 
@@ -8,7 +8,7 @@ Sister app of [VibeFlow](https://github.com/Tihi321/vibe-whisper-flow) (voice �
 
 - System-wide hotkey: reads the current selection, falls back to the clipboard when nothing is selected
 - Streams sentence by sentence: the first audio plays about 0.4 s after the text is grabbed, the rest is generated while it speaks (Kokoro runs ~8x faster than real time on a Ryzen AI Max+ 395)
-- Two engines, two profiles: **Kokoro** (English, 28 American and British voices) and **Supertonic 3** (31 languages, 10 voices F1..F5 / M1..M5). Text that looks English is read with your English profile, anything else with your other-language profile (default Croatian); a tray switch forces one of them
+- Two engines, one voice per language: **Kokoro** (English, Spanish, French, Hindi, Italian, Portuguese) and **Supertonic 3** (31 languages, 10 voices F1..F5 / M1..M5). The language of each read is detected from the text; a tray switch forces one language, and any language can be turned off
 - All audio is 44.1 kHz mono (Supertonic natively, Kokoro resampled up from 24 kHz)
 - Speed, pause between sentences, volume, output device
 - Export to an audio file (WAV or MP3, 44.1 kHz): type or paste text, or open a .txt, .md, .html, .docx, .epub or .pdf document (Settings > Export)
@@ -23,7 +23,7 @@ Sister app of [VibeFlow](https://github.com/Tihi321/vibe-whisper-flow) (voice �
 
 - Windows 10 / 11, Python 3.11+ (to run from source)
 - About 120 MB for the Kokoro int8 model and voices, downloaded from the Settings window
-- Optional: about 400 MB for Supertonic 3 (other languages, and English if you prefer it), downloaded from **Settings > Supertonic**
+- Optional: about 400 MB for Supertonic 3 (most languages, and English if you prefer it), downloaded from **Settings > Supertonic**
 
 ## Install
 
@@ -36,7 +36,7 @@ pip install -r requirements.txt
 
 # model + voices into .\models (or use the Download button in Settings > Kokoro)
 python -m vibetts.model_setup            # add --model fp32 for the larger model
-python -m vibetts.model_setup --supertonic   # optional: Supertonic 3 (other languages), ~400 MB into .\models\supertonic-3
+python -m vibetts.model_setup --supertonic   # optional: Supertonic 3 (most languages), ~400 MB into .\models\supertonic-3
 ```
 
 ## Run
@@ -61,7 +61,7 @@ The file name's extension picks the format:
 - `.mp3`: the default, 44.1 kHz mono (MPEG-1 Layer III), 64 kbps by default, about 0.5 MB per minute. Bitrates: 32, 48, 64, 96, 128, 160, 192, 256 or 320 kbps.
 - `.wav`: 44.1 kHz 16-bit mono, about 5.3 MB per minute.
 
-In the **Language** box pick `Auto` (the same routing as the hotkey), `English` or one of the 30 other languages. The format, MP3 bitrate and default folder (`~\Documents\VibeTTS`) are saved in `[export]` in `config.toml`.
+In the **Language** box pick `Auto` (the same detection as the hotkey) or one of the 31 languages; the voice list then shows the voices that read it. The format, MP3 bitrate and default folder (`~\Documents\VibeTTS`) are saved in `[export]` in `config.toml`.
 
 The export runs in the background with a progress bar and **Cancel**; a cancelled or failed export leaves no file behind. Reading aloud has priority: if you press the hotkey while an export runs, the export pauses until the reading ends. Only one export runs at a time, whether it comes from the window or from an agent. Export ignores the playback volume.
 
@@ -82,10 +82,10 @@ The same setting as `.mcp.json`: `{"mcpServers": {"vibetts": {"type": "http", "u
 | `synthesize_to_file` | Turns `text` or a document `path` into a 44.1 kHz `.wav` / `.mp3` file. Optional: `output`, `format`, `voice`, `lang`, `speed`, `overwrite`. Returns the path, duration, size, voice and language |
 | `speak` | Reads text aloud on your speakers, like the hotkey, and replaces what is playing. Optional: `voice`, `lang`, `speed`. With `wait = true` it returns when it has finished |
 | `synthesize_batch` | Many short clips in one call: `items` = `[{text, output, voice?, lang?, speed?}]` (absolute `output` paths ending in `.wav` / `.mp3`), optional `overwrite`. The model is loaded once and stays loaded; up to 500 items; runs in the same one-at-a-time export queue (it pauses while the app reads aloud). Returns one `{output, duration_s, ok, error}` per item; a failing item does not stop the others |
-| `list_voices` | `voices` (`id`, `label`, `engine`, `languages`), the 31 `languages` (`code`, `name`), the configured `english` and `other` profiles, `language_mode` and `supertonic_installed` |
+| `list_voices` | `voices` (`id`, `label`, `engine`, `languages`), the 31 `languages` (`code`, `name`), the configured `language_voices` (language code -> voice, empty = Off), `read_language` and `supertonic_installed` |
 | `stop` | Stops reading; `cancel_export = true` also cancels a running export |
 
-`voice` takes a Kokoro id (`af_heart`, English only) or a Supertonic id (`supertonic:F1` .. `supertonic:M5`, needs the Supertonic download). `lang` is one of the 31 Supertonic codes (`en`, `hr`, `de`, `sl`, ...). Leave both out to get what the hotkey would do: English text is read with the English profile, anything else with the other-language profile. A `lang` without a `voice` picks the profile voice (`en` the English one, any other code the other-language voice in that language); a Kokoro `voice` with a non-English `lang` is an error.
+`voice` takes a Kokoro id (`af_heart`, each reads one language: `a*`/`b*` English, `e*` Spanish, `f*` French, `h*` Hindi, `i*` Italian, `p*` Portuguese) or a Supertonic id (`supertonic:F1` .. `supertonic:M5`, needs the Supertonic download). `lang` is one of the 31 Supertonic codes (`en`, `hr`, `de`, `sl`, ...). Leave both out to get what the hotkey would do: the language is detected from the text and read with that language's configured voice. A `lang` without a `voice` uses that language's configured voice; a Kokoro `voice` without `lang` reads its own language; a Kokoro `voice` with another `lang` is an error.
 
 **Security.** The server is off by default.
 
@@ -143,8 +143,8 @@ Only the extension with an id in `[reader] extension_ids` and pages served by th
 | Select text, press **Alt+Win** | Reads the selection aloud |
 | Press **Alt+Win** with nothing selected | Reads the clipboard text (turn off in Settings) |
 | **Alt+Win** or **Esc** while reading | Stops |
-| Tray > **Language** | `Auto` (detect English), `English` (always the English profile) or the other language (always its profile) |
-| Tray > **English voice** / **Croatian voice** (named after your other language) / **Speed** | Change the voices or speed (applies to the next read) |
+| Tray > **Language** | `Auto (detect language)` or `Always <language>` for each enabled language |
+| Tray > **Voices** / **Speed** | **Voices** has a submenu per enabled language (Off, its Kokoro voices, Supertonic voices); changes apply to the next read |
 
 Pill colours: blue animated dots = starting / loading the model, violet = reading, green = done, red text = error.
 
@@ -181,28 +181,25 @@ VibeTTS waits until you release the hotkey (and any other modifier), saves the c
 - **Clipboard history (Win+V)** keeps a copy of the selected text, because the app itself does the copy. The restore of your previous clipboard is marked so it does not appear in the history again.
 - If an app is slow to answer, raise `[selection].copy_timeout_ms`.
 
-## Engines, profiles and language detection
+## Engines, per-language voices and language detection
 
 | Engine | Languages | Voices | Size | Speed |
 |---|---|---|---|---|
-| Kokoro-82M | English (American, British) | 28 (`af_heart`, `bf_emma`, `am_michael`, `bm_george` ...) | 92 MB (int8) | ~8x real time |
+| Kokoro-82M | English (American, British), Spanish, French, Hindi, Italian, Portuguese (Brazilian) | 41 (`af_heart`, `bf_emma`, `ef_dora`, `ff_siwis`, `pf_dora` ...) | 92 MB (int8) | ~8x real time |
 | Supertonic 3 | 31: English, Croatian, German, Slovenian, Spanish, French, Russian, Japanese ... | 10: F1..F5, M1..M5 | ~400 MB | ~11x real time |
 
-You set up two **profiles** in Settings > Voice (or `[speech]` in `config.toml`):
+Every language has its own voice, set in **Settings > Voice** (or `[speech.language_voices]` in `config.toml`): pick a language, then its engine (Supertonic, Kokoro where it reads that language, or Off) and voice. English defaults to Kokoro `af_heart`, every other language to Supertonic `F1`. A language set to **Off** is never read and never detected.
 
-- **English profile:** engine Kokoro (default, voice `af_heart`) or Supertonic (voice F1..M5).
-- **Other-language profile:** a Supertonic language (default Croatian, `hr`) and a Supertonic voice.
+Every read decides its language once, up front, from the whole text, among the enabled languages (all 31 by default). Detection is local and offline ([py3langid](https://github.com/adbar/py3langid)); very short text (under 4 words) counts as English, so a Croatian name in an English sentence does not switch voices. **Read** in Settings > Voice (or tray > **Language**) sets `Auto (detect language)` or `Always <language>`. Without the Supertonic download, a language falls back to its Kokoro default voice, or Kokoro English, with a hint to download Supertonic.
 
-Every read decides once, up front: text that **looks English** uses the English profile, anything else the other-language profile. The guess is cheap and local: letters outside the Latin script or non-English diacritics (č ć š ž ä ö ü é ñ ...) mean "not English", otherwise the share of common English function words decides; very short or ambiguous text counts as English, so a Croatian name inside an English sentence does not switch voices. Croatian typed without diacritics is still caught when the text is long enough. Tray > **Language** (or Settings > Voice > Language) forces one profile: `Auto`, `English` or the other language. Without the Supertonic download, a read that needs it falls back to your Kokoro English voice, with a hint to download Supertonic.
-
-Pick voices in the tray or Settings > Voice. `af_heart` (American, female) is the default and the best rated Kokoro voice; `af_bella` and `bf_emma` are other well-rated English voices, `am_michael` and `bm_george` are good male ones. Only English Kokoro voices are offered; other languages are Supertonic's job.
+Pick voices in the tray (**Voices** > language) or Settings > Voice. `af_heart` (American, female) is the default and the best rated Kokoro voice; `af_bella` and `bf_emma` are other well-rated English voices, `am_michael` and `bm_george` are good male ones. Old `voice`, `english_*`, `other_*` and `language_mode` settings are migrated automatically on the first start.
 
 | Kokoro model | Size | Speed | Notes |
 |---|---|---|---|
 | `int8` (default) | 92 MB | ~8x real time | Same speed, nearly the same sound |
 | `fp32` | 326 MB | ~8x real time | Original weights |
 
-Kokoro files come from the [kokoro-onnx](https://github.com/thewh1teagle/kokoro-onnx) release `model-files-v1.0` and live in `models\` next to the app. `preload = true` loads the model(s) your profiles need at startup (about 1 s each; the running app uses about 260 MB of RAM) so the first read starts at once.
+Kokoro files come from the [kokoro-onnx](https://github.com/thewh1teagle/kokoro-onnx) release `model-files-v1.0` and live in `models\` next to the app. `preload = true` loads the model(s) your language voices need at startup (about 1 s each; the running app uses about 260 MB of RAM) so the first read starts at once.
 
 **Supertonic.** Download it once in **Settings > Supertonic** (about 400 MB from [Supertone/supertonic-3](https://huggingface.co/Supertone/supertonic-3), into `models\supertonic-3`, progress bar, resumable, Cancel) or with `python -m vibetts.model_setup --supertonic`. The same tab sets the quality (4 to 16 steps, default 8: fewer is faster, more sounds better) and deletes the files again. The Supertonic 3 model is released under the OpenRAIL-M license; read its terms before using the audio commercially.
 
@@ -228,7 +225,7 @@ The model files are downloaded once into `build\models` and reused by later buil
 
 ## Getting the voice models from the app
 
-Supertonic has its own **Supertonic** tab with the same download, delete and status controls (see above). When the Kokoro model is missing, the Settings window opens on the **Kokoro** tab with a **Voice model not installed** panel: click **Download voice** (progress bar, Cancel). The tray menu also shows **Download voice model…** until the engines your profiles need are installed. The **Model files** list on the same tab downloads or deletes single files (int8, fp32, voices) and **Open folder** shows the models folder. After a download the model loads straight away; no restart is needed.
+Supertonic has its own **Supertonic** tab with the same download, delete and status controls (see above). When the Kokoro model is missing, the Settings window opens on the **Kokoro** tab with a **Voice model not installed** panel: click **Download voice** (progress bar, Cancel). The tray menu also shows **Download voice model…** until the engines your language voices need are installed. The **Model files** list on the same tab downloads or deletes single files (int8, fp32, voices) and **Open folder** shows the models folder. After a download the model loads straight away; no restart is needed.
 
 ## Permissions and caveats
 
@@ -245,8 +242,8 @@ Supertonic has its own **Supertonic** tab with the same download, delete and sta
 | Reads the wrong thing in a terminal | Select the text first; terminals only copy a selection |
 | No sound | Check Settings > Voice > Output device (blank = Windows default) and the log (`logs\vibetts.log`) |
 | "Download the voice model" | Settings > Kokoro > Download voice, or `python -m vibetts.model_setup` |
-| Croatian (or other) text is read by the English voice | Supertonic is not downloaded (Settings > Supertonic), or Tray > Language is set to `English` |
-| English text is read by the other-language voice | The text had too few common English words to be sure (or has many accented letters): set Tray > Language to `English` |
+| Croatian (or other) text is read by the English voice | Supertonic is not downloaded (Settings > Supertonic), or Tray > Language is set to `Always English` |
+| Text is read in the wrong language | Detection is a guess for short or mixed text: set Tray > Language to `Always <language>`, or turn unwanted languages Off in Settings > Voice |
 | Slow first read | Turn on "Load the model at startup" |
 
 ## Privacy
@@ -271,7 +268,8 @@ vibetts/
   fileassoc.py           "Open with VibeTTS" registration for .epub / .txt (HKCU)
   hotkeys.py             global hotkey listener (named bindings), chord parsing
   selection.py           copy the selection, snapshot and restore the clipboard
-  textprep.py            markdown cleanup, sentence chunking, English-or-not guess
+  langdetect.py          language detection (py3langid) among the enabled languages
+  textprep.py            markdown cleanup, sentence chunking
   tts.py                 Kokoro engine (soxr resampling to 44.1 kHz), streaming speaker, audio output, voice labels
   supertonic.py          Supertonic 3 engine (ONNX, 31 languages)
   model_setup.py         Kokoro and Supertonic model downloader (also a CLI)

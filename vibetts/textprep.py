@@ -190,6 +190,11 @@ _WORD = re.compile(r"[^\W\d_]+(?:['’][^\W\d_]+)?")
 EN_SHORT_WORDS = 4  # fewer words than this are too little to judge: counts as English
 
 
+def word_count(text: str) -> int:
+    """Number of words in `text` (letters only, as looks_english counts them)."""
+    return len(_WORD.findall(text))
+
+
 def _letter_kind(ch: str) -> int:
     """0 plain Latin (a-z), 1 Latin with a diacritic, 2 any other script."""
     o = ord(ch)

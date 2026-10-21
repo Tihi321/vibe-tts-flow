@@ -24,7 +24,10 @@ def test_round_trip_customised():
     cfg = Config()
     cfg.hotkey.read = "ctrl+shift+r"
     cfg.speech.model = "D:\\tts\\kokoro-v1.0.onnx"
-    cfg.speech.voice = "bf_emma"
+    cfg.speech.language_voices["en"] = "bf_emma"
+    cfg.speech.language_voices["es"] = "ef_dora"
+    cfg.speech.language_voices["de"] = ""
+    cfg.speech.read_language = "es"
     cfg.speech.speed = 1.35
     cfg.speech.sentence_pause = 0
     cfg.speech.device = "Headphones"
@@ -51,18 +54,22 @@ def test_custom_model_kept():
 
 def test_voice_display_string_parsed():
     form = form_from_config(Config())
-    form["voice"] = "bm_george  George (British English, male)"
-    assert config_from_form(Config(), form).speech.voice == "bm_george"
+    form["language_voices"] = {**form["language_voices"],
+                               "en": "bm_george  George (British English, male)"}
+    assert config_from_form(Config(), form).speech.language_voices["en"] == "bm_george"
+
+
+def _form_with(**voices):
+    form = form_from_config(Config())
+    form["language_voices"] = {**form["language_voices"], **voices}
+    return form
 
 
 @pytest.mark.parametrize("key,value", [
     ("hotkey_read", "ctrl+bogus"), ("speed", "3"), ("speed", "0.1"), ("volume", "1.5"),
     ("sentence_pause", "-1"), ("copy_timeout_ms", "10"), ("max_chars", "-1"),
-    ("pill_position", "left"), ("voice", ""), ("model", "bogus"),
-    ("voice", "supertonic:F1"), ("english_engine", "piper"),
-    ("english_supertonic_voice", "F9"), ("other_voice", "Z1"),
-    ("other_language", "en"), ("other_language", "Klingon"), ("other_language", ""),
-    ("language_mode", "always"), ("supertonic_steps", "3"), ("supertonic_steps", "17"),
+    ("pill_position", "left"), ("model", "bogus"), ("read_language", "Always Klingon"),
+    ("language_voices", "af_heart"), ("supertonic_steps", "3"), ("supertonic_steps", "17"),
     ("supertonic_steps", "x"),
 ])
 def test_invalid_values(key, value):
@@ -72,35 +79,66 @@ def test_invalid_values(key, value):
         config_from_form(Config(), form)
 
 
-def test_supertonic_keys_round_trip():
+def test_language_voices_round_trip():
     cfg = Config()
     form = form_from_config(cfg)
-    assert (form["english_engine"], form["english_supertonic_voice"], form["other_language"],
-            form["other_voice"], form["language_mode"], form["supertonic_steps"]) == (
-        "kokoro", "F1", "hr", "F1", "auto", "8")
-    cfg.speech.english_engine = "supertonic"
-    cfg.speech.english_supertonic_voice = "M3"
-    cfg.speech.other_language = "de"
-    cfg.speech.other_voice = "F5"
-    cfg.speech.language_mode = "other"
+    assert form["language_voices"] == cfg.speech.language_voices
+    assert form["language_voices"] is not cfg.speech.language_voices
+    assert (form["read_language"], form["supertonic_steps"]) == ("auto", "8")
+    cfg.speech.language_voices.update(en="supertonic:M3", es="ef_dora", de="", hr="supertonic:F5")
+    cfg.speech.read_language = "hr"
     cfg.speech.supertonic_steps = 12
     assert config_from_form(Config(), form_from_config(cfg)) == cfg
 
 
-def test_supertonic_form_accepts_names_and_prefixed_voices():
-    form = form_from_config(Config())
-    form.update(other_language="German", other_voice="supertonic:M2  M2 (Supertonic, male)",
-                english_supertonic_voice="supertonic:F4")
+def test_form_accepts_display_strings_and_labels():
+    form = _form_with(hr="supertonic:M2  Supertonic M2 (male)", es="ef_dora  Dora")
+    form["read_language"] = "Always Spanish"
     s = config_from_form(Config(), form).speech
-    assert (s.other_language, s.other_voice, s.english_supertonic_voice) == ("de", "M2", "F4")
+    assert (s.language_voices["hr"], s.language_voices["es"], s.read_language) == (
+        "supertonic:M2", "ef_dora", "es")
+
+
+def test_invalid_voice_for_language():
+    for lang, voice in (("hr", "af_heart"), ("es", "af_heart"), ("en", "ef_dora"),
+                        ("en", "jf_alpha"), ("hr", "supertonic:F9"), ("hr", "bogus")):
+        with pytest.raises(ValueError, match="cannot read that language"):
+            config_from_form(Config(), _form_with(**{lang: voice}))
+
+
+def test_all_languages_off_and_read_must_be_on():
+    form = form_from_config(Config())
+    form["language_voices"] = {c: "" for c in SUPERTONIC_LANGUAGES}
+    with pytest.raises(ValueError, match="at least one language"):
+        config_from_form(Config(), form)
+    form = _form_with(de="")
+    form["read_language"] = "Always German"
+    with pytest.raises(ValueError, match="Read must be"):
+        config_from_form(Config(), form)
+    form["read_language"] = "auto"
+    assert config_from_form(Config(), form).speech.language_voices["de"] == ""
+
+
+def test_read_and_language_labels():
+    assert settings_ui.read_label("auto") == "Auto (detect language)"
+    assert settings_ui.read_label("hr") == "Always Croatian"
+    assert settings_ui.read_from_label("Always Croatian") == "hr"
+    assert settings_ui.read_from_label("Auto (detect language)") == "auto"
+    assert settings_ui.read_from_label("hr") == "hr"
+    assert settings_ui.language_label("hr", "supertonic:F1") == "Croatian"
+    assert settings_ui.language_label("hr", "") == "Croatian (off)"
+    assert settings_ui.language_from_label("Croatian (off)") == "hr"
+    assert settings_ui.language_from_label("Nope") == ""
+    assert list(settings_ui.LANGUAGE_CODES.values())[0] == "en"
+    names = list(settings_ui.LANGUAGE_CODES)
+    assert names[1:] == sorted(names[1:]) and len(names) == 31
 
 
 def test_invalid_messages_are_readable():
     for key, value, text in (("supertonic_steps", "3", "Quality steps must be at least 4"),
                              ("supertonic_steps", "17", "Quality steps must be at most 16"),
-                             ("english_engine", "x", "English engine must be one of"),
-                             ("other_voice", "Z1", "Other language voice must be one of"),
-                             ("language_mode", "x", "Language must be one of")):
+                             ("language_voices", None, "Voices must be"),
+                             ("read_language", "x", "Read must be")):
         form = form_from_config(Config())
         form[key] = value
         with pytest.raises(ValueError, match=text):
@@ -134,7 +172,7 @@ class Recorder:
             is_autostart=lambda: False, set_autostart=lambda v: None,
             set_show_on_start=lambda v: None, models_dir=lambda: Path("."),
             voices=lambda: list(self.voice_list),
-            output_devices=lambda: [], play_test=lambda c, t: None,
+            output_devices=lambda: [], play_test=lambda c, t, lang=None: None,
             stop=lambda: self.calls.append("stop"), open_logs=lambda: None,
             open_config=lambda: None, version="t",
             load_document=self._load_document, export_audio=self._export_audio,
@@ -221,70 +259,159 @@ def test_tabs(tk_root):
         "General", "Voice", "Export", "Kokoro", "Supertonic", "Agents (MCP)", "Reader", "About"]
 
 
-def test_voice_combo(tk_root):
+def pick_language(win, name):
+    win._sel_lang.set(name)
+
+
+def test_voices_section_defaults(tk_root):
     win = make_window(tk_root, Recorder())
-    values = list(win._voice_combo.cget("values"))
-    assert [v.split(" ")[0] for v in values] == ["af_heart", "bf_emma"]
-    assert win._vars["voice"].get().startswith("af_heart  Heart")
-    assert win._collect()["voice"] == "af_heart"
+    langs = list(win._lang_combo.cget("values"))
+    assert len(langs) == 31 and langs[0] == "English" and langs[1:] == sorted(langs[1:])
+    assert win._sel_lang.get() == "English" and win._sel_engine.get() == "Kokoro"
+    assert [v.split(" ")[0] for v in win._voice_combo.cget("values")] == ["af_heart", "bf_emma"]
+    assert win._sel_voice.get().startswith("af_heart  Heart")
+    assert win._collect()["language_voices"] == Config().speech.language_voices
+    assert win._collect()["read_language"] == "auto"
     assert not win._is_dirty()
 
 
-def test_voice_combos_per_engine(tk_root):
+def test_engine_choices_depend_on_language(tk_root):
     rec = Recorder()
-    rec.voice_list = ["af_heart", "supertonic:F1", "bf_emma", "supertonic:M1"]
+    rec.voice_list = ["af_heart", "supertonic:F1", "bf_emma", "ef_dora", "em_alex", "ff_siwis"]
     win = make_window(tk_root, rec)
-    # Kokoro combo lists only the Kokoro English voices
-    assert [v.split(" ")[0] for v in win._voice_combo.cget("values")] == ["af_heart", "bf_emma"]
-    assert list(win._en_st_combo.cget("values")) == list(SUPERTONIC_VOICES)
-    assert win._voice_combo.winfo_manager() == "grid"
-    assert win._en_st_combo.winfo_manager() == ""
-    win._vars["english_engine"].set("supertonic")
-    assert win._en_st_combo.winfo_manager() == "grid"
-    assert win._voice_combo.winfo_manager() == ""
-    assert list(win._other_voice_combo.cget("values")) == list(SUPERTONIC_VOICES)
-    assert list(win._other_combo.cget("values")) == sorted(
-        n for c, n in SUPERTONIC_LANGUAGE_NAMES.items() if c != "en")
-    assert len(win._other_combo.cget("values")) == 30
+    assert list(win._engine_combo.cget("values")) == ["Supertonic", "Kokoro", "Off"]
+    pick_language(win, "Croatian")  # Kokoro does not read Croatian
+    assert list(win._engine_combo.cget("values")) == ["Supertonic", "Off"]
+    assert win._sel_engine.get() == "Supertonic"
+    assert list(win._voice_combo.cget("values"))[0].startswith("supertonic:F1")
+    assert len(win._voice_combo.cget("values")) == len(SUPERTONIC_VOICES)
+    pick_language(win, "Spanish")
+    assert list(win._engine_combo.cget("values")) == ["Supertonic", "Kokoro", "Off"]
+    win._sel_engine.set("Kokoro")
+    assert win._lang_voices["es"] == "ef_dora"
+    # only Spanish Kokoro voices, from the loaded list
+    assert [v.split(" ")[0] for v in win._voice_combo.cget("values")] == ["ef_dora", "em_alex"]
+    win._sel_voice.set("em_alex  Alex")
+    assert win._lang_voices["es"] == "em_alex"
+    assert win._collect()["language_voices"]["es"] == "em_alex"
 
 
-def test_language_combo_labels_and_mapping(tk_root):
+def test_kokoro_voices_fall_back_to_the_default_when_none_are_loaded(tk_root):
     rec = Recorder()
+    rec.voice_list = []
     win = make_window(tk_root, rec)
-    assert win._vars["other_language"].get() == "Croatian"
-    assert list(win._language_combo.cget("values")) == [
-        "Auto (detect English)", "Always English", "Always Croatian"]
-    assert win._vars["language_mode"].get() == "Auto (detect English)"
-    win._vars["language_mode"].set("Always English")
-    assert win._collect()["language_mode"] == "english"
-    win._vars["language_mode"].set("Always Croatian")
-    assert win._collect()["language_mode"] == "other"
-    # the third label follows the other language, and the selected mode stays "other"
-    win._vars["other_language"].set("German")
-    assert list(win._language_combo.cget("values"))[2] == "Always German"
-    assert win._vars["language_mode"].get() == "Always German"
-    assert win._collect()["language_mode"] == "other" and win._collect()["other_language"] == "de"
+    pick_language(win, "French")
+    win._sel_engine.set("Kokoro")
+    assert win._lang_voices["fr"] == "ff_siwis"
+    assert [v.split(" ")[0] for v in win._voice_combo.cget("values")] == ["ff_siwis"]
+
+
+def test_engine_switch_keeps_the_supertonic_voice_of_the_row(tk_root):
+    win = make_window(tk_root, Recorder())
+    pick_language(win, "Spanish")
+    win._sel_voice.set("supertonic:M3  M3")
+    assert win._lang_voices["es"] == "supertonic:M3"
+    win._sel_engine.set("Kokoro")
+    assert win._lang_voices["es"] == "ef_dora"
+    win._sel_engine.set("Supertonic")
+    assert win._lang_voices["es"] == "supertonic:M3"
+    win._sel_engine.set("Off")
+    win._sel_engine.set("Supertonic")
+    assert win._lang_voices["es"] == "supertonic:M3"
+    pick_language(win, "German")  # a row never touched: F1
+    win._sel_engine.set("Off")
+    win._sel_engine.set("Supertonic")
+    assert win._lang_voices["de"] == "supertonic:F1"
+
+
+def test_off_disables_voice_combo_and_marks_the_language(tk_root):
+    win = make_window(tk_root, Recorder())
+    pick_language(win, "German")
+    assert state(win._voice_combo) == "readonly"
+    win._sel_engine.set("Off")
+    assert win._lang_voices["de"] == "" and state(win._voice_combo) == "disabled"
+    assert win._sel_voice.get() == "" and list(win._voice_combo.cget("values")) == []
+    assert win._sel_lang.get() == "German (off)"
+    assert "German (off)" in win._lang_combo.cget("values")
+    assert win._is_dirty()
+    pick_language(win, "English")  # the marker stays on the list, the combo is live again
+    assert state(win._voice_combo) == "readonly"
+    pick_language(win, "German (off)")
+    assert win._sel_engine.get() == "Off" and state(win._voice_combo) == "disabled"
+    win._sel_engine.set("Supertonic")
+    assert win._lang_voices["de"] == "supertonic:F1" and state(win._voice_combo) == "readonly"
+    assert "German" in win._lang_combo.cget("values")
+
+
+def test_last_language_cannot_be_turned_off(tk_root):
+    rec = Recorder()
+    rec.config.speech.language_voices = {c: "" for c in SUPERTONIC_LANGUAGES}
+    rec.config.speech.language_voices["hr"] = "supertonic:F2"
+    win = make_window(tk_root, rec)
+    pick_language(win, "Croatian")
+    assert win._sel_engine.get() == "Supertonic"
+    win._sel_engine.set("Off")
+    assert win._sel_engine.get() == "Supertonic" and win._lang_voices["hr"] == "supertonic:F2"
+    assert win._sel_lang.get() == "Croatian" and state(win._voice_combo) == "readonly"
+    assert "At least one language" in win._status.cget("text")
+    assert not win._is_dirty()
+    pick_language(win, "German (off)")
+    win._sel_engine.set("Supertonic")  # turning another on, then Croatian off, is fine
+    pick_language(win, "Croatian")
+    win._sel_engine.set("Off")
+    assert win._lang_voices["hr"] == ""
+
+
+def test_read_combo_lists_only_enabled_languages(tk_root):
+    rec = Recorder()
+    rec.config.speech.language_voices = {c: "" for c in SUPERTONIC_LANGUAGES}
+    rec.config.speech.language_voices.update(en="af_heart", hr="supertonic:F1")
+    win = make_window(tk_root, rec)
+    assert list(win._read_combo.cget("values")) == [
+        "Auto (detect language)", "Always English", "Always Croatian"]
+    pick_language(win, "German (off)")
+    win._sel_engine.set("Supertonic")
+    assert list(win._read_combo.cget("values")) == [
+        "Auto (detect language)", "Always English", "Always Croatian", "Always German"]
+    win._vars["read_language"].set("Always German")
+    assert win._collect()["read_language"] == "de"
+    assert win.save() is True
+    assert rec.applied[-1].speech.read_language == "de"
+
+
+def test_read_resets_to_auto_when_its_language_goes_off(tk_root):
+    rec = Recorder()
+    rec.config.speech.read_language = "de"
+    win = make_window(tk_root, rec)
+    assert win._vars["read_language"].get() == "Always German" and not win._is_dirty()
+    pick_language(win, "Italian")
+    win._sel_engine.set("Off")  # another language: Read stays
+    assert win._vars["read_language"].get() == "Always German"
+    pick_language(win, "German")
+    win._sel_engine.set("Off")
+    assert win._vars["read_language"].get() == "Auto (detect language)"
+    assert "Always German" not in win._read_combo.cget("values")
+    assert win._collect()["read_language"] == "auto"
     assert win.save() is True
     sp = rec.applied[-1].speech
-    assert (sp.language_mode, sp.other_language) == ("other", "de")
-    win._vars["language_mode"].set("Auto (detect English)")
-    win._vars["other_language"].set("French")
-    assert win._vars["language_mode"].get() == "Auto (detect English)"
+    assert (sp.read_language, sp.language_voices["de"], sp.language_voices["it"]) == (
+        "auto", "", "")
 
 
 def test_new_keys_save_and_dirty(tk_root):
     rec = Recorder()
     win = make_window(tk_root, rec)
     assert not win._is_dirty()
-    win._vars["english_engine"].set("supertonic")
+    win._sel_engine.set("Supertonic")
     assert win._is_dirty()
-    win._vars["english_supertonic_voice"].set("M4")
-    win._vars["other_voice"].set("F3")
+    win._sel_voice.set("supertonic:M4  M4")
+    pick_language(win, "Croatian")
+    win._sel_voice.set("supertonic:F3  F3")
     win._vars["supertonic_steps"].set("12")
     assert win.save() is True
     sp = rec.config.speech
-    assert (sp.english_engine, sp.english_supertonic_voice, sp.other_voice,
-            sp.supertonic_steps) == ("supertonic", "M4", "F3", 12)
+    assert (sp.language_voices["en"], sp.language_voices["hr"], sp.supertonic_steps) == (
+        "supertonic:M4", "supertonic:F3", 12)
     assert not win._is_dirty()
 
 
@@ -293,48 +420,68 @@ def test_supertonic_hint_follows_presence(tk_root):
     win = make_window(tk_root, rec)
     assert "Supertonic tab" in win._supertonic_hint.cget("text")
     # the Supertonic choices stay selectable
-    assert state(win._en_st_combo) == "readonly" and state(win._other_combo) == "readonly"
+    assert state(win._engine_combo) == "readonly" and state(win._voice_combo) == "readonly"
     rec.st_present = True
+    win.refresh()
+    assert win._supertonic_hint.cget("text") == ""
+    # nothing enabled uses Supertonic: no hint even when it is missing
+    rec.st_present = False
+    rec.config.speech.language_voices = {c: "" for c in SUPERTONIC_LANGUAGES}
+    rec.config.speech.language_voices["en"] = "af_heart"
     win.refresh()
     assert win._supertonic_hint.cget("text") == ""
 
 
-def test_refresh_follows_new_keys_unless_edited(tk_root):
+def test_refresh_follows_config_unless_edited(tk_root):
     rec = Recorder()
     win = make_window(tk_root, rec)
-    rec.config.speech.english_engine = "supertonic"  # tray changes
-    rec.config.speech.other_language = "fr"
-    rec.config.speech.language_mode = "other"
+    rec.config.speech.language_voices["en"] = "bf_emma"  # tray changes
+    rec.config.speech.language_voices["fr"] = ""
+    rec.config.speech.read_language = "es"
     win.refresh()
-    assert win._vars["english_engine"].get() == "supertonic"
-    assert win._vars["other_language"].get() == "French"
-    assert win._vars["language_mode"].get() == "Always French"
+    assert win._lang_voices["en"] == "bf_emma" and win._lang_voices["fr"] == ""
+    assert win._vars["read_language"].get() == "Always Spanish"
+    assert win._sel_voice.get().startswith("bf_emma")
     assert not win._is_dirty()
-    win._vars["other_voice"].set("M2")  # the user edits it
-    rec.config.speech.other_voice = "F5"
+    pick_language(win, "Spanish")  # the user edits a row
+    win._sel_engine.set("Kokoro")
+    rec.config.speech.language_voices["es"] = "supertonic:F5"
     win.refresh()
-    assert win._vars["other_voice"].get() == "M2" and win._is_dirty()
-
-
-def test_refresh_follows_tray_changes_unless_edited(tk_root):
-    rec = Recorder()
-    win = make_window(tk_root, rec)
-    rec.config.speech.voice = "bf_emma"  # changed from the tray
+    assert win._lang_voices["es"] == "ef_dora" and win._is_dirty()
+    win._vars["read_language"].set("Auto (detect language)")  # and Read
+    rec.config.speech.read_language = "de"
     win.refresh()
-    assert win._vars["voice"].get().startswith("bf_emma") and not win._is_dirty()
-    win._vars["voice"].set("af_heart")  # the user edits it
-    rec.config.speech.voice = "bf_emma"
-    win.refresh()
-    assert win._vars["voice"].get().startswith("af_heart")  # the edit is kept
+    assert win._vars["read_language"].get() == "Auto (detect language)"
 
 
 def test_save_round_trips_voice(tk_root):
     rec = Recorder()
     win = make_window(tk_root, rec)
-    win._vars["voice"].set("bf_emma  Emma (British English, female)")
+    win._sel_voice.set("bf_emma  Emma (British English, female)")
     assert win.save() is True
-    assert rec.applied[-1].speech.voice == "bf_emma"
+    assert rec.applied[-1].speech.language_voices["en"] == "bf_emma"
     assert not win._is_dirty()
+
+
+def test_play_previews_the_selected_language(tk_root):
+    rec = Recorder()
+    calls = []
+    hooks = rec.hooks()
+    hooks.play_test = lambda cfg, text, lang: calls.append((cfg.speech.language_voices[lang],
+                                                              text, lang))
+    win = SettingsWindow(tk_root, hooks, lambda fn: fn(), lambda fn: fn())
+    try:
+        win.show("voice")
+    except tk.TclError:
+        pytest.skip("settings window cannot be built headless")
+    pick_language(win, "Spanish")
+    win._sel_engine.set("Kokoro")
+    win._sample.set("Hola")
+    win._play_test()
+    assert calls == [("ef_dora", "Hola", "es")]
+    win._sel_engine.set("Off")
+    win._play_test()
+    assert len(calls) == 1 and "is off" in win._test_result.cget("text")
 
 
 def test_window_fits_a_1080p_screen(tk_root):
@@ -481,7 +628,7 @@ def test_supertonic_hooks_defaults():
     h = SettingsHooks(get_config=hooks.get_config, apply=hooks.apply, is_autostart=lambda: False,
                       set_autostart=lambda v: None, set_show_on_start=lambda v: None,
                       models_dir=lambda: Path("."), voices=lambda: [], output_devices=lambda: [],
-                      play_test=lambda c, t: None, stop=lambda: None, open_logs=lambda: None,
+                      play_test=lambda c, t, lang=None: None, stop=lambda: None, open_logs=lambda: None,
                       open_config=lambda: None)
     assert h.supertonic_present() is False and h.supertonic_changed() is None
     assert h.supertonic_dir().parts[-2:] == ("models", "supertonic-3")
@@ -595,6 +742,7 @@ def test_export_language_combo_and_mapping(tk_root, monkeypatch, tmp_path):
     rec, win = export_win(tk_root, monkeypatch, save_to=tmp_path / "a.wav")
     values = list(win._export_lang_combo.cget("values"))
     assert values[:2] == ["Auto", "English"] and len(values) == 32
+    assert values[2:] == sorted(values[2:])
     assert win._export_lang.get() == "Auto"
     win._export_set_text("Hi")
     for label, lang in (("Auto", None), ("English", "en"), ("Croatian", "hr"),

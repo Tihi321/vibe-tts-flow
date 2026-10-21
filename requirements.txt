@@ -11,4 +11,5 @@ kokoro-onnx
 pypdf>=4
 lameenc>=1.7
 soxr
+py3langid
 pytest

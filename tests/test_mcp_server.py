@@ -299,3 +299,15 @@ def test_descriptions_say_44k(server):
     text = INSTRUCTIONS + " ".join(t["description"] for t in tools)
     assert "44.1 kHz" in text and "24 kHz" not in text
     assert "Supertonic" in INSTRUCTIONS
+
+
+def test_voice_and_lang_text_describes_per_language_voices(server):
+    from vibetts.mcp_server import INSTRUCTIONS
+
+    tools = {t["name"]: t for t in rpc(server, "tools/list")["result"]["tools"]}
+    assert "Spanish" in INSTRUCTIONS and "other-language" not in INSTRUCTIONS
+    speak = tools["speak"]["inputSchema"]["properties"]
+    assert "en, es, fr, hi, it, pt" in speak["voice"]["description"]
+    assert "English only" not in speak["lang"]["description"]
+    assert "language_voices" in tools["list_voices"]["description"]
+    assert "other-language" not in tools["list_voices"]["description"]

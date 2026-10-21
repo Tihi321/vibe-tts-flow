@@ -8,8 +8,13 @@ from typing import Callable
 import pystray
 from PIL import Image, ImageDraw
 
-from .config import SUPERTONIC_PREFIX, is_supertonic_voice
-from .tts import LANG_LABELS
+from .config import (
+    READ_AUTO,
+    SUPERTONIC_LANGUAGE_NAMES,
+    SUPERTONIC_PREFIX,
+    is_supertonic_voice,
+    kokoro_voice_lang,
+)
 
 log = logging.getLogger(__name__)
 
@@ -29,8 +34,6 @@ class TrayHooks:
     model_missing: Callable[[], bool]
     download_model: Callable[[], None]
     voices: Callable[[], list[str]]
-    current_voice: Callable[[], str]
-    set_voice: Callable[[str], None]
     current_speed: Callable[[], float]
     set_speed: Callable[[float], None]
     is_autostart: Callable[[], bool]
@@ -41,14 +44,14 @@ class TrayHooks:
     reload_config: Callable[[], None]
     quit: Callable[[], None]
     open_export: Callable[[], None] = lambda: None         # Settings > Export
-    # language profiles: voices() lists the English Kokoro ids, then the Supertonic ids when
-    # installed; current_voice / set_voice are the English profile's voice
-    current_language_mode: Callable[[], str] = lambda: "auto"      # auto | english | other
-    set_language_mode: Callable[[str], None] = lambda mode: None
-    other_language_name: Callable[[], str] = lambda: "Other language"
+    # per-language voices: languages() lists the enabled language codes (English first),
+    # voices() the Kokoro ids, then the Supertonic ids when installed
+    languages: Callable[[], list[str]] = lambda: ["en"]
+    current_voice: Callable[[str], str] = lambda lang: ""         # voice id of a language
+    set_voice: Callable[[str, str], None] = lambda lang, voice: None  # voice "" = Off
+    read_language: Callable[[], str] = lambda: "auto"             # auto | a language code
+    set_read_language: Callable[[str], None] = lambda code: None
     supertonic_available: Callable[[], bool] = lambda: False
-    current_other_voice: Callable[[], str] = lambda: ""            # supertonic:F1
-    set_other_voice: Callable[[str], None] = lambda voice: None
     # book reader (VTF-07): the menu item shows only while the reader server runs
     reader_running: Callable[[], bool] = lambda: False
     open_reader: Callable[[], None] = lambda: None
@@ -104,70 +107,56 @@ class Tray:
         name = v[len(SUPERTONIC_PREFIX):]
         return f"{name} ({'female' if name[:1] == 'F' else 'male'})"
 
-    def _voice_menu(self) -> pystray.Menu | None:
-        """English voice: Kokoro voices grouped en-US / en-GB, then the Supertonic voices."""
+    def _languages(self) -> list[str]:
+        try:
+            return list(self.hooks.languages())
+        except Exception:
+            log.exception("languages failed")
+            return []
+
+    def _language_voice_menu(self, lang: str, voices: list[str]) -> pystray.Menu:
+        """Voices of one language: Off, its Kokoro voices, then the Supertonic voices."""
         h = self.hooks
         M = pystray.MenuItem
+
+        def item(v: str, text: str) -> pystray.MenuItem:
+            return M(text, self._action(h.set_voice, lang, v), radio=True,
+                     checked=self._checked(lambda v=v: h.current_voice(lang) == v))
+
+        items = [item("", "Off")]
+        for v in voices:
+            if is_supertonic_voice(v) or kokoro_voice_lang(v) != lang:
+                continue
+            gender = {"f": "female", "m": "male"}.get(v[1:2], "")
+            items.append(item(v, f"{v[3:].title()} ({gender})" if gender else v))
+        items += [item(v, self._supertonic_text(v)) for v in voices if is_supertonic_voice(v)]
+        return pystray.Menu(*items)
+
+    def _voice_menu(self) -> pystray.Menu | None:
+        """One submenu per enabled language (Off, Kokoro voices of that language, Supertonic)."""
         try:
-            voices = list(h.voices())
+            voices = list(self.hooks.voices())
         except Exception:
             log.exception("voices failed")
             voices = []
-        if not voices:
+        langs = self._languages()
+        if not langs:
             return None
-        groups: list[pystray.MenuItem] = []
-
-        def item(v: str, text: str) -> pystray.MenuItem:
-            return M(text, self._action(h.set_voice, v), radio=True,
-                     checked=self._checked(lambda v=v: h.current_voice() == v))
-
-        for prefix, label in LANG_LABELS.items():
-            items = []
-            for v in voices:
-                if is_supertonic_voice(v) or v[:1] != prefix:
-                    continue
-                gender = {"f": "female", "m": "male"}.get(v[1:2], "")
-                items.append(item(v, f"{v[3:].title()} ({gender})" if gender else v))
-            if items:
-                groups.append(M(label, pystray.Menu(*items)))
-        supertonic = [item(v, self._supertonic_text(v)) for v in voices if is_supertonic_voice(v)]
-        if supertonic:
-            groups.append(M("Supertonic", pystray.Menu(*supertonic)))
-        if not groups:
-            return None
-        return pystray.Menu(*groups)
-
-    def _other_voice_menu(self) -> pystray.Menu | None:
-        """Voices of the other-language profile: Supertonic F1..M5, when installed."""
-        h = self.hooks
         M = pystray.MenuItem
-        try:
-            if not h.supertonic_available():
-                return None
-            voices = [v for v in h.voices() if is_supertonic_voice(v)]
-        except Exception:
-            log.exception("other voices failed")
-            return None
-        if not voices:
-            return None
         return pystray.Menu(*[
-            M(self._supertonic_text(v), self._action(h.set_other_voice, v), radio=True,
-              checked=self._checked(lambda v=v: h.current_other_voice() == v))
-            for v in voices])
+            M(SUPERTONIC_LANGUAGE_NAMES.get(lang, lang), self._language_voice_menu(lang, voices))
+            for lang in langs])
 
     def _language_menu(self) -> pystray.Menu:
+        """Auto (detect), or always read in one enabled language."""
         h = self.hooks
         M = pystray.MenuItem
-        try:
-            other = h.other_language_name()
-        except Exception:
-            log.exception("language name failed")
-            other = "Other language"
-        modes = (("auto", "Auto (detect English)"), ("english", "English"), ("other", other))
+        modes = [(READ_AUTO, "Auto (detect language)")]
+        modes += [(c, f"Always {SUPERTONIC_LANGUAGE_NAMES.get(c, c)}") for c in self._languages()]
         return pystray.Menu(*[
-            M(label, self._action(h.set_language_mode, mode), radio=True,
-              checked=self._checked(lambda mode=mode: h.current_language_mode() == mode))
-            for mode, label in modes])
+            M(label, self._action(h.set_read_language, code), radio=True,
+              checked=self._checked(lambda code=code: h.read_language() == code))
+            for code, label in modes])
 
     def _menu_items(self):
         h = self.hooks
@@ -179,7 +168,6 @@ class Tray:
                          checked=chk(lambda s=s: abs(h.current_speed() - s) < 1e-6))
                        for s in SPEEDS]
         voice_menu = self._voice_menu()
-        other_menu = self._other_voice_menu()
         items = [
             M("Settings…", act(h.open_settings), default=True),
             M("Export audio…", act(h.open_export)),
@@ -194,13 +182,7 @@ class Tray:
         ]
         items.append(M("Language", self._language_menu()))
         if voice_menu is not None:
-            items.append(M("English voice", voice_menu))
-        if other_menu is not None:
-            try:
-                other_name = h.other_language_name()
-            except Exception:
-                other_name = "Other language"
-            items.append(M(f"{other_name} voice", other_menu))
+            items.append(M("Voices", voice_menu))
         items += [
             M("Speed", pystray.Menu(*speed_items)),
             pystray.Menu.SEPARATOR,

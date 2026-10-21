@@ -18,6 +18,10 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 from . import __version__
 from .config import (
+    DEFAULT_KOKORO_VOICES,
+    DEFAULT_LANGUAGE_VOICES,
+    DEFAULT_SUPERTONIC_VOICE,
+    READ_AUTO,
     ROOT,
     SUPERTONIC_LANGUAGE_NAMES,
     SUPERTONIC_LANGUAGES,
@@ -26,11 +30,14 @@ from .config import (
     Config,
     SpeechConfig,
     config_path,
+    enabled_languages,
     export_folder,
     is_supertonic_voice,
+    kokoro_voice_lang,
     load_config,
     resolve_path,
     save_config,
+    voice_fits_language,
 )
 from .logging_setup import setup_logging
 
@@ -100,8 +107,8 @@ def setup_tab(voice: str) -> str:
 
 
 class Route(NamedTuple):
-    """How one request is read: the engine, the voice id, the language ('en' or a Supertonic
-    code) and whether Supertonic was wanted but is not installed (Kokoro English reads it)."""
+    """How one request is read: the engine, the voice id, the language (one of the 31 codes)
+    and whether Supertonic was wanted but is not installed (a Kokoro voice reads it instead)."""
     engine: str
     voice: str
     lang: str
@@ -109,75 +116,82 @@ class Route(NamedTuple):
 
 
 def kokoro_voice_of(s: SpeechConfig) -> str:
-    from .tts import kokoro_voice_supported
-
-    return s.voice if kokoro_voice_supported(s.voice) else "af_heart"
-
-
-def english_voice_of(s: SpeechConfig) -> str:
-    """The voice id of the English profile."""
-    if s.english_engine == "supertonic":
-        return SUPERTONIC_PREFIX + s.english_supertonic_voice
-    return kokoro_voice_of(s)
+    """The Kokoro English voice: the English row's voice when it is a Kokoro one, else af_heart."""
+    voice = s.language_voices.get("en", "")
+    return voice if kokoro_voice_lang(voice) == "en" else DEFAULT_KOKORO_VOICES["en"]
 
 
-def other_voice_of(s: SpeechConfig) -> str:
-    """The voice id of the other-language profile."""
-    return SUPERTONIC_PREFIX + s.other_voice
+def voice_for_lang(s: SpeechConfig, lang: str) -> str:
+    """The voice id of `lang`'s row (the default when the row is Off or not valid)."""
+    voice = s.language_voices.get(lang, "")
+    if voice and voice_fits_language(voice, lang):
+        return voice
+    return DEFAULT_LANGUAGE_VOICES.get(lang, DEFAULT_SUPERTONIC_VOICE)
+
+
+def fallback_lang(s: SpeechConfig) -> str:
+    """The language of text that cannot be told apart: English if enabled, else the first one."""
+    langs = enabled_languages(s)
+    return "en" if "en" in langs or not langs else langs[0]
 
 
 def profile_lang(s: SpeechConfig, text: str) -> str:
-    """Language of the profile `text` goes to: 'en', or speech.other_language (decided once
-    per read by language_mode, and by looks_english in auto mode)."""
-    from .textprep import looks_english
+    """Language `text` is read in, decided once per read: speech.read_language when it is
+    fixed, else the language detected among the enabled ones."""
+    from .langdetect import detect_language
 
-    if s.language_mode == "english":
-        return "en"
-    if s.language_mode == "other":
-        return s.other_language
-    return "en" if looks_english(text) else s.other_language
+    langs = enabled_languages(s)
+    if s.read_language != READ_AUTO and s.read_language in langs:
+        return s.read_language
+    return detect_language(text, langs, fallback_lang(s))
 
 
 def route_for(s: SpeechConfig, text: str, lang: str | None = None,
               supertonic_ok: bool | None = None) -> Route:
-    """Engine, voice and language of one read. `lang` None: language_mode + looks_english pick
-    the profile; 'en' is the English profile; any other code is read with the other-language
-    voice in that language. Supertonic not installed: Kokoro English reads it (fell_back)."""
+    """Engine, voice and language of one read. `lang` None: read_language or detection picks
+    it; the voice is that language's row. Supertonic wanted but not installed: the Kokoro voice
+    of that language when Kokoro reads it, else Kokoro English (both with fell_back)."""
     lang = lang or profile_lang(s, text)
-    wants_supertonic = lang != "en" or s.english_engine == "supertonic"
-    if wants_supertonic and not (supertonic_present(s) if supertonic_ok is None
-                                 else supertonic_ok):
-        return Route("kokoro", kokoro_voice_of(s), "en", True)
-    if lang == "en":
-        voice = english_voice_of(s)
-        return Route("supertonic" if is_supertonic_voice(voice) else "kokoro", voice, "en")
-    return Route("supertonic", other_voice_of(s), lang)
+    voice = voice_for_lang(s, lang)
+    if not is_supertonic_voice(voice):
+        return Route("kokoro", voice, lang)
+    if supertonic_present(s) if supertonic_ok is None else supertonic_ok:
+        return Route("supertonic", voice, lang)
+    if lang in DEFAULT_KOKORO_VOICES:
+        return Route("kokoro", DEFAULT_KOKORO_VOICES[lang], lang, True)
+    return Route("kokoro", kokoro_voice_of(s), "en", True)
 
 
 def route_request(s: SpeechConfig, text: str, voice: str | None = None,
                   lang: str | None = None) -> Route:
-    """Route of an explicit request (export, MCP): without `voice` it is route_for. An explicit
-    voice is used as is; a Kokoro voice reads English only (ValueError for another `lang`)."""
+    """Route of an explicit request (export, MCP): without `voice` it is route_for. A Supertonic
+    voice reads any language; a Kokoro voice only its own (ValueError for another `lang`)."""
     if lang is not None and lang not in SUPERTONIC_LANGUAGES:
         raise ValueError(f"Unknown language '{lang}'")
     if not voice:
         return route_for(s, text, lang)
     if is_supertonic_voice(voice):
         return Route("supertonic", voice, lang or profile_lang(s, text))
-    if lang not in (None, "en"):
-        raise ValueError(f"The Kokoro voice '{voice}' reads English only; "
-                         f"use a supertonic: voice for language '{lang}'")
-    return Route("kokoro", voice, "en")
+    own = kokoro_voice_lang(voice)
+    if own is None:
+        raise ValueError(f"Unknown voice '{voice}'")
+    if lang not in (None, own):
+        raise ValueError(f"The Kokoro voice '{voice}' reads {SUPERTONIC_LANGUAGE_NAMES[own]} "
+                         f"only; use a supertonic: voice for language '{lang}'")
+    return Route("kokoro", voice, own)
+
+
+def _read_langs(s: SpeechConfig) -> list[str]:
+    """The languages a read can end up in: the fixed one, else every enabled one."""
+    langs = enabled_languages(s)
+    if s.read_language != READ_AUTO and s.read_language in langs:
+        return [s.read_language]
+    return langs or ["en"]
 
 
 def needed_voices(s: SpeechConfig) -> list[str]:
-    """The configured voices language_mode can pick: English profile, other profile or both."""
-    voices = []
-    if s.language_mode != "other":
-        voices.append(english_voice_of(s))
-    if s.language_mode != "english":
-        voices.append(other_voice_of(s))
-    return voices
+    """The distinct voices a read can use (all enabled languages, or the fixed one)."""
+    return list(dict.fromkeys(voice_for_lang(s, c) for c in _read_langs(s)))
 
 
 def missing_voices(s: SpeechConfig) -> list[str]:
@@ -185,19 +199,19 @@ def missing_voices(s: SpeechConfig) -> list[str]:
 
 
 def primary_voice(s: SpeechConfig) -> str:
-    """The voice the app mainly needs: the other profile's when forced, else the English one."""
-    return other_voice_of(s) if s.language_mode == "other" else english_voice_of(s)
+    """The voice the app mainly needs: the fixed language's, else the fallback language's."""
+    langs = _read_langs(s)
+    return voice_for_lang(s, langs[0] if len(langs) == 1 else fallback_lang(s))
 
 
 def profile_routes(s: SpeechConfig) -> list[Route]:
-    """Routes of the profiles language_mode can pick (what to preload)."""
+    """One route per distinct voice a read can use (what to preload)."""
     ok = supertonic_present(s)
-    routes = []
-    if s.language_mode != "other":
-        routes.append(route_for(s, "", "en", ok))
-    if s.language_mode != "english":
-        routes.append(route_for(s, "", s.other_language, ok))
-    return routes
+    routes: dict[str, Route] = {}
+    for lang in _read_langs(s):
+        route = route_for(s, "", lang, ok)
+        routes.setdefault(route.voice, route)
+    return list(routes.values())
 
 
 _fallback_warned = False
@@ -261,7 +275,7 @@ def run_export(engine: Any, s: SpeechConfig, req: ExportRequest, folder: Path,
 
 
 def voices_in_file(path: Path) -> list[str]:
-    """English voice names stored in voices-v1.0.bin (an .npz archive) without loading the model."""
+    """Supported Kokoro voice names stored in voices-v1.0.bin (an .npz archive) without loading the model."""
     import numpy as np
 
     from .tts import kokoro_voice_supported
@@ -353,7 +367,7 @@ class EngineHolder:
         self._supertonic = None
         engine = _st().SupertonicEngine(key[0], key[1])
         try:
-            engine.synth("Ready.", voice if is_supertonic_voice(voice) else other_voice_of(s),
+            engine.synth("Ready.", voice if is_supertonic_voice(voice) else DEFAULT_SUPERTONIC_VOICE,
                          1.0, "en")  # warm-up: first run is slower
         except Exception:
             log.warning("Supertonic warm-up failed", exc_info=True)
@@ -443,15 +457,12 @@ class TTSApp:
             model_missing=lambda: bool(missing_voices(self.cfg.speech)),
             download_model=self._download_missing,
             voices=self._voices,
-            current_voice=lambda: english_voice_of(self.cfg.speech),
+            languages=lambda: enabled_languages(self.cfg.speech),
+            current_voice=lambda lang: voice_for_lang(self.cfg.speech, lang),
             set_voice=self._set_voice,
-            current_language_mode=lambda: self.cfg.speech.language_mode,
-            set_language_mode=self._set_language_mode,
-            other_language_name=lambda: SUPERTONIC_LANGUAGE_NAMES.get(
-                self.cfg.speech.other_language, self.cfg.speech.other_language),
+            read_language=lambda: self.cfg.speech.read_language,
+            set_read_language=self._set_read_language,
             supertonic_available=lambda: supertonic_present(self.cfg.speech),
-            current_other_voice=lambda: other_voice_of(self.cfg.speech),
-            set_other_voice=self._set_other_voice,
             current_speed=lambda: self.cfg.speech.speed,
             set_speed=self._set_speed,
             is_autostart=autostart.is_enabled,
@@ -576,8 +587,8 @@ class TTSApp:
                 return
             if note_fallback(route):
                 self._hint = SUPERTONIC_HINT
-            log.info("reading %d chars in %d chunks with %s (%s)%s",
-                     sum(len(c.text) for c in chunks), len(chunks), route.voice, route.lang,
+            log.info("reading %d chars in %d chunks, language %s, voice %s%s",
+                     sum(len(c.text) for c in chunks), len(chunks), route.lang, route.voice,
                      " (from clipboard)" if grab.from_clipboard else "")
             self.speak(chunks, s, route.voice, route.lang)
         except Exception as e:
@@ -1010,13 +1021,14 @@ class TTSApp:
         save_config(cfg)
         return self.apply_config(cfg, "Settings saved")
 
-    def _play_test(self, cfg: Config, text: str) -> None:
+    def _play_test(self, cfg: Config, text: str, lang: str | None = None) -> None:
+        """Read the Settings sample; `lang` previews that language row (None: as a read does)."""
         from . import textprep
 
         chunks = textprep.prepare(text)
         if not chunks:
             return
-        route = route_for(cfg.speech, text)
+        route = route_for(cfg.speech, text, lang)
         if not voice_ready(cfg.speech, route.voice):
             raise RuntimeError(missing_message(route.voice))
         threading.Thread(target=self.speak, args=(chunks, cfg.speech, route.voice, route.lang),
@@ -1102,7 +1114,7 @@ class TTSApp:
         self.tray.set_enabled(self.enabled)
 
     def _voices(self) -> list[str]:
-        """English Kokoro voices (from the loaded engine, else read from the voices file), then
+        """Kokoro voices (from the loaded engine, else read from the voices file), then
         the Supertonic voices when they are installed."""
         out: list[str] = []
         loaded = self.engine.loaded
@@ -1119,31 +1131,29 @@ class TTSApp:
             out += supertonic_voice_ids()
         return out
 
-    def _set_voice(self, voice: str) -> None:
-        """Pick the English voice: a Kokoro id, or a supertonic: id (also switches the engine)."""
+    def _set_voice(self, lang: str, voice: str) -> None:
+        """Pick the voice of one language: a Kokoro id of that language, a supertonic: id, or ""
+        for Off (the last enabled language cannot be turned off)."""
         s = self.cfg.speech
-        if is_supertonic_voice(voice):
-            s.english_engine = "supertonic"
-            s.english_supertonic_voice = voice[len(SUPERTONIC_PREFIX):]
-            self._preload()
-        else:
-            s.english_engine, s.voice = "kokoro", voice
+        if lang not in SUPERTONIC_LANGUAGES:
+            return
+        if voice == "":
+            if enabled_languages(s) == [lang]:
+                return
+        elif not voice_fits_language(voice, lang):
+            return
+        s.language_voices[lang] = voice
+        if voice == "" and s.read_language == lang:
+            s.read_language = READ_AUTO
         self._save()
+        self._preload()
         self._voices_changed()
 
-    def _set_other_voice(self, voice: str) -> None:
-        if not is_supertonic_voice(voice):
+    def _set_read_language(self, code: str) -> None:
+        """Language menu: "auto" (detect) or an enabled language code (always read in it)."""
+        if code != READ_AUTO and code not in enabled_languages(self.cfg.speech):
             return
-        self.cfg.speech.other_voice = voice[len(SUPERTONIC_PREFIX):]
-        self._save()
-        self._voices_changed()
-
-    def _set_language_mode(self, mode: str) -> None:
-        from .config import LANGUAGE_MODES
-
-        if mode not in LANGUAGE_MODES:
-            return
-        self.cfg.speech.language_mode = mode
+        self.cfg.speech.read_language = code
         self._save()
         self._preload()
         self._voices_changed()
@@ -1194,8 +1204,10 @@ class AgentBridge:
             raise ToolError(MISSING_MODEL)
         if voice not in self.app._voices():
             raise ToolError(f"Unknown voice '{voice}'. Call list_voices to get the valid ids.")
-        if lang not in (None, "en"):
-            raise ToolError(f"The Kokoro voice '{voice}' reads English only; use a supertonic: "
+        own = kokoro_voice_lang(voice)
+        if lang not in (None, own):
+            raise ToolError(f"The Kokoro voice '{voice}' reads "
+                            f"{SUPERTONIC_LANGUAGE_NAMES.get(own, own)} only; use a supertonic: "
                             f"voice for language '{lang}'.")
 
     def list_voices(self) -> dict:
@@ -1207,12 +1219,12 @@ class AgentBridge:
             supertonic = is_supertonic_voice(v)
             voices.append({"id": v, "label": voice_label(v),
                            "engine": "supertonic" if supertonic else "kokoro",
-                           "languages": list(SUPERTONIC_LANGUAGES) if supertonic else ["en"]})
+                           "languages": (list(SUPERTONIC_LANGUAGES) if supertonic
+                                         else [kokoro_voice_lang(v) or "en"])})
         return {"voices": voices,
                 "languages": [{"code": c, "name": n} for c, n in SUPERTONIC_LANGUAGE_NAMES.items()],
-                "english": {"engine": s.english_engine, "voice": english_voice_of(s)},
-                "other": {"language": s.other_language, "voice": other_voice_of(s)},
-                "language_mode": s.language_mode,
+                "language_voices": dict(s.language_voices),
+                "read_language": s.read_language,
                 "supertonic_installed": supertonic_present(s)}
 
     def synthesize_batch(self, args: dict) -> dict:
@@ -1476,7 +1488,7 @@ def run_mcp_only(cfg: Config, port: int | None = None) -> int:
 def say(cfg: Config, text: str, out: str | None = None, title: str = "",
         markdown: bool | None = None) -> int:
     """Speak `text` (or write it to an audio file, WAV/MP3 by extension) without the tray,
-    routed like the hotkey (English profile or other-language profile); for testing and
+    routed like the hotkey (detected or fixed language, that language's voice); for testing and
     scripts."""
     from . import textprep
     from .export import ExportRequest
@@ -1621,9 +1633,9 @@ def main(argv: list[str] | None = None) -> int:
             inst = None
             return 0
         cfg = load_config()
-        log.info("effective hotkey=%s english=%s other=%s/%s mode=%s speed=%s", cfg.hotkey.read,
-                 english_voice_of(cfg.speech), cfg.speech.other_language,
-                 other_voice_of(cfg.speech), cfg.speech.language_mode, cfg.speech.speed)
+        log.info("effective hotkey=%s read_language=%s languages=%d primary=%s speed=%s",
+                 cfg.hotkey.read, cfg.speech.read_language,
+                 len(enabled_languages(cfg.speech)), primary_voice(cfg.speech), cfg.speech.speed)
         TTSApp(cfg, start_hidden=args.hidden, instance=inst,
                open_path=str(Path(args.open).resolve()) if args.open else None).run()
         return 0

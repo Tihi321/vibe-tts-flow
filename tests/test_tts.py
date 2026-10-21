@@ -150,9 +150,15 @@ def test_voice_helpers():
     assert voice_lang("af_heart") == "en-us"
     assert voice_lang("bm_george") == "en-gb"
     assert voice_supported("af_heart") and voice_supported("bm_george")
-    # Kokoro reads English only: the other languages go to Supertonic
-    assert not voice_supported("ff_siwis") and not voice_supported("ef_dora")
+    assert voice_lang("ef_dora") == "es" and voice_lang("ff_siwis") == "fr-fr"
+    assert voice_lang("hf_alpha") == "hi" and voice_lang("if_sara") == "it"
+    assert voice_lang("pf_dora") == "pt-br"
+    for v in ("ff_siwis", "ef_dora", "hf_alpha", "if_sara", "pm_alex"):
+        assert voice_supported(v)
+    # Japanese (espeak cannot read kanji) and Chinese (Supertonic has none) stay out
     assert not voice_supported("jf_alpha") and not voice_supported("zm_yunxi")
+    assert voice_label("ef_dora") == "Dora (Spanish, female)"
+    assert voice_label("pm_alex") == "Alex (Brazilian Portuguese, male)"
     assert voice_label("af_heart") == "Heart (American English, female)"
     assert voice_label("bm_george") == "George (British English, male)"
 
@@ -164,7 +170,7 @@ def test_supertonic_voice_ids_and_labels():
     assert not voice_supported("supertonic:F6") and not voice_supported("supertonic:")
     assert voice_label("supertonic:F1") == "F1 (Supertonic, female)"
     assert voice_label("supertonic:M3") == "M3 (Supertonic, male)"
-    assert sorted(VOICE_LANGS) == sorted(LANG_LABELS) == ["a", "b"]
+    assert sorted(VOICE_LANGS) == sorted(LANG_LABELS) == ["a", "b", "e", "f", "h", "i", "p"]
 
 
 def test_unsupported_voice_ids():
@@ -194,6 +200,10 @@ def test_kokoro_uses_the_voice_language(monkeypatch):
     assert seen == {"voice": "bf_emma", "lang": "en-gb"}
     KokoroEngine("m", "v").synth("Hello", "af_heart", 1.0, "hr")  # lang is ignored
     assert seen == {"voice": "af_heart", "lang": "en-us"}
+    KokoroEngine("m", "v").synth("Hola", "ef_dora", 1.0)
+    assert seen == {"voice": "ef_dora", "lang": "es"}
+    KokoroEngine("m", "v").synth("Ciao", "if_sara", 1.0)
+    assert seen == {"voice": "if_sara", "lang": "it"}
 
 
 def _fake_kokoro(monkeypatch, samples):
@@ -208,7 +218,7 @@ def _fake_kokoro(monkeypatch, samples):
             return samples, 24000
 
         def get_voices(self):
-            return ["af_heart", "ff_siwis", "bf_emma"]
+            return ["af_heart", "ff_siwis", "bf_emma", "jf_alpha"]
 
     monkeypatch.setitem(sys.modules, "kokoro_onnx", types.SimpleNamespace(Kokoro=K))
 
@@ -229,11 +239,11 @@ def test_kokoro_resamples_to_44k(monkeypatch):
     assert abs(np.argmax(spectrum) * SAMPLE_RATE / len(out) - 440) < 2
 
 
-def test_kokoro_voices_are_english_only(monkeypatch):
+def test_kokoro_voices_exclude_japanese_and_chinese(monkeypatch):
     from vibetts.tts import KokoroEngine
 
     _fake_kokoro(monkeypatch, np.zeros(4, np.float32))
-    assert KokoroEngine("m", "v").voices() == ["af_heart", "bf_emma"]
+    assert KokoroEngine("m", "v").voices() == ["af_heart", "ff_siwis", "bf_emma"]
 
 
 def test_resample_edge_cases():

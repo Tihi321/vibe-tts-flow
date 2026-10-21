@@ -9,21 +9,27 @@ read = "alt+win"
 [speech]
 model = "models/kokoro-v1.0.int8.onnx"   # or models/kokoro-v1.0.onnx (fp32, 3.5x larger)
 voices = "models/voices-v1.0.bin"
-voice = "af_heart"           # Kokoro English voice: af_* / am_* American, bf_* / bm_* British
 speed = 1.0                  # 0.5 .. 2.0
 sentence_pause = 0.25        # seconds of silence between sentences
 volume = 1.0                 # 0 .. 1
 device = ""                  # "" = Windows default output; or part of the device name
 preload = true               # load the model at startup so the first read starts at once
-# Two profiles: text that looks English is read with the English profile, anything else
-# with the other-language profile (Supertonic 3, 31 languages; download it in Settings).
-english_engine = "kokoro"            # kokoro | supertonic: who reads English
-english_supertonic_voice = "F1"      # F1..F5 / M1..M5, used when english_engine = "supertonic"
-other_language = "hr"                # Supertonic language code (not "en"), e.g. hr de es sl ru
-other_voice = "F1"                   # F1..F5 / M1..M5
-language_mode = "auto"               # auto (detect English) | english (always) | other (always)
+# Which language is read: "auto" detects the language of each read and uses that language's
+# voice; or a language code (e.g. "hr") to always read in that language.
+read_language = "auto"
 supertonic_dir = "models/supertonic-3"  # Supertonic model files (downloaded from Settings)
 supertonic_steps = 8                 # 4 .. 16: fewer = faster, more = better quality
+
+# One voice per language (31 languages). A voice is a Kokoro id (Kokoro reads en es fr hi it pt:
+# af_* am_* bf_* bm_* ef_* em_* ff_* hf_* hm_* if_* im_* pf_* pm_*), "supertonic:F1" .. "supertonic:M5"
+# (Supertonic 3 reads all 31; download it in Settings), or "" = Off (never detected or read).
+# Languages missing from this table use "supertonic:F1" (English: "af_heart").
+[speech.language_voices]
+en = "af_heart"
+hr = "supertonic:F1"
+# es = "ef_dora"             # Spanish with Kokoro instead
+# de = "supertonic:M1"
+# ru = ""                    # Off
 
 [selection]
 copy_timeout_ms = 400        # how long to wait for the app to answer the copy shortcut
