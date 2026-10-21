@@ -123,7 +123,8 @@ class SpyKokoro(FakeKokoro):
 def test_say_reads_with_the_configured_voice(fakes, monkeypatch, tmp_path):
     monkeypatch.setattr("vibetts.tts.KokoroEngine", SpyKokoro)
     SpyKokoro.seen = []
-    cfg = Config(speech=dataclasses.replace(fakes, voice="bf_emma"))
+    cfg = Config(speech=dataclasses.replace(
+        fakes, language_voices={**fakes.language_voices, "en": "bf_emma"}))
     assert app.say(cfg, "Read https://x.org/a now.", str(tmp_path / "o.wav")) == 0
     assert SpyKokoro.seen[-1] == ("Read link now.", "bf_emma")
 
@@ -153,7 +154,7 @@ def test_speak_passes_the_voice_to_the_engine(fakes):
     a.speak([Chunk("Hi", 0.0)], s, "bf_emma")
     a.speak([Chunk("Hi", 0.0)], s)
     a.speak([Chunk("Hi", 0.0)], s, "supertonic:F2", "hr")
-    assert [r.voice for r in reqs] == ["bf_emma", "af_heart", "supertonic:F2"]  # default: speech.voice
+    assert [r.voice for r in reqs] == ["bf_emma", "af_heart", "supertonic:F2"]  # default: the Kokoro English voice
     assert [r.lang for r in reqs] == [None, None, "hr"]
     install_supertonic(s)
     engine = a._engine_for_speaker()  # loads the engine of the request being spoken
@@ -214,109 +215,157 @@ def make_app(s):
 
 def test_tray_set_voice(fakes):
     a = make_app(fakes)
-    a._set_voice("bf_emma")
-    assert a.cfg.speech.voice == "bf_emma" and a.cfg.speech.english_engine == "kokoro"
+    install_supertonic(a.cfg.speech)
+    a.cfg.speech.preload = False
+    a._set_voice("en", "bf_emma")
+    assert a.cfg.speech.language_voices["en"] == "bf_emma"
     assert len(a.saved_configs) == 1 and a.tray.updates == 1
-    a._set_voice("supertonic:M2")  # a Supertonic voice also switches the English engine
-    assert (a.cfg.speech.english_engine, a.cfg.speech.english_supertonic_voice) == ("supertonic", "M2")
-    assert a.cfg.speech.voice == "bf_emma"
-    a._set_voice("af_heart")
-    assert a.cfg.speech.english_engine == "kokoro" and a.cfg.speech.english_supertonic_voice == "M2"
+    a._set_voice("en", "supertonic:M2")
+    assert a.cfg.speech.language_voices["en"] == "supertonic:M2"
+    a._set_voice("es", "ef_dora")  # a Kokoro voice of that language
+    assert a.cfg.speech.language_voices["es"] == "ef_dora"
+    a._set_voice("hr", "supertonic:M3")
+    assert a.cfg.speech.language_voices["hr"] == "supertonic:M3"
+    before = dict(a.cfg.speech.language_voices)
+    a._set_voice("hr", "af_heart")  # a Kokoro voice of another language: ignored
+    a._set_voice("es", "bf_emma")
+    a._set_voice("xx", "supertonic:F1")  # unknown language
+    a._set_voice("hr", "bogus")
+    assert a.cfg.speech.language_voices == before and len(a.saved_configs) == 4
 
 
-def test_tray_set_other_voice_and_language_mode(fakes):
+def test_tray_set_voice_off_and_read_language(fakes):
     a = make_app(fakes)
-    a._set_other_voice("supertonic:M3")
-    assert a.cfg.speech.other_voice == "M3"
-    a._set_other_voice("af_heart")  # not a Supertonic voice: ignored
-    assert a.cfg.speech.other_voice == "M3"
-    a._set_language_mode("other")
-    assert a.cfg.speech.language_mode == "other"
-    a._set_language_mode("bogus")
-    assert a.cfg.speech.language_mode == "other"
-    assert len(a.saved_configs) == 2 and a.tray.updates == 2
+    a.cfg.speech.preload = False
+    a._set_read_language("de")
+    assert a.cfg.speech.read_language == "de"
+    a._set_read_language("bogus")
+    assert a.cfg.speech.read_language == "de"
+    a._set_voice("de", "")  # Off while read_language is "de": back to auto
+    assert a.cfg.speech.language_voices["de"] == "" and a.cfg.speech.read_language == "auto"
+    a._set_read_language("de")  # a language that is Off cannot be picked
+    assert a.cfg.speech.read_language == "auto"
+    a._set_read_language("hr")
+    a._set_voice("es", "")  # another language Off: read_language stays
+    assert a.cfg.speech.read_language == "hr"
+    a._set_read_language("auto")
+    assert a.cfg.speech.read_language == "auto"
+    assert len(a.saved_configs) == 5 and a.tray.updates == 5
+
+
+def test_tray_cannot_turn_off_the_last_language(fakes):
+    a = make_app(fakes)
+    a.cfg.speech.preload = False
+    for code in app.SUPERTONIC_LANGUAGES:
+        if code != "en":
+            a._set_voice(code, "")
+    assert app.enabled_languages(a.cfg.speech) == ["en"]
+    a._set_voice("en", "")
+    assert a.cfg.speech.language_voices["en"] == "af_heart"
+
+
+def test_tray_hooks_are_wired_to_the_config(fakes, monkeypatch):
+    seen = {}
+
+    class T:
+        def __init__(self, hooks):
+            seen["hooks"] = hooks
+
+    monkeypatch.setattr("vibetts.tray.Tray", T)
+    monkeypatch.setattr("vibetts.overlay.Overlay", lambda ui: FakeOverlay())
+    monkeypatch.setattr("vibetts.reading.ReadingSession", lambda a: None)
+    monkeypatch.setattr("vibetts.hotkeys.HotkeyListener", lambda *a, **k: None)
+    monkeypatch.setattr("vibetts.tts.Speaker", lambda *a, **k: None)
+    a = app.TTSApp(Config(speech=dataclasses.replace(
+        fakes, language_voices={**fakes.language_voices, "de": "", "es": "ef_dora"})))
+    h = seen["hooks"]
+    assert "de" not in h.languages() and h.languages()[:2] == ["en", "ko"]
+    assert h.current_voice("es") == "ef_dora" and h.current_voice("en") == "af_heart"
+    assert h.current_voice("hr") == "supertonic:F1"
+    assert h.read_language() == "auto"
+    a._save = lambda: None
+    a.tray = FakeTray()
+    a.cfg.speech.preload = False
+    h.set_read_language("es")
+    assert h.read_language() == "es"
 
 
 # ---------------------------------------------------------------- tray menus
 
-def make_tray(voices=None, current="af_heart"):
+def make_tray(voices=None, current=None, languages=("en", "es", "hr"), read="auto"):
     from vibetts.tray import Tray, TrayHooks
 
     calls = []
     noop = lambda *a: None  # noqa: E731
+    current = current if current is not None else {"en": "af_heart", "es": "ef_dora",
+                                                   "hr": "supertonic:M1"}
     hooks = TrayHooks(
         is_enabled=lambda: True, set_enabled=noop, is_speaking=lambda: False, stop=noop,
         model_missing=lambda: False, download_model=noop,
-        voices=lambda: voices if voices is not None else ["af_heart", "am_adam", "bf_emma"],
-        current_voice=lambda: current, set_voice=lambda v: calls.append(("voice", v)),
+        voices=lambda: voices if voices is not None else [
+            "af_heart", "am_adam", "bf_emma", "ef_dora", "em_alex", "pf_dora"],
+        languages=lambda: list(languages),
+        current_voice=lambda lang: current.get(lang, ""),
+        set_voice=lambda lang, v: calls.append(("voice", lang, v)),
+        read_language=lambda: read,
+        set_read_language=lambda c: calls.append(("read", c)),
         current_speed=lambda: 1.0, set_speed=noop, is_autostart=lambda: False,
         set_autostart=noop, open_settings=noop, open_config=noop, open_logs=noop,
         reload_config=noop, quit=noop)
     return Tray(hooks), calls
 
 
-def test_tray_voices_grouped_by_language():
-    tray, calls = make_tray(current="am_adam", voices=["af_heart", "am_adam", "bf_emma",
-                                                       "supertonic:F1", "supertonic:M1"])
-    groups = {g.text: [i.text for i in g.submenu.items] for g in tray._voice_menu().items}
-    assert groups == {"American English": ["Heart (female)", "Adam (male)"],
-                      "British English": ["Emma (female)"],
-                      "Supertonic": ["F1 (female)", "M1 (male)"]}
-    us = tray._voice_menu().items[0]
-    assert [i.checked for i in us.submenu.items] == [False, True]
-    us.submenu.items[0](tray._icon)  # picking a voice goes through set_voice
-    assert calls == [("voice", "af_heart")]
+def _submenus(tray):
+    return {i.text: i for i in tray._menu_items() if getattr(i, "submenu", None)}
+
+
+def test_tray_voices_menu_has_a_submenu_per_enabled_language():
+    tray, calls = make_tray()
+    langs = {g.text: [i.text for i in g.submenu.items] for g in tray._voice_menu().items}
+    assert list(langs) == ["English", "Spanish", "Croatian"]
+    assert langs["English"] == ["Off", "Heart (female)", "Adam (male)", "Emma (female)"]
+    assert langs["Spanish"] == ["Off", "Dora (female)", "Alex (male)"]
+    assert langs["Croatian"] == ["Off"]  # Supertonic not installed: only Off
+    es = tray._voice_menu().items[1]
+    assert [i.checked for i in es.submenu.items] == [False, True, False]
+    es.submenu.items[2](tray._icon)  # picking a voice goes through set_voice(lang, voice)
+    es.submenu.items[0](tray._icon)  # Off is the empty voice
+    assert calls == [("voice", "es", "em_alex"), ("voice", "es", "")]
+
+
+def test_tray_voices_menu_lists_supertonic_for_every_language():
+    tray, calls = make_tray(voices=["af_heart", "ef_dora", *app.supertonic_voice_ids()])
+    langs = {g.text: [i.text for i in g.submenu.items] for g in tray._voice_menu().items}
+    assert langs["Croatian"] == ["Off", *[f"{v[11:]} ({'female' if v[11] == 'F' else 'male'})"
+                                         for v in app.supertonic_voice_ids()]]
+    assert langs["English"][:2] == ["Off", "Heart (female)"] and len(langs["English"]) == 12
+    hr = tray._voice_menu().items[2]
+    assert [i.checked for i in hr.submenu.items][1 + 5] is True  # M1
+    hr.submenu.items[1](tray._icon)
+    assert calls == [("voice", "hr", "supertonic:F1")]
 
 
 def test_tray_menu_has_voice_entry():
     tray, _ = make_tray()
     texts = [getattr(i, "text", "") for i in tray._menu_items()]
-    assert "English voice" in texts and "Language" in texts and "Speed" in texts
-    assert "Croatian voice" not in texts  # Supertonic not installed: no other-language voices
-    tray, _ = make_tray(voices=[])
+    assert "Voices" in texts and "Language" in texts and "Speed" in texts
+    assert "English voice" not in texts and "Croatian voice" not in texts
+    tray, _ = make_tray(languages=())
     texts = [getattr(i, "text", "") for i in tray._menu_items()]
-    assert "English voice" not in texts and "Language" in texts
-
-
-def make_profile_tray(mode="auto", other="supertonic:F1", english="af_heart"):
-    from vibetts.tray import Tray, TrayHooks
-
-    calls = []
-    noop = lambda *a: None  # noqa: E731
-    hooks = TrayHooks(
-        is_enabled=lambda: True, set_enabled=noop, is_speaking=lambda: False, stop=noop,
-        model_missing=lambda: False, download_model=noop,
-        voices=lambda: ["af_heart", "bf_emma"] + app.supertonic_voice_ids(),
-        current_voice=lambda: english, set_voice=lambda v: calls.append(("voice", v)),
-        current_speed=lambda: 1.0, set_speed=noop, is_autostart=lambda: False,
-        set_autostart=noop, open_settings=noop, open_config=noop, open_logs=noop,
-        reload_config=noop, quit=noop,
-        current_language_mode=lambda: mode, set_language_mode=lambda m: calls.append(("mode", m)),
-        other_language_name=lambda: "Croatian", supertonic_available=lambda: True,
-        current_other_voice=lambda: other, set_other_voice=lambda v: calls.append(("other", v)))
-    return Tray(hooks), calls
+    assert "Voices" not in texts and "Language" in texts
 
 
 def test_tray_language_menu():
-    tray, calls = make_profile_tray(mode="other")
-    items = {i.text: i for i in tray._menu_items() if hasattr(i, "submenu") and i.submenu}
-    lang = items["Language"].submenu.items
-    assert [i.text for i in lang] == ["Auto (detect English)", "English", "Croatian"]
-    assert [i.checked for i in lang] == [False, False, True]
-    lang[1](tray._icon)
-    assert calls == [("mode", "english")]
-
-
-def test_tray_other_voice_menu():
-    tray, calls = make_profile_tray(other="supertonic:M2")
-    items = {i.text: i for i in tray._menu_items() if hasattr(i, "submenu") and i.submenu}
-    other = items["Croatian voice"].submenu.items
-    assert [i.text for i in other][:2] == ["F1 (female)", "F2 (female)"] and len(other) == 10
-    assert [i.checked for i in other] == [v.endswith("M2") for v in app.supertonic_voice_ids()]
-    other[5](tray._icon)
-    assert calls == [("other", "supertonic:M1")]
-    eng = items["English voice"].submenu.items
-    assert [g.text for g in eng] == ["American English", "British English", "Supertonic"]
+    tray, calls = make_tray(read="es")
+    lang = _submenus(tray)["Language"].submenu.items
+    assert [i.text for i in lang] == ["Auto (detect language)", "Always English",
+                                      "Always Spanish", "Always Croatian"]
+    assert [i.checked for i in lang] == [False, False, True, False]
+    lang[3](tray._icon)
+    lang[0](tray._icon)
+    assert calls == [("read", "hr"), ("read", "auto")]
+    tray, _ = make_tray()
+    assert [i.checked for i in _submenus(tray)["Language"].submenu.items][0] is True
 
 
 # ---------------------------------------------------------------- plan_speech / run_export
@@ -512,9 +561,10 @@ def test_bridge_list_voices(bridge):
          "languages": ["en"]}]
     assert [l["code"] for l in out["languages"]][:3] == ["en", "ko", "ja"] and len(out["languages"]) == 31
     assert {"code": "hr", "name": "Croatian"} in out["languages"]
-    assert out["english"] == {"engine": "kokoro", "voice": "af_heart"}
-    assert out["other"] == {"language": "hr", "voice": "supertonic:F1"}
-    assert out["language_mode"] == "auto" and out["supertonic_installed"] is False
+    assert out["language_voices"] == Config().speech.language_voices
+    assert out["language_voices"]["en"] == "af_heart" and out["language_voices"]["hr"] == "supertonic:F1"
+    assert out["read_language"] == "auto" and out["supertonic_installed"] is False
+    assert not {"english", "other", "language_mode"} & set(out)
 
 
 def test_bridge_speak_waits_for_the_real_speaker(bridge):
@@ -773,7 +823,7 @@ def test_tray_menu_has_export_item_after_settings():
     hooks = TrayHooks(
         is_enabled=lambda: True, set_enabled=noop, is_speaking=lambda: False, stop=noop,
         model_missing=lambda: False, download_model=noop, voices=lambda: [],
-        current_voice=lambda: "af_heart", set_voice=noop, current_speed=lambda: 1.0,
+        current_voice=lambda lang: "af_heart", set_voice=noop, current_speed=lambda: 1.0,
         set_speed=noop, is_autostart=lambda: False, set_autostart=noop, open_settings=noop,
         open_config=noop, open_logs=noop, reload_config=noop, quit=noop,
         open_export=lambda: calls.append("export"))
@@ -992,39 +1042,79 @@ HR_TEXT = "Ovo je jednostavan test sustava koji čita tekst na hrvatskom jeziku,
 EN_LONG = "This is a simple test of the system that reads the text out loud in English."
 
 
-@pytest.mark.parametrize("mode,text,engine,expected", [
-    ("auto", EN_LONG, "kokoro", ("kokoro", "af_heart", "en")),
-    ("auto", HR_TEXT, "kokoro", ("supertonic", "supertonic:F2", "hr")),
-    ("auto", EN_LONG, "supertonic", ("supertonic", "supertonic:M1", "en")),
-    ("auto", HR_TEXT, "supertonic", ("supertonic", "supertonic:F2", "hr")),
-    ("english", HR_TEXT, "kokoro", ("kokoro", "af_heart", "en")),
-    ("english", HR_TEXT, "supertonic", ("supertonic", "supertonic:M1", "en")),
-    ("other", EN_LONG, "kokoro", ("supertonic", "supertonic:F2", "hr")),
-    ("other", EN_LONG, "supertonic", ("supertonic", "supertonic:F2", "hr")),
-])
-def test_route_matrix(fakes, mode, text, engine, expected):
-    s = dataclasses.replace(fakes, language_mode=mode, english_engine=engine,
-                            english_supertonic_voice="M1", other_voice="F2")
-    install_supertonic(s)
-    route = app.route_for(s, text)
-    assert tuple(route[:3]) == expected and route.fell_back is False
+DE_TEXT = "Das ist ein einfacher Test des Systems, der den deutschen Text vorliest, weil es schön ist."
+ES_TEXT = "Este es un sencillo test del sistema que lee el texto en español para todos los usuarios."
 
 
-def test_route_other_language_and_explicit_lang(fakes):
-    s = dataclasses.replace(fakes, other_language="de", other_voice="M4")
+def _speech(s, read_language="auto", **voices):
+    """`s` with some language voices replaced (a fresh dict: replace() would share it)."""
+    return dataclasses.replace(s, language_voices={**s.language_voices, **voices},
+                               read_language=read_language)
+
+
+def test_route_per_language(fakes):
+    s = _speech(fakes, es="ef_dora", de="supertonic:M1", hr="supertonic:F2")
     install_supertonic(s)
-    assert app.route_for(s, "Das ist ein einfacher Test des Systems, der den Text vorliest, schön.")[::2] \
-        == ("supertonic", "de")
-    # an explicit lang: "en" is the English profile, anything else the other-language voice
+    assert app.route_for(s, EN_LONG) == app.Route("kokoro", "af_heart", "en")
+    assert app.route_for(s, ES_TEXT) == app.Route("kokoro", "ef_dora", "es")
+    assert app.route_for(s, DE_TEXT) == app.Route("supertonic", "supertonic:M1", "de")
+    assert app.route_for(s, HR_TEXT) == app.Route("supertonic", "supertonic:F2", "hr")
+    # Supertonic English
+    s2 = _speech(s, en="supertonic:M3")
+    assert app.route_for(s2, EN_LONG) == app.Route("supertonic", "supertonic:M3", "en")
+
+
+def test_route_explicit_lang_skips_detection(fakes):
+    s = _speech(fakes, es="ef_dora", de="supertonic:M4")
+    install_supertonic(s)
     assert app.route_for(s, HR_TEXT, "en") == app.Route("kokoro", "af_heart", "en")
-    assert app.route_for(s, EN_LONG, "fr") == app.Route("supertonic", "supertonic:M4", "fr")
+    assert app.route_for(s, EN_LONG, "es") == app.Route("kokoro", "ef_dora", "es")
+    assert app.route_for(s, EN_LONG, "de") == app.Route("supertonic", "supertonic:M4", "de")
+    assert app.route_for(s, EN_LONG, "fr") == app.Route("supertonic", "supertonic:F1", "fr")
+
+
+def test_route_languages_that_are_off_are_never_detected(fakes):
+    s = _speech(fakes, de="", sl="")
+    install_supertonic(s)
+    assert app.enabled_languages(s) == [c for c in app.SUPERTONIC_LANGUAGES if c not in ("de", "sl")]
+    for text in (DE_TEXT, ES_TEXT, HR_TEXT, EN_LONG):
+        assert app.route_for(s, text).lang not in ("de", "sl")
+    # only two languages on: everything is one of them
+    only = _speech(fakes, **{c: "" for c in app.SUPERTONIC_LANGUAGES if c not in ("en", "hr")})
+    assert app.route_for(only, DE_TEXT).lang in ("en", "hr")
+    assert app.route_for(only, HR_TEXT).lang == "hr" and app.route_for(only, EN_LONG).lang == "en"
+
+
+def test_route_fallback_language_when_english_is_off(fakes):
+    s = _speech(fakes, en="", **{c: "" for c in app.SUPERTONIC_LANGUAGES if c not in ("en", "hr", "de")})
+    install_supertonic(s)
+    assert app.fallback_lang(s) == "de"  # English is off: the first enabled language
+    assert app.route_for(s, "ok").lang == "de"  # too short to detect
+
+
+def test_route_read_language_forces_the_language(fakes):
+    s = _speech(fakes, read_language="hr", es="ef_dora")
+    install_supertonic(s)
+    for text in (EN_LONG, DE_TEXT, HR_TEXT):
+        assert app.route_for(s, text) == app.Route("supertonic", "supertonic:F1", "hr")
+    s = _speech(fakes, read_language="es", es="ef_dora")
+    assert app.route_for(s, EN_LONG) == app.Route("kokoro", "ef_dora", "es")
+    s = _speech(fakes, read_language="en")
+    assert app.route_for(s, HR_TEXT) == app.Route("kokoro", "af_heart", "en")
+    # a forced language that is Off is ignored (auto)
+    s = _speech(fakes, read_language="de", de="")
+    assert app.profile_lang(s, EN_LONG) == "en"
 
 
 def test_route_falls_back_to_kokoro_when_supertonic_is_missing(fakes, caplog):
     s = fakes  # not installed
-    route = app.route_for(s, HR_TEXT)
+    route = app.route_for(s, HR_TEXT)  # Kokoro has no Croatian: Kokoro English reads it
     assert route == app.Route("kokoro", "af_heart", "en", True)
-    s2 = dataclasses.replace(s, english_engine="supertonic")
+    # Kokoro reads Spanish: the Kokoro Spanish voice, not English
+    es = _speech(s, es="supertonic:F3")
+    assert app.route_for(es, ES_TEXT) == app.Route("kokoro", "ef_dora", "es", True)
+    assert app.route_for(es, EN_LONG) == app.Route("kokoro", "af_heart", "en")
+    s2 = _speech(s, en="supertonic:F1")
     assert app.route_for(s2, EN_LONG) == app.Route("kokoro", "af_heart", "en", True)
     with caplog.at_level("WARNING", logger="vibetts.app"):
         assert app.note_fallback(route) is True and app.note_fallback(route) is False  # once
@@ -1049,16 +1139,40 @@ def test_route_request_explicit_voice_and_lang(fakes):
         app.route_request(s, EN_LONG, None, "xx")
 
 
-def test_active_voices_per_mode(fakes):
-    s = dataclasses.replace(fakes, english_engine="supertonic", english_supertonic_voice="F5")
-    assert app.needed_voices(s) == ["supertonic:F5", "supertonic:F1"]
-    assert app.needed_voices(dataclasses.replace(s, language_mode="english")) == ["supertonic:F5"]
-    assert app.needed_voices(dataclasses.replace(s, language_mode="other")) == ["supertonic:F1"]
-    assert app.primary_voice(dataclasses.replace(s, language_mode="other")) == "supertonic:F1"
-    assert app.primary_voice(fakes) == "af_heart"
-    assert app.missing_voices(fakes) == ["supertonic:F1"]
-    install_supertonic(fakes)
-    assert app.missing_voices(fakes) == []
+def test_route_request_kokoro_voice_for_its_own_language(fakes):
+    s = fakes
+    assert app.route_request(s, HR_TEXT, "ef_dora") == app.Route("kokoro", "ef_dora", "es")
+    assert app.route_request(s, EN_LONG, "ef_dora", "es") == app.Route("kokoro", "ef_dora", "es")
+    assert app.route_request(s, EN_LONG, "pf_dora", "pt").lang == "pt"
+    assert app.route_request(s, EN_LONG, "bm_george", "en").voice == "bm_george"
+    with pytest.raises(ValueError, match="reads Spanish only"):
+        app.route_request(s, EN_LONG, "ef_dora", "en")
+    with pytest.raises(ValueError, match="reads English only"):
+        app.route_request(s, EN_LONG, "af_heart", "hr")
+    with pytest.raises(ValueError, match="Unknown voice"):
+        app.route_request(s, EN_LONG, "jf_alpha")
+
+
+def test_needed_and_primary_voices(fakes):
+    s = fakes  # auto: one Kokoro voice plus the Supertonic family
+    assert app.needed_voices(s) == ["af_heart", "supertonic:F1"]
+    assert app.primary_voice(s) == "af_heart"
+    assert app.missing_voices(s) == ["supertonic:F1"]
+    install_supertonic(s)
+    assert app.missing_voices(s) == []
+    mixed = _speech(s, es="ef_dora", de="supertonic:M2")
+    assert app.needed_voices(mixed) == ["af_heart", "supertonic:F1", "supertonic:M2", "ef_dora"]
+    # a fixed language needs only its voice
+    en = _speech(s, read_language="en")
+    assert app.needed_voices(en) == ["af_heart"] and app.primary_voice(en) == "af_heart"
+    hr = _speech(s, read_language="hr", hr="supertonic:F5")
+    assert app.needed_voices(hr) == ["supertonic:F5"] and app.primary_voice(hr) == "supertonic:F5"
+    # a language that is Off is not needed
+    off = _speech(s, **{c: "" for c in app.SUPERTONIC_LANGUAGES if c != "en"})
+    assert app.needed_voices(off) == ["af_heart"]
+    # English off: the first enabled language is the primary one
+    no_en = _speech(s, en="", **{c: "" for c in app.SUPERTONIC_LANGUAGES if c not in ("en", "de")})
+    assert app.needed_voices(no_en) == ["supertonic:F1"] and app.primary_voice(no_en) == "supertonic:F1"
 
 
 # ---------------------------------------------------------------- engines
@@ -1084,9 +1198,9 @@ def test_holder_loads_each_family_lazily(fakes):
 
 
 def test_holder_default_voice_follows_the_profile(fakes):
-    s = dataclasses.replace(fakes, language_mode="other")
+    s = _speech(fakes, read_language="hr")
     install_supertonic(s)
-    engine = app.EngineHolder().get(s)  # no voice: the primary one (other-language profile)
+    engine = app.EngineHolder().get(s)  # no voice: the primary one (Croatian, Supertonic)
     assert engine.kokoro is None and isinstance(engine.supertonic, FakeSupertonic)
 
 
@@ -1123,22 +1237,22 @@ def test_preload_loads_the_engines_the_profiles_need(fakes):
     s = fakes
     install_supertonic(s)
     holder = app.EngineHolder()
-    holder.preload(s)  # auto: English (Kokoro) and other language (Supertonic)
+    holder.preload(s)  # auto: English (Kokoro) and the other languages (Supertonic)
     loaded = _wait_loaded(holder, kokoro=True, supertonic=True)
     assert isinstance(loaded.kokoro, FakeKokoro) and isinstance(loaded.supertonic, FakeSupertonic)
     only_en = app.EngineHolder()
-    only_en.preload(dataclasses.replace(s, language_mode="english"))
+    only_en.preload(_speech(s, read_language="en"))
     _wait_loaded(only_en, kokoro=True)
     assert only_en.loaded.supertonic is None
     only_other = app.EngineHolder()
-    only_other.preload(dataclasses.replace(s, language_mode="other"))
+    only_other.preload(_speech(s, read_language="hr"))
     _wait_loaded(only_other, supertonic=True)
     assert only_other.loaded.kokoro is None
 
 
 def test_preload_without_supertonic_loads_kokoro_only(fakes):
     holder = app.EngineHolder()
-    holder.preload(fakes)  # the other profile falls back to Kokoro English
+    holder.preload(fakes)  # the Supertonic languages fall back to Kokoro
     _wait_loaded(holder, kokoro=True)
     assert holder.loaded.supertonic is None and FakeSupertonic.instances == []
 
@@ -1234,13 +1348,35 @@ def test_bridge_list_voices_with_supertonic(bridge):
     b, a = bridge
     install_supertonic(a.cfg.speech)
     a._voices = lambda: ["af_heart", *app.supertonic_voice_ids()]
-    a.cfg.speech.other_language, a.cfg.speech.language_mode = "de", "other"
+    a.cfg.speech.language_voices["de"] = ""
+    a.cfg.speech.read_language = "hr"
     out = b.list_voices()
     st = out["voices"][1]
     assert st == {"id": "supertonic:F1", "label": "F1 (Supertonic, female)", "engine": "supertonic",
                   "languages": list(app.SUPERTONIC_LANGUAGES)}
-    assert out["supertonic_installed"] is True and out["language_mode"] == "other"
-    assert out["other"] == {"language": "de", "voice": "supertonic:F1"}
+    assert out["supertonic_installed"] is True and out["read_language"] == "hr"
+    assert out["language_voices"]["de"] == "" and out["language_voices"]["hr"] == "supertonic:F1"
+
+
+def test_bridge_list_voices_kokoro_voices_list_their_own_language(bridge):
+    b, a = bridge
+    a._voices = lambda: ["af_heart", "ef_dora", "pf_dora", "supertonic:F1"]
+    by_id = {v["id"]: v["languages"] for v in b.list_voices()["voices"]}
+    assert by_id["af_heart"] == ["en"] and by_id["ef_dora"] == ["es"] and by_id["pf_dora"] == ["pt"]
+    assert by_id["supertonic:F1"] == list(app.SUPERTONIC_LANGUAGES)
+
+
+def test_bridge_accepts_a_kokoro_voice_for_its_own_language(bridge, monkeypatch):
+    from vibetts.mcp_server import ToolError
+
+    b, a = bridge
+    a._voices = lambda: ["af_heart", "ef_dora"]
+    b._check_voice(a.cfg.speech, "ef_dora", "es")
+    b._check_voice(a.cfg.speech, "ef_dora", None)
+    with pytest.raises(ToolError, match="reads Spanish only"):
+        b._check_voice(a.cfg.speech, "ef_dora", "en")
+    with pytest.raises(ToolError, match="reads English only"):
+        b._check_voice(a.cfg.speech, "af_heart", "hr")
 
 
 def test_bridge_speak_routes_by_lang(bridge, monkeypatch):
@@ -1275,13 +1411,15 @@ def test_bridge_batch_with_lang(bridge, tmp_path):
 
 # ---------------------------------------------------------------- app wiring
 
-def test_voices_lists_english_kokoro_then_supertonic_when_installed(fakes, tmp_path):
+def test_voices_lists_kokoro_then_supertonic_when_installed(fakes, tmp_path):
     a = make_app(fakes)
     with open(a.cfg.speech.voices, "wb") as fh:
-        np.savez(fh, af_heart=np.zeros(2), ff_siwis=np.zeros(2), bm_george=np.zeros(2))
-    assert a._voices() == ["af_heart", "bm_george"]
+        np.savez(fh, af_heart=np.zeros(2), ff_siwis=np.zeros(2), bm_george=np.zeros(2),
+                 jf_alpha=np.zeros(2), zf_xiaobei=np.zeros(2))
+    # French is supported now; Japanese and Chinese are not
+    assert a._voices() == ["af_heart", "bm_george", "ff_siwis"]
     install_supertonic(a.cfg.speech)
-    assert a._voices() == ["af_heart", "bm_george", *app.supertonic_voice_ids()]
+    assert a._voices() == ["af_heart", "bm_george", "ff_siwis", *app.supertonic_voice_ids()]
 
 
 def test_supertonic_changed_reloads_and_refreshes(fakes):
@@ -1314,8 +1452,8 @@ def test_apply_config_reports_the_missing_engine(mapp):
     a = mapp
     a.listener = type("L", (), {"set_bindings": lambda self, b: None})()
     base = a.cfg.speech
-    new = Config(speech=dataclasses.replace(base, english_engine="supertonic"))
-    assert a.apply_config(new) == app.MISSING_SUPERTONIC  # the English profile needs it
+    new = Config(speech=_speech(base, "en", en="supertonic:F1"))
+    assert a.apply_config(new) == app.MISSING_SUPERTONIC  # the fallback language (English) needs it
     ok = Config(speech=dataclasses.replace(base, preload=False))
     assert a.apply_config(ok) is None  # Kokoro is there; Supertonic is only a soft need
 
@@ -1365,7 +1503,7 @@ def test_tray_download_opens_the_engine_that_is_missing(fakes):
     opened = []
     a.open_settings = lambda tab=None, banner=None, download=False: opened.append((tab, download))
     a._download_missing()
-    assert opened == [("supertonic", True)]  # Kokoro is there, Supertonic (other profile) is not
+    assert opened == [("supertonic", True)]  # Kokoro is there, Supertonic (other languages) is not
     a.cfg.speech.model = str(Path(a.cfg.speech.model).with_name("nope.onnx"))
     a._download_missing()
     assert opened[-1] == ("kokoro", True)
@@ -1384,7 +1522,7 @@ def test_say_routes_like_the_hotkey(fakes, tmp_path, monkeypatch, capsys):
     assert app.say(cfg, EN_LONG, str(tmp_path / "en.wav")) == 0
     assert "voice af_heart, language en" in capsys.readouterr().out
     # forced English: Croatian text goes to the English voice
-    cfg.speech.language_mode = "english"
+    cfg.speech.read_language = "en"
     assert app.say(cfg, HR_TEXT, str(tmp_path / "forced.wav")) == 0
     assert "voice af_heart" in capsys.readouterr().out
 
@@ -1397,7 +1535,7 @@ def test_say_without_supertonic_falls_back_and_says_so(fakes, tmp_path, capsys):
 
 
 def test_say_supertonic_only_missing_message(fakes, tmp_path, capsys):
-    cfg = Config(speech=dataclasses.replace(fakes, english_engine="supertonic", language_mode="english"))
+    cfg = Config(speech=_speech(fakes, "en", en="supertonic:F1"))
     cfg.speech.model = str(tmp_path / "nope.onnx")  # even Kokoro is gone: the fallback fails too
     assert app.say(cfg, EN_LONG, str(tmp_path / "x.wav")) == 1
     assert "model files missing" in capsys.readouterr().err
@@ -1604,7 +1742,9 @@ def test_reader_bridge_list_voices_and_session(rapp):
     rapp.reading = object()
     b = app.ReaderBridge(rapp)
     assert b.session is rapp.reading
-    assert [v["id"] for v in b.list_voices()["voices"]] == ["af_heart"]
+    out = b.list_voices()
+    assert [v["id"] for v in out["voices"]] == ["af_heart"]
+    assert out["read_language"] == "auto" and out["language_voices"]["en"] == "af_heart"
 
 
 def test_reader_bridge_open_book_returns_url_and_opens_browser(rapp, tmp_path, monkeypatch):
@@ -1694,7 +1834,7 @@ def test_tray_reader_item_visibility_and_pause_label():
     hooks = TrayHooks(
         is_enabled=lambda: True, set_enabled=noop, is_speaking=lambda: state["speaking"],
         stop=noop, model_missing=lambda: False, download_model=noop, voices=lambda: [],
-        current_voice=lambda: "af_heart", set_voice=noop, current_speed=lambda: 1.0,
+        current_voice=lambda lang: "af_heart", set_voice=noop, current_speed=lambda: 1.0,
         set_speed=noop, is_autostart=lambda: False, set_autostart=noop, open_settings=noop,
         open_config=noop, open_logs=noop, reload_config=noop, quit=noop,
         reader_running=lambda: state["running"], open_reader=lambda: calls.append("reader"),

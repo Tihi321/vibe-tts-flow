@@ -25,10 +25,12 @@ SAMPLE_RATE = 44100   # every output: Supertonic natively, Kokoro resampled up f
 KOKORO_RATE = 24000
 BLOCK_FRAMES = 4410   # 100 ms: how quickly Stop takes effect
 
-# Kokoro voice name prefix -> espeak language. Kokoro only reads English here (other
-# languages go to Supertonic), so only the American and British voices are offered.
-VOICE_LANGS = {"a": "en-us", "b": "en-gb"}
-LANG_LABELS = {"a": "American English", "b": "British English"}
+# Kokoro voice name prefix -> espeak language. Japanese (j) and Chinese (z) voices are not
+# offered: espeak cannot read kanji and Supertonic has no Chinese.
+VOICE_LANGS = {"a": "en-us", "b": "en-gb", "e": "es", "f": "fr-fr", "h": "hi", "i": "it",
+               "p": "pt-br"}
+LANG_LABELS = {"a": "American English", "b": "British English", "e": "Spanish", "f": "French",
+               "h": "Hindi", "i": "Italian", "p": "Brazilian Portuguese"}
 
 
 def voice_lang(voice: str) -> str:
@@ -40,7 +42,7 @@ def kokoro_voice_supported(voice: str) -> bool:
 
 
 def voice_supported(voice: str) -> bool:
-    """A Kokoro English voice id (af_heart) or a Supertonic one (supertonic:F1)."""
+    """A Kokoro voice id (af_heart) or a Supertonic one (supertonic:F1)."""
     return kokoro_voice_supported(voice) or is_supertonic_voice(voice)
 
 
@@ -79,7 +81,7 @@ class KokoroEngine:
         return [v for v in self._kokoro.get_voices() if kokoro_voice_supported(v)]
 
     def synth(self, text: str, voice: str, speed: float, lang: str | None = None) -> np.ndarray:
-        """44.1 kHz mono audio (`lang` is ignored: Kokoro reads English here)."""
+        """44.1 kHz mono audio (`lang` is ignored: the espeak language comes from the voice prefix)."""
         with self._lock:
             samples, rate = self._kokoro.create(text, voice=voice, speed=speed,
                                                 lang=voice_lang(voice))

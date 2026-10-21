@@ -3,8 +3,10 @@ from pathlib import Path
 
 import pytest
 
-from vibetts.config import (MP3_BITRATES, SUPERTONIC_LANGUAGES, Config, config_from_dict,
-                            export_folder, load_config, resolve_path, save_config, snap_bitrate)
+from vibetts.config import (DEFAULT_LANGUAGE_VOICES, KOKORO_LANGUAGES, MP3_BITRATES,
+                            SUPERTONIC_LANGUAGES, Config, config_from_dict, enabled_languages,
+                            export_folder, kokoro_voice_lang, load_config, resolve_path,
+                            save_config, snap_bitrate, voice_fits_language)
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -27,7 +29,7 @@ def test_invalid_values_fall_back():
 def test_save_load_round_trip(tmp_path):
     cfg = Config()
     cfg.hotkey.read = "ctrl+shift+r"
-    cfg.speech.voice = "bm_george"
+    cfg.speech.language_voices["en"] = "bm_george"
     cfg.speech.speed = 1.25
     cfg.selection.max_chars = 0
     path = tmp_path / "config.toml"
@@ -47,52 +49,129 @@ def test_broken_toml_uses_defaults(tmp_path):
     assert load_config(path) == Config()
 
 
-def test_unknown_voice_falls_back():
-    assert config_from_dict({"speech": {"voice": "bm_george"}}).speech.voice == "bm_george"
-    # only English Kokoro voices (a* / b*) are valid for `voice`
-    for bad in ("", "omni:alma", "heart", "ff_siwis", "ef_dora", "jf_alpha", "supertonic:F1"):
-        assert config_from_dict({"speech": {"voice": bad}}).speech.voice == "af_heart"
+def test_kokoro_voice_lang():
+    assert KOKORO_LANGUAGES == {"a": "en", "b": "en", "e": "es", "f": "fr", "h": "hi", "i": "it",
+                                "p": "pt"}
+    assert kokoro_voice_lang("af_heart") == "en" and kokoro_voice_lang("bm_george") == "en"
+    assert kokoro_voice_lang("ef_dora") == "es" and kokoro_voice_lang("pf_dora") == "pt"
+    for bad in ("", "heart", "jf_alpha", "zf_xiaobei", "supertonic:F1", "af"):
+        assert kokoro_voice_lang(bad) is None
+    assert voice_fits_language("ef_dora", "es") and not voice_fits_language("ef_dora", "en")
+    assert voice_fits_language("supertonic:M2", "hr") and not voice_fits_language("supertonic:X", "hr")
 
 
-def test_profile_defaults():
+def test_language_voice_defaults():
     s = Config().speech
-    assert (s.english_engine, s.voice, s.english_supertonic_voice) == ("kokoro", "af_heart", "F1")
-    assert (s.other_language, s.other_voice, s.language_mode) == ("hr", "F1", "auto")
+    assert tuple(s.language_voices) == SUPERTONIC_LANGUAGES and len(s.language_voices) == 31
+    assert s.language_voices["en"] == "af_heart"
+    assert all(v == "supertonic:F1" for c, v in s.language_voices.items() if c != "en")
+    assert s.language_voices == DEFAULT_LANGUAGE_VOICES and s.read_language == "auto"
+    assert enabled_languages(s) == list(SUPERTONIC_LANGUAGES)
     assert (s.supertonic_dir, s.supertonic_steps) == ("models/supertonic-3", 8)
+    for gone in ("voice", "english_engine", "english_supertonic_voice", "other_language",
+                 "other_voice", "language_mode"):
+        assert not hasattr(s, gone)
 
 
-def test_profile_values_round_trip(tmp_path):
+def test_missing_languages_are_filled_with_defaults():
+    s = config_from_dict({"speech": {"language_voices": {"es": "ef_dora", "xx": "supertonic:F1"}}}).speech
+    assert s.language_voices["es"] == "ef_dora"
+    assert s.language_voices["en"] == "af_heart" and s.language_voices["hr"] == "supertonic:F1"
+    assert "xx" not in s.language_voices and len(s.language_voices) == 31
+
+
+def test_language_voices_round_trip(tmp_path):
     cfg = Config()
     s = cfg.speech
-    s.english_engine, s.english_supertonic_voice = "supertonic", "M3"
-    s.other_language, s.other_voice, s.language_mode = "de", "F5", "other"
+    s.language_voices.update({"en": "supertonic:M3", "es": "ef_dora", "de": "", "fr": "ff_siwis"})
+    s.read_language = "es"
     s.supertonic_dir, s.supertonic_steps = "D:/models/st", 12
     path = tmp_path / "config.toml"
     save_config(cfg, path)
+    text = path.read_text(encoding="utf-8")
+    assert "[speech.language_voices]" in text and 'es = "ef_dora"' in text and 'de = ""' in text
     assert load_config(path) == cfg
+    assert enabled_languages(cfg.speech)[:3] == ["en", "ko", "ja"] and "de" not in enabled_languages(cfg.speech)
 
 
-@pytest.mark.parametrize("key,bad", [
-    ("english_engine", "omnivoice"), ("english_engine", ""),
-    ("language_mode", "croatian"), ("language_mode", "AUTO"),
-    ("other_language", "xx"), ("other_language", "en"), ("other_language", ""),
-    ("english_supertonic_voice", "F6"), ("english_supertonic_voice", "supertonic:F1"),
-    ("other_voice", "X1"), ("other_voice", "f1"),
+@pytest.mark.parametrize("lang,bad", [
+    ("hr", "af_heart"), ("en", "ef_dora"), ("es", "af_heart"), ("hr", "ef_dora"),
+    ("en", "jf_alpha"), ("de", "heart"), ("fr", "supertonic:F6"), ("it", "omni:alma"),
+    ("en", "supertonic"),
 ])
-def test_invalid_profile_values_fall_back(key, bad):
-    default = getattr(Config().speech, key)
-    assert getattr(config_from_dict({"speech": {key: bad}}).speech, key) == default
+def test_invalid_language_voice_falls_back(lang, bad):
+    s = config_from_dict({"speech": {"language_voices": {lang: bad}}}).speech
+    assert s.language_voices[lang] == DEFAULT_LANGUAGE_VOICES[lang]
 
 
-def test_valid_profile_values_are_kept():
-    s = config_from_dict({"speech": {"english_engine": "supertonic", "language_mode": "english",
-                                     "other_language": "sl", "english_supertonic_voice": "M5",
-                                     "other_voice": "M1"}}).speech
-    assert (s.english_engine, s.language_mode, s.other_language) == ("supertonic", "english", "sl")
-    assert (s.english_supertonic_voice, s.other_voice) == ("M5", "M1")
-    for code in SUPERTONIC_LANGUAGES:
-        if code != "en":
-            assert config_from_dict({"speech": {"other_language": code}}).speech.other_language == code
+def test_valid_language_voices_are_kept():
+    voices = {"en": "bf_emma", "es": "em_alex", "fr": "ff_siwis", "hi": "hm_omega",
+              "it": "if_sara", "pt": "pm_santa", "hr": "supertonic:M5", "en2": "x"}
+    s = config_from_dict({"speech": {"language_voices": voices}}).speech
+    for code, voice in voices.items():
+        if code != "en2":
+            assert s.language_voices[code] == voice
+
+
+def test_non_table_language_voices_use_defaults():
+    assert config_from_dict({"speech": {"language_voices": "af_heart"}}).speech.language_voices \
+        == DEFAULT_LANGUAGE_VOICES
+    assert config_from_dict({"speech": {"language_voices": {"en": 5}}}).speech.language_voices \
+        == DEFAULT_LANGUAGE_VOICES
+
+
+def test_all_languages_off_turns_english_back_on():
+    s = config_from_dict({"speech": {"language_voices": {c: "" for c in SUPERTONIC_LANGUAGES},
+                                     "read_language": "de"}}).speech
+    assert enabled_languages(s) == ["en"] and s.language_voices["en"] == "af_heart"
+    assert s.read_language == "auto"
+
+
+def test_read_language_must_be_auto_or_enabled():
+    assert config_from_dict({"speech": {"read_language": "hr"}}).speech.read_language == "hr"
+    assert config_from_dict({"speech": {"read_language": "auto"}}).speech.read_language == "auto"
+    for bad in ("xx", "", "AUTO", "croatian"):
+        assert config_from_dict({"speech": {"read_language": bad}}).speech.read_language == "auto"
+    off = {"language_voices": {"hr": ""}, "read_language": "hr"}
+    assert config_from_dict({"speech": off}).speech.read_language == "auto"
+
+
+def test_migration_english_kokoro_and_other_language():
+    s = config_from_dict({"speech": {"voice": "bm_george", "english_engine": "kokoro",
+                                     "other_language": "de", "other_voice": "M2",
+                                     "language_mode": "auto", "speed": 1.2}}).speech
+    assert s.language_voices["en"] == "bm_george" and s.language_voices["de"] == "supertonic:M2"
+    assert s.language_voices["hr"] == "supertonic:F1" and s.read_language == "auto"
+    assert s.speed == 1.2
+
+
+def test_migration_supertonic_english():
+    s = config_from_dict({"speech": {"voice": "af_heart", "english_engine": "supertonic",
+                                     "english_supertonic_voice": "M3"}}).speech
+    assert s.language_voices["en"] == "supertonic:M3"
+    assert s.language_voices["hr"] == "supertonic:F1" and s.read_language == "auto"
+
+
+def test_migration_language_modes():
+    old = {"voice": "af_heart", "other_language": "sl", "other_voice": "F4"}
+    english = config_from_dict({"speech": {**old, "language_mode": "english"}}).speech
+    assert english.read_language == "en" and english.language_voices["sl"] == "supertonic:F4"
+    other = config_from_dict({"speech": {**old, "language_mode": "other"}}).speech
+    assert other.read_language == "sl" and other.language_voices["sl"] == "supertonic:F4"
+    auto = config_from_dict({"speech": {**old, "language_mode": "auto"}}).speech
+    assert auto.read_language == "auto"
+
+
+def test_migration_old_defaults_and_bad_old_values():
+    s = config_from_dict({"speech": {"voice": "ef_dora", "other_language": "en"}}).speech
+    assert s.language_voices == DEFAULT_LANGUAGE_VOICES  # not an English voice: default
+    s = config_from_dict({"speech": {"language_mode": "other"}}).speech
+    assert s.read_language == "hr"  # the old default other language
+
+
+def test_new_shape_wins_over_old_keys():
+    s = config_from_dict({"speech": {"voice": "bm_george", "language_voices": {"en": "af_nova"}}}).speech
+    assert s.language_voices["en"] == "af_nova"
 
 
 def test_supertonic_steps_clamped():
@@ -112,14 +191,19 @@ def test_mp3_bitrates_are_mpeg1():
 
 def test_old_keys_are_dropped_on_save(tmp_path):
     path = tmp_path / "config.toml"
-    path.write_text('[speech]\nvoice = "bf_emma"\nengine = "omnivoice"\nauto_language = true\n',
+    path.write_text('[speech]\nvoice = "bf_emma"\nengine = "omnivoice"\nauto_language = true\n'
+                    'other_language = "de"\nother_voice = "M1"\nlanguage_mode = "other"\n',
                     encoding="utf-8")
     cfg = load_config(path)
-    assert cfg.speech.voice == "bf_emma"
+    assert cfg.speech.language_voices["en"] == "bf_emma"
+    assert cfg.speech.language_voices["de"] == "supertonic:M1" and cfg.speech.read_language == "de"
     save_config(cfg, path)
     text = path.read_text(encoding="utf-8")
-    assert "[speech]\nengine =" not in text and "\nengine =" not in text
-    assert "auto_language" not in text
+    for gone in ("\nengine =", "auto_language", "other_language", "other_voice", "language_mode",
+                 "english_engine", "\nvoice ="):
+        assert gone not in text
+    assert "[speech.language_voices]" in text and 'en = "bf_emma"' in text
+    assert load_config(path) == cfg
 
 
 def test_export_mcp_defaults():

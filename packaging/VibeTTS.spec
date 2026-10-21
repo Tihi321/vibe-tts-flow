@@ -13,6 +13,7 @@ datas = [(os.path.join(ROOT, "config.example.toml"), ".")]
 datas += [(os.path.join(ROOT, "vibetts", "web"), "vibetts/web")]
 datas += collect_data_files("sv_ttk")
 datas += collect_data_files("kokoro_onnx")       # config.json (vocabulary)
+datas += collect_data_files("py3langid")        # the language model (data/model.plzma)
 datas += collect_data_files("espeakng_loader")   # espeak-ng-data (phoneme rules)
 binaries = collect_dynamic_libs("espeakng_loader")  # espeak-ng.dll
 

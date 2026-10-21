@@ -14,11 +14,12 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Any, Callable
 
 from . import docload, model_setup
-from .config import (ENGINES, EXPORT_FORMATS, EXTENSION_ID_RE, LANGUAGE_MODES, MCP_DEFAULT_PORT,
-                     MP3_BITRATES, READER_DEFAULT_PORT, ROOT, SUPERTONIC_LANGUAGE_NAMES,
+from .config import (DEFAULT_KOKORO_VOICES, DEFAULT_LANGUAGE_VOICES, DEFAULT_SUPERTONIC_VOICE,
+                     EXPORT_FORMATS, EXTENSION_ID_RE, KOKORO_LANGUAGES, MCP_DEFAULT_PORT,
+                     MP3_BITRATES, READ_AUTO, READER_DEFAULT_PORT, ROOT, SUPERTONIC_LANGUAGE_NAMES,
                      SUPERTONIC_LANGUAGES, SUPERTONIC_PREFIX, SUPERTONIC_STEPS_RANGE,
                      SUPERTONIC_VOICES, Config, export_folder, is_supertonic_voice,
-                     resolve_path, snap_bitrate)
+                     kokoro_voice_lang, resolve_path, snap_bitrate, voice_fits_language)
 from .export import ExportBusy, ExportCancelled, ExportProgress, ExportRequest
 from .hotkeys import parse_chord
 from .tts import voice_label
@@ -128,39 +129,64 @@ def _clock(seconds: float) -> str:
     return f"{s // 60}:{s % 60:02d}"
 
 
-LANG_AUTO = "Auto (detect English)"
-LANG_ENGLISH = "Always English"
+READ_AUTO_LABEL = "Auto (detect language)"
 EXPORT_LANG_AUTO = "Auto"
-EXPORT_LANG_ENGLISH = "English"
+ENGINE_SUPERTONIC, ENGINE_KOKORO, ENGINE_OFF = "Supertonic", "Kokoro", "Off"
+OFF_SUFFIX = " (off)"
 SUPERTONIC_NOTE = ("Supertonic 3 by Supertone: 31 languages, about 400 MB. "
                    "Model licence OpenRAIL-M.")
 SUPERTONIC_HINT = "Download Supertonic in the Supertonic tab"
-# the 30 non-English Supertonic languages: English name -> code
-OTHER_LANGUAGES: dict[str, str] = dict(sorted(
+VOICES_HINT = ("Auto detects the language of each read and uses that language's voice. "
+               "Set a language to Off to stop detecting it.")
+LAST_LANGUAGE_NOTE = "At least one language must stay on."
+# all 31 languages, English first, then by display name: English name -> code
+LANGUAGE_CODES: dict[str, str] = {"English": "en", **dict(sorted(
     ((name, code) for code, name in SUPERTONIC_LANGUAGE_NAMES.items() if code != "en"),
-    key=lambda kv: kv[0]))
-FOLLOW_KEYS = ("voice", "english_engine", "english_supertonic_voice", "other_language",
-               "other_voice", "language_mode")
+    key=lambda kv: kv[0]))}
+FOLLOW_KEYS = ("language_voices", "read_language")
 
 
-def language_mode_label(mode: str, other_name: str) -> str:
-    if mode == "english":
-        return LANG_ENGLISH
-    if mode == "other":
-        return f"Always {other_name}"
-    return LANG_AUTO
+def read_label(code: str) -> str:
+    """'auto' -> 'Auto (detect language)', 'hr' -> 'Always Croatian'."""
+    if code == READ_AUTO:
+        return READ_AUTO_LABEL
+    return f"Always {SUPERTONIC_LANGUAGE_NAMES.get(code, code)}"
 
 
-def language_mode_from_label(label: Any) -> str:
-    """'Auto (detect English)' -> 'auto', 'Always Croatian' -> 'other'; unknown text is kept."""
+def read_from_label(label: Any) -> str:
+    """'Always Croatian' -> 'hr', 'Auto (detect language)' -> 'auto'; unknown text is kept."""
     text = str(label or "").strip()
-    if text == LANG_AUTO:
-        return "auto"
-    if text == LANG_ENGLISH:
-        return "english"
-    if text.startswith("Always ") and text[7:] in OTHER_LANGUAGES:
-        return "other"
+    if text == READ_AUTO_LABEL:
+        return READ_AUTO
+    if text.startswith("Always ") and text[7:] in LANGUAGE_CODES:
+        return LANGUAGE_CODES[text[7:]]
     return text
+
+
+def language_label(code: str, voice: str) -> str:
+    """Language combo entry: the display name, marked '(off)' when its voice is Off."""
+    name = SUPERTONIC_LANGUAGE_NAMES[code]
+    return name if voice else name + OFF_SUFFIX
+
+
+def language_from_label(label: Any) -> str:
+    """'Croatian (off)' -> 'hr'; '' when the text is not a language."""
+    text = str(label or "").strip()
+    if text.endswith(OFF_SUFFIX):
+        text = text[: -len(OFF_SUFFIX)]
+    return LANGUAGE_CODES.get(text, "")
+
+
+def engine_choices(code: str) -> list[str]:
+    """Kokoro is offered only for the languages it reads."""
+    kokoro = [ENGINE_KOKORO] if code in KOKORO_LANGUAGES.values() else []
+    return [ENGINE_SUPERTONIC, *kokoro, ENGINE_OFF]
+
+
+def engine_of(voice: str) -> str:
+    if not voice:
+        return ENGINE_OFF
+    return ENGINE_SUPERTONIC if is_supertonic_voice(voice) else ENGINE_KOKORO
 
 
 def _voice_token(raw: Any) -> str:
@@ -185,12 +211,8 @@ def form_from_config(cfg: Config) -> dict[str, Any]:
         "show_pill": bool(cfg.ui.show_pill),
         "pill_position": cfg.ui.pill_position,
         "model": model_choice(s.model),
-        "voice": s.voice,
-        "english_engine": s.english_engine,
-        "english_supertonic_voice": s.english_supertonic_voice,
-        "other_language": s.other_language,
-        "other_voice": s.other_voice,
-        "language_mode": s.language_mode,
+        "language_voices": dict(s.language_voices),
+        "read_language": s.read_language,
         "supertonic_steps": str(s.supertonic_steps),
         "speed": _num(s.speed),
         "sentence_pause": _num(s.sentence_pause),
@@ -246,12 +268,21 @@ def _choice(form: dict, key: str, label: str, options: tuple[str, ...]) -> str:
     return value
 
 
-def _supertonic_voice(form: dict, key: str, label: str) -> str:
-    raw = _voice_token(form.get(key, ""))
-    name = raw[len(SUPERTONIC_PREFIX):] if raw.startswith(SUPERTONIC_PREFIX) else raw
-    if name not in SUPERTONIC_VOICES:
-        raise ValueError(f"{label} must be one of: {', '.join(SUPERTONIC_VOICES)}")
-    return name
+def _language_voices(form: dict) -> dict[str, str]:
+    """The per-language voices of the form: '' (Off) or a voice that can read that language."""
+    raw = form.get("language_voices")
+    if not isinstance(raw, dict):
+        raise ValueError("Voices must be a language -> voice table")
+    voices: dict[str, str] = {}
+    for code in SUPERTONIC_LANGUAGES:
+        voice = _voice_token(raw.get(code, DEFAULT_LANGUAGE_VOICES[code]))
+        if voice and not voice_fits_language(voice, code):
+            raise ValueError(f"{SUPERTONIC_LANGUAGE_NAMES[code]} voice '{voice}' cannot read "
+                             "that language")
+        voices[code] = voice
+    if not any(voices.values()):
+        raise ValueError("Turn at least one language on")
+    return voices
 
 
 def config_from_form(base: Config, form: dict[str, Any]) -> Config:
@@ -279,22 +310,11 @@ def config_from_form(base: Config, form: dict[str, Any]) -> Config:
         s.model = (old[: cut + 1] + filename) if cut >= 0 else filename
     elif choice != _basename(base.speech.model):
         raise ValueError("Pick a voice model")
-    voice = _voice_token(form.get("voice", ""))
-    if not voice:
-        raise ValueError("Pick a voice")
-    if is_supertonic_voice(voice):
-        raise ValueError("English voice (Kokoro) must be a Kokoro voice")
-    s.voice = voice
-    s.english_engine = _choice(form, "english_engine", "English engine", ENGINES)
-    s.english_supertonic_voice = _supertonic_voice(
-        form, "english_supertonic_voice", "English Supertonic voice")
-    other = str(form.get("other_language", "")).strip()
-    other = other if other in SUPERTONIC_LANGUAGES else OTHER_LANGUAGES.get(other, "")
-    if not other or other == "en":
-        raise ValueError("Other language must be one of the 30 non-English Supertonic languages")
-    s.other_language = other
-    s.other_voice = _supertonic_voice(form, "other_voice", "Other language voice")
-    s.language_mode = _choice(form, "language_mode", "Language", LANGUAGE_MODES)
+    s.language_voices = _language_voices(form)
+    read = read_from_label(form.get("read_language", READ_AUTO))
+    if read != READ_AUTO and not s.language_voices.get(read):
+        raise ValueError("Read must be Auto or one of the languages that is on")
+    s.read_language = read
     s.supertonic_steps = _int(form, "supertonic_steps", "Quality steps",
                               SUPERTONIC_STEPS_RANGE[0], SUPERTONIC_STEPS_RANGE[1])
     s.speed = _float(form, "speed", "Speed", 0.5, 2.0)
@@ -336,7 +356,7 @@ class SettingsHooks:
     models_dir: Callable[[], Path]
     voices: Callable[[], list[str]]
     output_devices: Callable[[], list[str]]
-    play_test: Callable[[Config, str], None]
+    play_test: Callable[[Config, str, str], None]  # (config, text, language code)
     stop: Callable[[], None]
     open_logs: Callable[[], None]
     open_config: Callable[[], None]
@@ -449,6 +469,14 @@ class SettingsWindow:
         self._st_busy = False
         self._st_cancel = threading.Event()
         self._st_sync = False
+        # the Voices section: the edited language -> voice table, the language shown in the
+        # Language/Engine/Voice combos, the Kokoro voices on disk, and each row's last
+        # Supertonic voice (so Supertonic -> Off -> Supertonic keeps it)
+        self._lang_voices: dict[str, str] = dict(DEFAULT_LANGUAGE_VOICES)
+        self._sel_code = "en"
+        self._kokoro_voices: list[str] = []
+        self._st_memory: dict[str, str] = {}
+        self._voice_sync = False
 
     # -- public -----------------------------------------------------------
     def is_visible(self) -> bool:
@@ -502,7 +530,7 @@ class SettingsWindow:
         form = form_from_config(self.hooks.get_config())
         collected = self._collect()
         for key in FOLLOW_KEYS:
-            if key in self._vars and collected.get(key) == self._snapshot.get(key):
+            if collected.get(key) == self._snapshot.get(key):
                 self._set_form_var(key, form[key])
                 self._snapshot[key] = form[key]
 
@@ -710,41 +738,30 @@ class SettingsWindow:
 
     # -- Voice ----------------------------------------------------------------------
     def _build_voice(self, f: ttk.Frame) -> None:
-        en = ttk.LabelFrame(f, text="English", padding=10)
-        en.pack(fill="x")
-        ttk.Label(en, text="Engine").grid(row=0, column=0, sticky="w", pady=3, padx=(0, 10))
-        eng_row = ttk.Frame(en)
-        eng_row.grid(row=0, column=1, columnspan=2, sticky="w", pady=3)
-        engine_var = self._var("english_engine", "kokoro")
-        for value, text in (("kokoro", "Kokoro"), ("supertonic", "Supertonic")):
-            ttk.Radiobutton(eng_row, text=text, value=value, variable=engine_var).pack(
-                side="left", padx=(0, 12))
-        # both voice combos share one row; only the selected engine's is shown
-        self._voice_combo = self._combo(en, 1, "Voice", "voice", [], 44, readonly=True)
-        self._en_st_combo = self._combo(en, 1, "Voice", "english_supertonic_voice",
-                                        list(SUPERTONIC_VOICES), 44, readonly=True)
-        engine_var.trace_add("write", lambda *_: self._safe_ui(self._show_engine_combo))
-        self._show_engine_combo()
-
-        ot = ttk.LabelFrame(f, text="Other language", padding=10)
-        ot.pack(fill="x", pady=(10, 0))
-        self._other_combo = self._combo(ot, 0, "Language", "other_language",
-                                        list(OTHER_LANGUAGES), 44, readonly=True)
-        self._other_voice_combo = self._combo(ot, 1, "Voice", "other_voice",
-                                              list(SUPERTONIC_VOICES), 44, readonly=True)
-
-        lg = ttk.LabelFrame(f, text="Language", padding=10)
-        lg.pack(fill="x", pady=(10, 0))
-        self._language_combo = self._combo(
-            lg, 0, "Read", "language_mode",
-            [LANG_AUTO, LANG_ENGLISH, language_mode_label("other", "")], 44, readonly=True)
-        ttk.Label(lg, text="Auto reads English-looking text with the English voice, anything "
-                  "else with the other language.", foreground="gray", wraplength=580,
-                  justify="left").grid(row=1, column=0, columnspan=3, sticky="w")
-        self._supertonic_hint = ttk.Label(lg, text="", foreground="#d33")
-        self._supertonic_hint.grid(row=2, column=0, columnspan=3, sticky="w", pady=(4, 0))
-        self._vars["other_language"].trace_add(
-            "write", lambda *_: self._safe_ui(self._sync_language_labels))
+        vs = ttk.LabelFrame(f, text="Voices", padding=10)
+        vs.pack(fill="x")
+        self._sel_lang = tk.StringVar()
+        self._sel_engine = tk.StringVar()
+        self._sel_voice = tk.StringVar()
+        rows = (("Language", self._sel_lang), ("Engine", self._sel_engine),
+                ("Voice", self._sel_voice))
+        combos = []
+        for i, (text, var) in enumerate(rows):
+            ttk.Label(vs, text=text).grid(row=i, column=0, sticky="w", pady=3, padx=(0, 10))
+            cb = ttk.Combobox(vs, textvariable=var, values=[], width=44, state="readonly")
+            cb.grid(row=i, column=1, columnspan=2, sticky="w", pady=3)
+            combos.append(cb)
+        self._lang_combo, self._engine_combo, self._voice_combo = combos
+        self._read_combo = self._combo(vs, 3, "Read", "read_language", [READ_AUTO_LABEL], 44,
+                                       readonly=True)
+        ttk.Label(vs, text=VOICES_HINT, foreground="gray", wraplength=580,
+                  justify="left").grid(row=4, column=0, columnspan=3, sticky="w")
+        self._supertonic_hint = ttk.Label(vs, text="", foreground="#d33")
+        self._supertonic_hint.grid(row=5, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        self._sel_lang.trace_add("write", lambda *_: self._safe_ui(self._on_language_picked))
+        self._sel_engine.trace_add("write", lambda *_: self._safe_ui(self._on_engine_picked))
+        self._sel_voice.trace_add("write", lambda *_: self._safe_ui(self._on_voice_picked))
+        self._sync_voice_rows()
 
         vo = ttk.LabelFrame(f, text="Playback", padding=10)
         vo.pack(fill="x", pady=(10, 0))
@@ -767,28 +784,90 @@ class SettingsWindow:
         self._test_result = ttk.Label(row, text="", wraplength=440, justify="left")
         self._test_result.pack(side="left", padx=10)
 
-    def _show_engine_combo(self) -> None:
-        supertonic = str(self._vars["english_engine"].get()) == "supertonic"
-        shown, hidden = (self._en_st_combo, self._voice_combo) if supertonic else (
-            self._voice_combo, self._en_st_combo)
-        hidden.grid_remove()
-        shown.grid()
+    def _kokoro_choices(self, code: str) -> list[str]:
+        """Kokoro voices that read `code`: the ones on disk, else that language's default."""
+        voices = [v for v in self._kokoro_voices if kokoro_voice_lang(v) == code]
+        return voices or ([DEFAULT_KOKORO_VOICES[code]] if code in DEFAULT_KOKORO_VOICES else [])
 
-    def _sync_language_labels(self) -> None:
-        """The third Language choice names the selected other language."""
-        name = str(self._vars["other_language"].get())
-        third = language_mode_label("other", name)
-        mode = language_mode_from_label(self._vars["language_mode"].get())
-        self._language_combo.configure(values=[LANG_AUTO, LANG_ENGLISH, third])
-        if mode == "other":
-            self._vars["language_mode"].set(third)
+    def _sync_voice_rows(self) -> None:
+        """Redraw the Language/Engine/Voice combos from the edited table, and keep the Read
+        choices to the languages that are on (a Read language that went Off falls to Auto)."""
+        code, voice = self._sel_code, self._lang_voices.get(self._sel_code, "")
+        self._voice_sync = True
+        try:
+            self._lang_combo.configure(values=[
+                language_label(c, self._lang_voices.get(c, "")) for c in LANGUAGE_CODES.values()])
+            self._sel_lang.set(language_label(code, voice))
+            engine = engine_of(voice)
+            self._engine_combo.configure(values=engine_choices(code))
+            self._sel_engine.set(engine)
+            if engine == ENGINE_SUPERTONIC:
+                voices = [SUPERTONIC_PREFIX + v for v in SUPERTONIC_VOICES]
+            elif engine == ENGINE_KOKORO:
+                voices = self._kokoro_choices(code)
+                if voice not in voices:
+                    voices.insert(0, voice)
+            else:
+                voices = []
+            self._voice_combo.configure(
+                values=[f"{v}  {voice_label(v)}" for v in voices],
+                state="disabled" if engine == ENGINE_OFF else "readonly")
+            self._sel_voice.set(f"{voice}  {voice_label(voice)}" if voice else "")
+            on = [c for c in LANGUAGE_CODES.values() if self._lang_voices.get(c, "")]
+            labels = [READ_AUTO_LABEL, *(read_label(c) for c in on)]
+            self._read_combo.configure(values=labels)
+            if self._vars["read_language"].get() not in labels:
+                self._vars["read_language"].set(READ_AUTO_LABEL)
+        finally:
+            self._voice_sync = False
+        self._refresh_voice_hint()
+
+    def _on_language_picked(self) -> None:
+        if self._voice_sync:
+            return
+        code = language_from_label(self._sel_lang.get())
+        if code:
+            self._sel_code = code
+            self._sync_voice_rows()
+
+    def _on_engine_picked(self) -> None:
+        if self._voice_sync:
+            return
+        code, old = self._sel_code, self._lang_voices.get(self._sel_code, "")
+        engine = str(self._sel_engine.get())
+        if engine not in engine_choices(code) or engine == engine_of(old):
+            return
+        if engine == ENGINE_OFF and sum(1 for v in self._lang_voices.values() if v) <= 1:
+            self._sync_voice_rows()  # put the combo back
+            self._set_status(LAST_LANGUAGE_NOTE)
+            return
+        if is_supertonic_voice(old):
+            self._st_memory[code] = old
+        if engine == ENGINE_OFF:
+            new = ""
+        elif engine == ENGINE_KOKORO:
+            new = DEFAULT_KOKORO_VOICES[code]
+        else:
+            new = self._st_memory.get(code, DEFAULT_SUPERTONIC_VOICE)
+        self._lang_voices[code] = new
+        self._sync_voice_rows()
+
+    def _on_voice_picked(self) -> None:
+        if self._voice_sync:
+            return
+        code, voice = self._sel_code, _voice_token(self._sel_voice.get())
+        if voice and voice != self._lang_voices.get(code) and voice_fits_language(voice, code):
+            self._lang_voices[code] = voice
+            self._sync_voice_rows()
 
     def _set_form_var(self, key: str, value: Any) -> None:
         """Set a form variable from its config-side value (codes -> display names)."""
-        if key == "other_language":
-            value = SUPERTONIC_LANGUAGE_NAMES.get(str(value), value)
-        elif key == "language_mode":
-            value = language_mode_label(str(value), str(self._vars["other_language"].get()))
+        if key == "language_voices":
+            self._lang_voices = dict(DEFAULT_LANGUAGE_VOICES) | dict(value)
+            self._sync_voice_rows()
+            return
+        if key == "read_language":
+            value = read_label(str(value))
         self._vars[key].set(value)
 
     def _refresh_voice_hint(self) -> None:
@@ -796,7 +875,8 @@ class SettingsWindow:
             present = bool(self.hooks.supertonic_present())
         except Exception:
             present = False
-        self._supertonic_hint.configure(text="" if present else SUPERTONIC_HINT)
+        wanted = any(is_supertonic_voice(v) for v in self._lang_voices.values())
+        self._supertonic_hint.configure(text="" if present or not wanted else SUPERTONIC_HINT)
 
     # -- Export ------------------------------------------------------------------
     def _build_export(self, f: ttk.Frame) -> None:
@@ -831,7 +911,7 @@ class SettingsWindow:
             state="readonly")
         self._export_voice_combo.grid(row=0, column=1, columnspan=2, sticky="w", pady=3)
         self._export_lang_codes: dict[str, str | None] = {
-            EXPORT_LANG_AUTO: None, EXPORT_LANG_ENGLISH: "en", **OTHER_LANGUAGES}
+            EXPORT_LANG_AUTO: None, **LANGUAGE_CODES}
         self._export_lang = tk.StringVar(value=EXPORT_LANG_AUTO)
         ttk.Label(vo, text="Language").grid(row=2, column=0, sticky="w", pady=3, padx=(0, 10))
         self._export_lang_combo = ttk.Combobox(
@@ -1547,20 +1627,15 @@ class SettingsWindow:
             self._setup.pack_forget()
 
     def _load_voices(self) -> None:
-        """Fill the Kokoro English voice combo (Supertonic voices are the fixed F1..M5)."""
+        """Remember the Kokoro voices on disk (all supported languages) for the Voices section;
+        Supertonic voices are the fixed F1..M5."""
         try:
             voices = [v for v in self.hooks.voices() if not is_supertonic_voice(v)]
         except Exception:
             log.debug("voice list failed", exc_info=True)
             voices = []
-        current = _voice_token(self._vars["voice"].get())
-        if current and current not in voices:
-            voices.insert(0, current)
-        display = {v: f"{v}  {voice_label(v)}" for v in voices}
-        self._voice_combo.configure(values=[display[v] for v in voices])
-        if current:
-            self._vars["voice"].set(display.get(current, current))
-        self._refresh_voice_hint()
+        self._kokoro_voices = voices
+        self._sync_voice_rows()
 
     def _refresh_files(self) -> None:
         mdir = self.hooks.models_dir()
@@ -1690,10 +1765,16 @@ class SettingsWindow:
         except ValueError as e:
             self._test_result.configure(text=str(e), foreground="#d33")
             return
+        code = self._sel_code
+        if not cfg.speech.language_voices.get(code):
+            self._test_result.configure(
+                text=f"{SUPERTONIC_LANGUAGE_NAMES[code]} is off. Pick a voice to try it.",
+                foreground="#d33")
+            return
         text = self._sample.get().strip() or SAMPLE_TEXT
         self._test_result.configure(text="", foreground="")
         try:
-            self.hooks.play_test(cfg, text)
+            self.hooks.play_test(cfg, text, code)
         except Exception as e:  # noqa: BLE001
             self._test_result.configure(text=f"Failed: {e}", foreground="#d33")
 
@@ -1732,7 +1813,7 @@ class SettingsWindow:
         cfg = self.hooks.get_config()
         form = form_from_config(cfg)
         for key, value in form.items():
-            if key in self._vars:
+            if key in self._vars or key == "language_voices":
                 self._set_form_var(key, value)
         self._load_voices()
         self._refresh_supertonic()
@@ -1755,16 +1836,9 @@ class SettingsWindow:
 
     def _collect(self) -> dict[str, Any]:
         form = {k: v.get() for k, v in self._vars.items()}
-        if "voice" in form:
-            form["voice"] = _voice_token(form["voice"])
-        for key in ("english_supertonic_voice", "other_voice"):
-            if key in form:
-                form[key] = _voice_token(form[key])
-        if "other_language" in form:
-            name = str(form["other_language"]).strip()
-            form["other_language"] = OTHER_LANGUAGES.get(name, name)
-        if "language_mode" in form:
-            form["language_mode"] = language_mode_from_label(form["language_mode"])
+        form["language_voices"] = dict(self._lang_voices)
+        if "read_language" in form:
+            form["read_language"] = read_from_label(form["read_language"])
         return form
 
     def _is_dirty(self) -> bool:

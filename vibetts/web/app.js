@@ -516,7 +516,7 @@ function speakBody(item) {
     speed: settings.speed,
   };
   if (settings.voice) body.voice = settings.voice;
-  if (settings.lang && langRelevant()) body.lang = settings.lang;
+  if (settings.lang && langSupported(settings.voice, settings.lang)) body.lang = settings.lang;
   return body;
 }
 
@@ -735,16 +735,29 @@ function updateControls() {
   $("#prev-sent").disabled = !hasBook;
   $("#next-sent").disabled = !hasBook;
   $("#elsewhere").hidden = !(st.book && elsewhere());
-  $("#lang").disabled = !langRelevant();
+  $("#lang").disabled = !st.voices;
   $("#speed-out").textContent = `${settings.speed.toFixed(2)}x`;
 }
 
-function engineOf(voiceId) {
-  const v = st.voices && st.voices.voices.find((x) => x.id === voiceId);
-  return v ? String(v.engine || "").toLowerCase() : "";
+// Language codes the voice can read, or null for "all" (Auto voice / unknown voice).
+function voiceLangs(voiceId) {
+  const v = voiceId && st.voices && (st.voices.voices || []).find((x) => x.id === voiceId);
+  return v && Array.isArray(v.languages) && v.languages.length ? v.languages : null;
 }
-function langRelevant() {
-  return !settings.voice || engineOf(settings.voice).includes("supertonic");
+function langSupported(voiceId, code) {
+  const codes = voiceLangs(voiceId);
+  return !codes || codes.includes(code);
+}
+// Offer only the languages the selected voice supports; reset to Auto if the current one isn't.
+function fillLangs() {
+  const lsel = $("#lang");
+  const codes = voiceLangs(settings.voice);
+  lsel.replaceChildren(el("option", { value: "", text: "Auto" }));
+  for (const l of st.voices.languages || []) {
+    if (!codes || codes.includes(l.code)) lsel.append(el("option", { value: l.code, text: l.name || l.code }));
+  }
+  if (settings.lang && !langSupported(settings.voice, settings.lang)) settings.lang = "";
+  lsel.value = settings.lang;
 }
 
 async function ensureVoices() {
@@ -755,7 +768,6 @@ async function ensureVoices() {
     return;
   }
   const vsel = $("#voice");
-  const lsel = $("#lang");
   vsel.replaceChildren(el("option", { value: "", text: "Auto" }));
   const groups = new Map();
   for (const v of st.voices.voices || []) {
@@ -764,13 +776,11 @@ async function ensureVoices() {
     groups.get(key).append(el("option", { value: v.id, text: v.label || v.id }));
   }
   vsel.append(...groups.values());
-  lsel.replaceChildren(el("option", { value: "", text: "Auto" }));
-  for (const l of st.voices.languages || []) lsel.append(el("option", { value: l.code, text: l.name || l.code }));
 
   if (settings.voice && !(st.voices.voices || []).some((v) => v.id === settings.voice)) settings.voice = "";
   if (settings.lang && !(st.voices.languages || []).some((l) => l.code === settings.lang)) settings.lang = "";
   vsel.value = settings.voice;
-  lsel.value = settings.lang;
+  fillLangs();
   saveSettings();
   updateControls();
 }
@@ -815,6 +825,7 @@ function initReader() {
   speed.value = String(settings.speed);
   vsel.addEventListener("change", () => {
     settings.voice = vsel.value;
+    fillLangs();
     saveSettings();
     updateControls();
     restartIfPlaying();

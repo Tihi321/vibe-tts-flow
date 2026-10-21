@@ -11,6 +11,7 @@ const els = {
 let online = false;
 let voicesLoaded = false;
 let lastStatus = null;
+let voiceData = { voices: [], languages: [] };
 
 const send = (msg) =>
   chrome.runtime.sendMessage(msg).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
@@ -73,14 +74,33 @@ async function loadVoices() {
     o.textContent = v.label || v.id;
     els.voice.appendChild(o);
   }
-  for (const l of res.data.languages || []) {
+  voiceData = res.data;
+  els.voice.value = saved.voice || "";
+  if (els.voice.value !== (saved.voice || "")) els.voice.value = "";
+  fillLangs(saved.lang || "");
+}
+
+// Offer only the languages the selected voice supports (Auto voice -> all); reset stored lang if unsupported.
+function fillLangs(wanted) {
+  const v = (voiceData.voices || []).find((x) => x.id === els.voice.value);
+  const codes = v && Array.isArray(v.languages) && v.languages.length ? v.languages : null;
+  els.lang.replaceChildren();
+  const auto = document.createElement("option");
+  auto.value = "";
+  auto.textContent = "Auto";
+  els.lang.appendChild(auto);
+  for (const l of voiceData.languages || []) {
+    if (codes && !codes.includes(l.code)) continue;
     const o = document.createElement("option");
     o.value = l.code;
     o.textContent = l.name || l.code;
     els.lang.appendChild(o);
   }
-  els.voice.value = saved.voice || "";
-  els.lang.value = saved.lang || "";
+  els.lang.value = wanted;
+  if (els.lang.value !== wanted) {
+    els.lang.value = "";
+    chrome.storage.sync.set({ lang: "" });
+  }
 }
 
 async function activeTabId() {
@@ -112,7 +132,10 @@ els.stop.addEventListener("click", () => action({ cmd: "stop" }));
 els.prev.addEventListener("click", () => action({ cmd: "seek", delta: -1 }));
 els.next.addEventListener("click", () => action({ cmd: "seek", delta: 1 }));
 
-els.voice.addEventListener("change", () => chrome.storage.sync.set({ voice: els.voice.value }));
+els.voice.addEventListener("change", () => {
+  chrome.storage.sync.set({ voice: els.voice.value });
+  fillLangs(els.lang.value);
+});
 els.lang.addEventListener("change", () => chrome.storage.sync.set({ lang: els.lang.value }));
 els.speed.addEventListener("input", () => {
   els.speedOut.textContent = Number(els.speed.value).toFixed(2);

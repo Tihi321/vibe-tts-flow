@@ -41,8 +41,7 @@ class HotkeyConfig:
     read: str = "alt+win"  # press: read the selection; press again (or Esc): stop
 
 
-ENGINES = ("kokoro", "supertonic")
-LANGUAGE_MODES = ("auto", "english", "other")  # auto: English-looking text -> English profile
+READ_AUTO = "auto"  # speech.read_language: detect the language of each read
 SUPERTONIC_PREFIX = "supertonic:"
 SUPERTONIC_VOICES = ("F1", "F2", "F3", "F4", "F5", "M1", "M2", "M3", "M4", "M5")
 SUPERTONIC_STEPS_RANGE = (4, 16)
@@ -56,6 +55,15 @@ SUPERTONIC_LANGUAGE_NAMES = {
     "vi": "Vietnamese",
 }
 SUPERTONIC_LANGUAGES = tuple(SUPERTONIC_LANGUAGE_NAMES)  # the 31 codes Supertonic 3 reads
+# Kokoro voice prefix (af_heart -> "a") -> the language it reads. Japanese (j) is left out
+# (espeak cannot read kanji) and so is Chinese (z, Supertonic has no Chinese).
+KOKORO_LANGUAGES = {"a": "en", "b": "en", "e": "es", "f": "fr", "h": "hi", "i": "it", "p": "pt"}
+DEFAULT_SUPERTONIC_VOICE = "supertonic:F1"
+# The Kokoro voice that reads each Kokoro language when Supertonic is not installed.
+DEFAULT_KOKORO_VOICES = {"en": "af_heart", "es": "ef_dora", "fr": "ff_siwis", "hi": "hf_alpha",
+                         "it": "if_sara", "pt": "pf_dora"}
+DEFAULT_LANGUAGE_VOICES = {c: ("af_heart" if c == "en" else DEFAULT_SUPERTONIC_VOICE)
+                           for c in SUPERTONIC_LANGUAGES}
 
 
 def is_supertonic_voice(voice: str) -> bool:
@@ -63,21 +71,38 @@ def is_supertonic_voice(voice: str) -> bool:
     return voice.startswith(SUPERTONIC_PREFIX) and voice[len(SUPERTONIC_PREFIX):] in SUPERTONIC_VOICES
 
 
+def kokoro_voice_lang(voice: str) -> str | None:
+    """'af_heart' -> 'en', 'ef_dora' -> 'es'; None when it is not a supported Kokoro voice id."""
+    if len(voice) > 3 and voice[2:3] == "_":
+        return KOKORO_LANGUAGES.get(voice[:1])
+    return None
+
+
+def voice_fits_language(voice: str, lang: str) -> bool:
+    """Can `voice` read `lang`? Supertonic voices read all 31; a Kokoro voice only its own."""
+    if is_supertonic_voice(voice):
+        return lang in SUPERTONIC_LANGUAGES
+    return kokoro_voice_lang(voice) == lang
+
+
+def enabled_languages(s: "SpeechConfig") -> list[str]:
+    """Codes whose voice is not Off: English first, then SUPERTONIC_LANGUAGES order."""
+    return [c for c in SUPERTONIC_LANGUAGES if s.language_voices.get(c, "")]
+
+
 @dataclass
 class SpeechConfig:
     model: str = "models/kokoro-v1.0.int8.onnx"
     voices: str = "models/voices-v1.0.bin"
-    voice: str = "af_heart"      # Kokoro voice for English
     speed: float = 1.0           # 0.5 .. 2.0
     sentence_pause: float = 0.25  # seconds of silence between sentences
     volume: float = 1.0          # 0 .. 1
     device: str = ""             # "" = Windows default output, or part of the device name
     preload: bool = True         # load the model at startup so the first read starts at once
-    english_engine: str = "kokoro"          # kokoro | supertonic: who reads English
-    english_supertonic_voice: str = "F1"    # Supertonic voice for English (english_engine supertonic)
-    other_language: str = "hr"              # Supertonic language for text that is not English
-    other_voice: str = "F1"                 # Supertonic voice for that language
-    language_mode: str = "auto"             # auto | english | other
+    # language code -> voice: a Kokoro id (af_heart, ef_dora), "supertonic:F1" .. "supertonic:M5",
+    # or "" = Off (never detected, never offered)
+    language_voices: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_LANGUAGE_VOICES))
+    read_language: str = "auto"             # auto: detect the language of each read | a language code
     supertonic_dir: str = "models/supertonic-3"  # Supertonic model files, downloaded from Settings
     supertonic_steps: int = 8               # 4 .. 16: fewer = faster, more = better quality
 
@@ -192,6 +217,11 @@ def _coerce(value: Any, default: Any) -> Any:
         if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
             raise TypeError("expected a list of strings")
         return list(value)
+    if isinstance(default, dict):
+        if not isinstance(value, dict) or not all(
+                isinstance(k, str) and isinstance(v, str) for k, v in value.items()):
+            raise TypeError("expected a table of strings")
+        return dict(value)
     raise TypeError("unsupported type")
 
 
@@ -217,24 +247,27 @@ def _build(cls: type, data: Any, where: str) -> Any:
 
 
 def _validate_speech(s: SpeechConfig) -> None:
-    d = SpeechConfig()
-    v = s.voice
-    # Kokoro ids look like af_heart; only the English ones (a* American, b* British) are offered
-    if not (len(v) > 3 and v[2:3] == "_" and v[:1] in ("a", "b")):
-        log.warning("config: speech.voice %r is not an English Kokoro voice; using %s", v, d.voice)
-        s.voice = d.voice
-
-    def check(name: str, ok: bool) -> None:
-        if not ok:
-            log.warning("config: speech.%s %r is not valid; using %r", name, getattr(s, name),
-                        getattr(d, name))
-            setattr(s, name, getattr(d, name))
-
-    check("english_engine", s.english_engine in ENGINES)
-    check("language_mode", s.language_mode in LANGUAGE_MODES)
-    check("other_language", s.other_language in SUPERTONIC_LANGUAGES and s.other_language != "en")
-    check("english_supertonic_voice", s.english_supertonic_voice in SUPERTONIC_VOICES)
-    check("other_voice", s.other_voice in SUPERTONIC_VOICES)
+    voices = {}
+    for code, voice in s.language_voices.items():
+        if code not in SUPERTONIC_LANGUAGES:
+            log.warning("config: speech.language_voices has unknown language %r; ignored", code)
+            continue
+        voices[code] = voice
+    for code, default in DEFAULT_LANGUAGE_VOICES.items():
+        voice = voices.get(code, default)
+        if voice != "" and not voice_fits_language(voice, code):
+            log.warning("config: speech.language_voices.%s %r is not a voice for that language; "
+                        "using %r", code, voice, default)
+            voice = default
+        voices[code] = voice
+    s.language_voices = {c: voices[c] for c in SUPERTONIC_LANGUAGES}
+    if not enabled_languages(s):
+        log.warning("config: every language is off; turning English on")
+        s.language_voices["en"] = DEFAULT_LANGUAGE_VOICES["en"]
+    if s.read_language != READ_AUTO and s.read_language not in enabled_languages(s):
+        log.warning("config: speech.read_language %r is not an enabled language; using auto",
+                    s.read_language)
+        s.read_language = READ_AUTO
     lo, hi = SUPERTONIC_STEPS_RANGE
     steps = min(max(int(s.supertonic_steps), lo), hi)
     if steps != s.supertonic_steps:
@@ -243,7 +276,41 @@ def _validate_speech(s: SpeechConfig) -> None:
         s.supertonic_steps = steps
 
 
+_OLD_SPEECH_KEYS = ("voice", "english_engine", "english_supertonic_voice", "other_language",
+                    "other_voice", "language_mode")
+
+
+def _migrate_speech(d: dict) -> dict:
+    """Old [speech] keys (English profile + one other-language profile) -> language_voices and
+    read_language. Returns `d` unchanged when it is already in the new shape."""
+    sp = d.get("speech") if isinstance(d, dict) else None
+    if not isinstance(sp, dict) or "language_voices" in sp or not any(k in sp for k in _OLD_SPEECH_KEYS):
+        return d
+    sp = dict(sp)
+    voices: dict[str, str] = {}
+    en = sp.get("voice", "af_heart")
+    if sp.get("english_engine") == "supertonic":
+        st = sp.get("english_supertonic_voice", "F1")
+        en = SUPERTONIC_PREFIX + str(st)
+    if isinstance(en, str):
+        voices["en"] = en
+    other = sp.get("other_language", "hr")
+    if isinstance(other, str) and other in SUPERTONIC_LANGUAGES and other != "en":
+        voices[other] = SUPERTONIC_PREFIX + str(sp.get("other_voice", "F1"))
+    mode = sp.get("language_mode", "auto")
+    if mode == "english":
+        sp["read_language"] = "en"
+    elif mode == "other" and isinstance(other, str):
+        sp["read_language"] = other
+    sp["language_voices"] = voices
+    for k in _OLD_SPEECH_KEYS:
+        sp.pop(k, None)
+    log.info("config: migrated the old English / other-language voice settings")
+    return {**d, "speech": sp}
+
+
 def config_from_dict(d: dict) -> Config:
+    d = _migrate_speech(d)
     cfg = _build(Config, d, "config")
     _validate_speech(cfg.speech)
     _validate_export(cfg.export)

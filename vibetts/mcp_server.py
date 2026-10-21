@@ -18,12 +18,12 @@ log = logging.getLogger(__name__)
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")  # newest first
 
 INSTRUCTIONS = (
-    "VibeTTS is a local text-to-speech app: Kokoro (English) and Supertonic 3 (31 languages, when "
-    "installed). Use synthesize_to_file to turn text or a document (.txt/.md/.html/.docx/.epub/.pdf) into a "
+    "VibeTTS is a local text-to-speech app: Kokoro (English, Spanish, French, Hindi, Italian, Portuguese) and Supertonic 3 (31 languages, "
+    "when installed). Use synthesize_to_file to turn text or a document (.txt/.md/.html/.docx/.epub/.pdf) into a "
     "WAV or MP3 file (44.1 kHz mono). Use speak to read text aloud on the user's speakers; use it sparingly "
     "because it is audible to the user. Call list_voices first to get valid voice ids and language codes; "
-    "pass 'lang' to read in a specific language (omitted: English text uses the English voice, anything "
-    "else the other-language voice). synthesize_batch writes many short clips in one call. Use stop to "
+    "pass 'lang' to read in a specific language (omitted: the language is detected among the languages the user "
+    "enabled and read with that language's configured voice). synthesize_batch writes many short clips in one call. Use stop to "
     "interrupt playback or cancel a running export."
 )
 
@@ -412,8 +412,8 @@ def build_tools(api: AgentApi, max_chars: int) -> list[Tool]:
     def schema(props: dict, required: list[str] | None = None) -> dict:
         return {"type": "object", "properties": props, "required": required or [], "additionalProperties": False}
 
-    voice_p = {"type": "string", "description": "Voice id: a Kokoro English voice (af_heart) or a Supertonic voice (supertonic:F1); call list_voices for valid values. Defaults to the voice of the language profile that matches the text."}
-    lang_p = {"type": "string", "enum": list(SUPERTONIC_LANGUAGES), "description": "Language of the text (ISO code, e.g. en, hr, de). Default: detected (English text uses the English voice, anything else the app's other-language voice). Kokoro voices read English only."}
+    voice_p = {"type": "string", "description": "Voice id: a Kokoro voice (af_heart; Kokoro reads en, es, fr, hi, it, pt) or a Supertonic voice (supertonic:F1; reads all 31 languages); call list_voices for valid values. Defaults to the configured voice of the text's language."}
+    lang_p = {"type": "string", "enum": list(SUPERTONIC_LANGUAGES), "description": "Language of the text (ISO code, e.g. en, hr, de). Default: detected among the languages the user enabled, read with that language's configured voice. A Kokoro voice only reads its own language (en, es, fr, hi, it, pt); Supertonic voices read all."}
     speed_p = {"type": "number", "minimum": 0.5, "maximum": 2, "description": "Speech speed multiplier, 0.5 to 2 (default 1)."}
     limit = f" At most {max_chars} characters." if max_chars > 0 else ""
 
@@ -454,8 +454,8 @@ def build_tools(api: AgentApi, max_chars: int) -> list[Tool]:
         ),
         Tool(
             "list_voices",
-            "List the available voices (id, label, engine, languages), the language codes, the app's English and "
-            "other-language profiles, the language mode and whether Supertonic is installed. Call this to get valid voice ids.",
+            "List the available voices (id, label, engine, languages), the language codes, the voice configured for "
+            "each language (language_voices, empty = off), the read_language setting (auto or a code) and whether Supertonic is installed. Call this to get valid voice ids.",
             schema({}),
             list_voices,
             {"title": "List voices", "readOnlyHint": True, "openWorldHint": False},
