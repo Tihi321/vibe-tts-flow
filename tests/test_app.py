@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 from vibetts import app
-from vibetts.config import Config, SpeechConfig
+from vibetts.config import ALL_LANGUAGES, Config, SpeechConfig
 
 
 def test_engine_holder_missing_files(tmp_path):
@@ -62,6 +62,35 @@ class FakeSupertonic:
         return np.ones(20, np.float32)
 
 
+class FakeHiggs:
+    instances: list = []
+
+    def __init__(self, model_dir, voices_dir, temperature=0.8, threads=0):
+        self.model_dir, self.voices_dir, self.temperature = model_dir, voices_dir, temperature
+        self.calls, self.langs = [], []
+        FakeHiggs.instances.append(self)
+
+    def voices(self):
+        return fake_higgs_voice_ids(self.voices_dir)
+
+    def synth(self, text, voice, speed, lang=None):
+        self.calls.append((text, voice, speed))
+        self.langs.append(lang)
+        return np.ones(30, np.float32)
+
+
+def fake_higgs_voice_ids(voices_dir):
+    custom = sorted(p.name for p in Path(voices_dir).glob("*") if p.is_dir())
+    return [f"higgs:{n}" for n in ("F1", "F2", "M1", "M2", *custom)]
+
+
+def install_higgs(s):
+    """Make the fake Higgs 'downloaded' for the SpeechConfig `s`."""
+    d = Path(s.higgs_dir)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "ok").write_bytes(b"x")
+
+
 def install_supertonic(s):
     """Make the fake Supertonic 'downloaded' for the SpeechConfig `s`."""
     d = Path(s.supertonic_dir)
@@ -78,12 +107,18 @@ def fakes(tmp_path, monkeypatch):
     fake = types.SimpleNamespace(models_present=lambda d: (Path(d) / "ok").exists(),
                                  SupertonicEngine=FakeSupertonic)
     monkeypatch.setattr(app, "_st", lambda: fake)
+    FakeHiggs.instances = []
+    fake_hg = types.SimpleNamespace(models_present=lambda d: (Path(d) / "ok").exists(),
+                                    voice_ids=fake_higgs_voice_ids, HiggsEngine=FakeHiggs)
+    monkeypatch.setattr(app, "_hg", lambda: fake_hg)
     monkeypatch.setattr(app, "_fallback_warned", False)
+    monkeypatch.setattr(app, "_fallback_warned_higgs", False)
     model, voices = tmp_path / "m.onnx", tmp_path / "v.bin"
     model.write_bytes(b"x")
     voices.write_bytes(b"x")
     return SpeechConfig(model=str(model), voices=str(voices),
-                        supertonic_dir=str(tmp_path / "st"))
+                        supertonic_dir=str(tmp_path / "st"), higgs_dir=str(tmp_path / "hg"),
+                        higgs_voices_dir=str(tmp_path / "hgv"))
 
 
 def test_holder_loads_once_and_reloads_on_new_files(fakes, tmp_path):
@@ -559,8 +594,11 @@ def test_bridge_list_voices(bridge):
          "languages": ["en"]},
         {"id": "bf_emma", "label": "Emma (British English, female)", "engine": "kokoro",
          "languages": ["en"]}]
-    assert [l["code"] for l in out["languages"]][:3] == ["en", "ko", "ja"] and len(out["languages"]) == 31
+    assert [l["code"] for l in out["languages"]][:3] == ["en", "ko", "ja"]
+    assert [l["code"] for l in out["languages"]] == list(ALL_LANGUAGES) and len(out["languages"]) == 101
     assert {"code": "hr", "name": "Croatian"} in out["languages"]
+    assert {"code": "bs", "name": "Bosnian"} in out["languages"]
+    assert out["higgs_installed"] is False
     assert out["language_voices"] == Config().speech.language_voices
     assert out["language_voices"]["en"] == "af_heart" and out["language_voices"]["hr"] == "supertonic:F1"
     assert out["read_language"] == "auto" and out["supertonic_installed"] is False
@@ -2003,3 +2041,298 @@ def test_start_skips_the_settings_window_when_opening_a_book(fakes):
     assert started == ["b.epub"] and a._open_path is None
     a._start()
     assert opened == [()]
+
+
+# ---------------------------------------------------------------- Higgs (VTF-09)
+
+def test_higgs_helpers_and_setup(fakes):
+    s = fakes
+    assert not app.higgs_present(s) and app.voice_ready(s, "higgs:F1") is False
+    assert app.missing_message("higgs:F1") == app.MISSING_HIGGS
+    assert app.setup_tab("higgs:F1") == "higgs" and app.setup_tab("supertonic:F1") == "supertonic"
+    install_higgs(s)
+    assert app.higgs_present(s) and app.voice_ready(s, "higgs:F1") is True
+    assert app.higgs_voice_ids(s)[:4] == ["higgs:F1", "higgs:F2", "higgs:M1", "higgs:M2"]
+    assert app.voice_ready(s, "higgs:Gone") is False  # a deleted custom voice
+
+
+def test_route_higgs_languages(fakes):
+    s = _speech(fakes, hr="higgs:F1", bs="higgs:M1", de="supertonic:M1")
+    install_higgs(s)
+    assert app.route_for(s, HR_TEXT, "hr") == app.Route("higgs", "higgs:F1", "hr")
+    assert app.route_for(s, "x", "bs") == app.Route("higgs", "higgs:M1", "bs")
+    # a Higgs-only language that is Off still has a default for an explicit request
+    assert app.route_for(s, "x", "sq") == app.Route("higgs", "higgs:F1", "sq")
+
+
+def test_route_higgs_missing_falls_back(fakes, caplog):
+    s = _speech(fakes, hr="higgs:F1", es="higgs:F2", bs="higgs:F1")
+    # nothing installed: Kokoro Spanish for es, Kokoro English otherwise
+    assert app.route_for(s, "x", "es") == app.Route("kokoro", "ef_dora", "es", True, "higgs")
+    assert app.route_for(s, "x", "hr") == app.Route("kokoro", "af_heart", "en", True, "higgs")
+    assert app.route_for(s, "x", "bs") == app.Route("kokoro", "af_heart", "en", True, "higgs")
+    install_supertonic(s)  # Supertonic reads hr and es, not bs
+    assert app.route_for(s, "x", "hr") == app.Route("supertonic", "supertonic:F1", "hr", True, "higgs")
+    assert app.route_for(s, "x", "es") == app.Route("supertonic", "supertonic:F1", "es", True, "higgs")
+    assert app.route_for(s, "x", "bs") == app.Route("kokoro", "af_heart", "en", True, "higgs")
+    route = app.route_for(s, "x", "hr")
+    assert app.fallback_hint(route) == app.HIGGS_HINT
+    with caplog.at_level("WARNING", logger="vibetts.app"):
+        assert app.note_fallback(route) is True and app.note_fallback(route) is False
+    assert "Higgs is not installed" in caplog.text and "Supertonic is not installed" not in caplog.text
+    # the missing-Supertonic note is a separate once-per-session message
+    st = app.Route("kokoro", "af_heart", "en", True)
+    assert app.fallback_hint(st) == app.SUPERTONIC_HINT and app.note_fallback(st) is True
+
+
+def test_route_with_a_deleted_custom_higgs_voice_falls_back(fakes):
+    s = _speech(fakes, hr="higgs:Gone")
+    install_higgs(s)
+    install_supertonic(s)
+    assert app.voice_for_lang(s, "hr") == "higgs:Gone"  # no crash
+    assert app.voice_ready(s, "higgs:Gone") is False
+    assert app.route_for(s, "x", "hr") == app.Route("supertonic", "supertonic:F1", "hr", True, "higgs")
+    Path(s.higgs_voices_dir, "Gone").mkdir(parents=True)  # the clip folder is back
+    assert app.route_for(s, "x", "hr") == app.Route("higgs", "higgs:Gone", "hr")
+
+
+def test_route_request_higgs(fakes):
+    s = fakes
+    assert app.route_request(s, "x", "higgs:F1", "bs") == app.Route("higgs", "higgs:F1", "bs")
+    assert app.route_request(s, "x", "higgs:Anna", "hr") == app.Route("higgs", "higgs:Anna", "hr")
+    with pytest.raises(ValueError, match="Higgs does not read Japanese"):
+        app.route_request(s, "x", "higgs:F1", "ja")
+    with pytest.raises(ValueError, match="Supertonic does not read Bosnian"):
+        app.route_request(s, "x", "supertonic:F1", "bs")
+    with pytest.raises(ValueError, match="higgs: voice"):
+        app.route_request(s, "x", "af_heart", "bs")
+    with pytest.raises(ValueError, match="Unknown language"):
+        app.route_request(s, "x", None, "xx")
+    assert app.route_request(s, "x", None, "bs").lang == "en"  # Higgs missing: Kokoro English
+    install_higgs(s)
+    assert app.route_request(s, "x", None, "bs") == app.Route("higgs", "higgs:F1", "bs")
+
+
+def test_routing_engine_sends_higgs_voices_to_higgs():
+    k, st, hg = FakeKokoro(), FakeSupertonic("d"), FakeHiggs("d", "v")
+    eng = app.RoutingEngine(k, st, hg)
+    eng.synth("a", "higgs:F1", 1.0, "hr")
+    eng.synth("b", "supertonic:F1", 1.0, "hr")
+    eng.synth("c", "af_heart", 1.0)
+    assert [c[0] for c in hg.calls] == ["a"] and [c[0] for c in st.calls] == ["b"]
+    assert [c[0] for c in k.calls] == ["c"]
+    assert "higgs:F1" in eng.voices()
+    with pytest.raises(RuntimeError, match="Settings > Higgs"):
+        app.RoutingEngine(k, st).synth("a", "higgs:F1", 1.0)
+
+
+def test_holder_loads_higgs_with_warm_up_and_keys_on_temperature(fakes):
+    s = fakes
+    holder = app.EngineHolder()
+    with pytest.raises(RuntimeError, match="Higgs is not installed"):
+        holder.get(s, voice="higgs:F1")
+    install_higgs(s)
+    eng = holder.get(s, voice="higgs:F2").higgs
+    assert isinstance(eng, FakeHiggs) and eng.calls == [("Ready.", "higgs:F2", 1.0)]
+    assert eng.model_dir == Path(s.higgs_dir) and eng.temperature == 0.8
+    assert holder.get(s, voice="higgs:F2").higgs is eng and holder.loaded.higgs is eng
+    assert holder.get(dataclasses.replace(s, higgs_temperature=0.5), voice="higgs:F1").higgs is not eng
+    holder.unload_higgs()
+    assert holder.loaded is None
+
+
+def test_higgs_warm_up_failure_does_not_block_loading(fakes, monkeypatch):
+    install_higgs(fakes)
+
+    class Boom(FakeHiggs):
+        def synth(self, *a, **k):
+            raise RuntimeError("no kernels")
+
+    monkeypatch.setattr(app, "_hg", lambda: types.SimpleNamespace(
+        models_present=lambda d: True, voice_ids=fake_higgs_voice_ids, HiggsEngine=Boom))
+    assert isinstance(app.EngineHolder().get(fakes, voice="higgs:F1").higgs, Boom)
+
+
+def test_preload_covers_higgs(fakes):
+    s = _speech(fakes, read_language="hr", hr="higgs:F1")
+    install_higgs(s)
+    holder = app.EngineHolder()
+    holder.preload(s)
+    for _ in range(100):
+        if holder.loaded is not None and holder.loaded.higgs is not None:
+            break
+        time.sleep(0.02)
+    assert isinstance(holder.loaded.higgs, FakeHiggs)
+
+
+def test_voices_include_higgs_when_installed(fakes):
+    a = make_app(fakes)
+    install_higgs(a.cfg.speech)
+    assert a._voices()[-4:] == ["higgs:F1", "higgs:F2", "higgs:M1", "higgs:M2"]
+
+
+def test_higgs_unloaded_when_no_language_uses_it(fakes):
+    s = _speech(fakes, hr="higgs:F1")
+    install_higgs(s)
+    a = make_app(s)
+    a.cfg.speech.preload = False
+    a.engine.get(s, voice="higgs:F1")
+    assert a.engine.loaded.higgs is not None
+    a._set_voice("de", "supertonic:M1")  # Higgs still used by hr
+    assert a.engine.loaded is not None
+    a._set_voice("hr", "supertonic:F1")
+    assert a.engine.loaded is None
+    a._set_voice("bs", "higgs:M1")  # a Higgs-only language accepts Higgs
+    assert a.cfg.speech.language_voices["bs"] == "higgs:M1"
+    a._set_voice("bs", "supertonic:F1")  # but not Supertonic
+    assert a.cfg.speech.language_voices["bs"] == "higgs:M1"
+    a._set_voice("bs", "")
+    new = Config(speech=dataclasses.replace(s, language_voices={**s.language_voices, "hr": "higgs:F1"}))
+    a.engine.get(new.speech, voice="higgs:F1")
+    assert a.engine.loaded.higgs is not None
+    new.speech.language_voices["hr"] = "supertonic:F1"
+    a.cfg = new
+    a.listener = type("L", (), {"set_bindings": lambda self, b: None})()
+    a.apply_config(new)  # Settings applied: no language uses Higgs any more
+    assert a.engine.loaded is None
+
+
+def test_higgs_changed_reloads_in_the_background(fakes):
+    s = _speech(fakes, hr="higgs:F1")
+    install_higgs(s)
+    a = make_app(s)
+    a.cfg.speech.preload = False
+    a.engine.get(s, voice="higgs:F1")
+    app._fallback_warned_higgs = True
+    import shutil
+
+    shutil.rmtree(s.higgs_dir)
+    a._higgs_changed()
+    for t in threading.enumerate():
+        if t.name == "vibetts-higgs-reload":
+            t.join(5)
+    assert a.engine.loaded is None and app._fallback_warned_higgs is False and a.tray.updates == 1
+
+
+def test_settings_hooks_get_higgs_wiring(mapp, monkeypatch):
+    a = mapp
+    a._autostart = type("A", (), {"is_enabled": staticmethod(lambda: False)})
+    monkeypatch.setattr("vibetts.settings_ui.SettingsWindow", FakeSettingsWindow)
+    hooks = a._settings_window().hooks
+    assert hooks.higgs_dir() == Path(a.cfg.speech.higgs_dir)
+    assert hooks.higgs_voices_dir() == Path(a.cfg.speech.higgs_voices_dir)
+    assert hooks.higgs_present() is False and hooks.higgs_changed == a._higgs_changed
+
+
+def test_bridge_list_voices_and_check_voice_with_higgs(bridge):
+    from vibetts.mcp_server import ToolError
+
+    b, a = bridge
+    s = a.cfg.speech
+    a._voices = lambda: ["af_heart", *app.higgs_voice_ids(s)] if app.higgs_present(s) else ["af_heart"]
+    with pytest.raises(ToolError, match="Settings > Higgs"):
+        b._check_voice(s, "higgs:F1", "hr")
+    install_higgs(s)
+    out = b.list_voices()
+    hg = [v for v in out["voices"] if v["engine"] == "higgs"]
+    assert [v["id"] for v in hg] == ["higgs:F1", "higgs:F2", "higgs:M1", "higgs:M2"]
+    assert hg[0]["label"] == "F1 (Higgs, female)" and hg[0]["languages"] == list(app.HIGGS_LANGUAGES)
+    assert out["higgs_installed"] is True
+    b._check_voice(s, "higgs:F1", "bs")
+    with pytest.raises(ToolError, match="Unknown voice"):
+        b._check_voice(s, "higgs:Nobody", "hr")
+    with pytest.raises(ToolError, match="Higgs does not read"):
+        b._check_voice(s, "higgs:F1", "ja")
+    with pytest.raises(ToolError, match="Unknown language"):
+        b._check_voice(s, None, "xx")
+    with pytest.raises(ToolError, match="higgs: voice"):
+        b._check_voice(s, "af_heart", "bs")
+
+
+def test_tray_voices_menu_lists_higgs_voices_that_fit():
+    ids = ["af_heart", *app.supertonic_voice_ids(), "higgs:F1", "higgs:M2", "higgs:Anna"]
+    tray, calls = make_tray(voices=ids, languages=("en", "hr", "bs"),
+                            current={"en": "af_heart", "hr": "higgs:F1", "bs": ""})
+    langs = {g.text: [i.text for i in g.submenu.items] for g in tray._voice_menu().items}
+    assert langs["Croatian"][-3:] == ["F1 (female)", "M2 (male)", "Anna (custom)"]
+    assert len(langs["Croatian"]) == 1 + 10 + 3
+    assert langs["Bosnian"] == ["Off", "F1 (female)", "M2 (male)", "Anna (custom)"]  # no Supertonic
+    assert langs["English"][-3:] == ["F1 (female)", "M2 (male)", "Anna (custom)"]
+    bs = tray._voice_menu().items[2]
+    bs.submenu.items[1](tray._icon)
+    assert calls == [("voice", "bs", "higgs:F1")]
+
+
+def test_say_with_a_higgs_voice_and_lang(fakes, tmp_path, capsys):
+    cfg = Config(speech=fakes)
+    out = str(tmp_path / "o.wav")
+    assert app.say(cfg, HR_TEXT, out, voice="higgs:F1", lang="hr") == 1  # not installed
+    assert "model_setup --higgs" in capsys.readouterr().err
+    install_higgs(fakes)
+    assert app.say(cfg, HR_TEXT, out, voice="higgs:F1", lang="hr") == 0
+    eng = FakeHiggs.instances[-1]
+    assert eng.calls[-1][1] == "higgs:F1" and eng.langs[-1] == "hr"
+    assert app.say(cfg, HR_TEXT, out, voice="higgs:F1", lang="ja") == 1
+    assert "Higgs does not read Japanese" in capsys.readouterr().err
+
+
+def test_cli_voice_and_lang_need_say_or_doc():
+    with pytest.raises(SystemExit):
+        app.main(["--voice", "higgs:F1"])
+
+
+def test_run_export_with_higgs_route(fakes, tmp_path):
+    from vibetts.export import ExportRequest
+
+    install_higgs(fakes)
+    engine = app.EngineHolder().get(fakes, voice="higgs:F1")
+    req = ExportRequest(HR_TEXT, tmp_path / "x.wav", "higgs:F1", None, "hr", "wav")
+    res = app.run_export(engine, fakes, req, tmp_path)
+    assert (res.voice, res.lang) == ("higgs:F1", "hr") and res.path.exists()
+    req2 = ExportRequest(HR_TEXT, tmp_path / "y.wav", "higgs:Gone", None, "hr", "wav")
+    with pytest.raises(RuntimeError, match="Settings > Higgs"):
+        app.run_export(engine, fakes, req2, tmp_path)
+
+
+def test_routing_engine_forwards_cancel_only_to_higgs():
+    class Cancellable(FakeHiggs):
+        accepts_cancel = True
+
+        def synth(self, text, voice, speed, lang=None, cancel=None):
+            self.cancel_seen = cancel
+            return super().synth(text, voice, speed, lang)
+
+    hg, k, st = Cancellable("d", "v"), FakeKokoro(), FakeSupertonic("d")
+    eng = app.RoutingEngine(k, st, hg)
+    assert eng.accepts_cancel is True
+    token = threading.Event()
+    eng.synth("a", "higgs:F1", 1.0, "hr", cancel=token)
+    assert hg.cancel_seen is token
+    eng.synth("b", "af_heart", 1.0, None, cancel=token)  # Kokoro's signature is unchanged
+    eng.synth("c", "supertonic:F1", 1.0, "hr", cancel=token)
+    assert k.calls and st.calls
+    # a Higgs engine without cancel support is still called the old way
+    plain = app.RoutingEngine(higgs=FakeHiggs("d", "v"))
+    plain.synth("a", "higgs:F1", 1.0, "hr", cancel=token)
+
+
+def test_export_cancel_stops_higgs_mid_chunk(fakes, tmp_path):
+    from vibetts.export import ExportCancelled, ExportRequest
+    from vibetts.tts import SynthCancelled
+
+    class Slow(FakeHiggs):
+        accepts_cancel = True
+
+        def synth(self, text, voice, speed, lang=None, cancel=None):
+            while not cancel.is_set():
+                time.sleep(0.01)
+            raise SynthCancelled()
+
+    install_higgs(fakes)
+    cancel = threading.Event()
+    threading.Timer(0.2, cancel.set).start()
+    req = ExportRequest(HR_TEXT, tmp_path / "x.wav", "higgs:F1", None, "hr", "wav")
+    t0 = time.monotonic()
+    with pytest.raises(ExportCancelled):
+        app.run_export(app.RoutingEngine(higgs=Slow("d", "v")), fakes, req, tmp_path, cancel=cancel)
+    assert time.monotonic() - t0 < 3 and not (tmp_path / "x.wav").exists()

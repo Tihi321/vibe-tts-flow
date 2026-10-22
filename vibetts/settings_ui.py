@@ -14,12 +14,14 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Any, Callable
 
 from . import docload, model_setup
-from .config import (DEFAULT_KOKORO_VOICES, DEFAULT_LANGUAGE_VOICES, DEFAULT_SUPERTONIC_VOICE,
-                     EXPORT_FORMATS, EXTENSION_ID_RE, KOKORO_LANGUAGES, MCP_DEFAULT_PORT,
-                     MP3_BITRATES, READ_AUTO, READER_DEFAULT_PORT, ROOT, SUPERTONIC_LANGUAGE_NAMES,
-                     SUPERTONIC_LANGUAGES, SUPERTONIC_PREFIX, SUPERTONIC_STEPS_RANGE,
-                     SUPERTONIC_VOICES, Config, export_folder, is_supertonic_voice,
-                     kokoro_voice_lang, resolve_path, snap_bitrate, voice_fits_language)
+from .config import (ALL_LANGUAGES, DEFAULT_KOKORO_VOICES, DEFAULT_LANGUAGE_VOICES,
+                     DEFAULT_SUPERTONIC_VOICE, EXPORT_FORMATS, EXTENSION_ID_RE, HIGGS_LANGUAGES,
+                     HIGGS_PREFIX, HIGGS_PRESETS, HIGGS_TEMPERATURE_RANGE, HIGGS_VOICE_NAME_RE,
+                     KOKORO_LANGUAGES, LANGUAGE_NAMES, MCP_DEFAULT_PORT, MP3_BITRATES, READ_AUTO,
+                     READER_DEFAULT_PORT, ROOT, SUPERTONIC_LANGUAGES, SUPERTONIC_PREFIX,
+                     SUPERTONIC_STEPS_RANGE, SUPERTONIC_VOICES, Config, export_folder,
+                     is_higgs_voice, is_supertonic_voice, kokoro_voice_lang, resolve_path,
+                     snap_bitrate, voice_fits_language)
 from .export import ExportBusy, ExportCancelled, ExportProgress, ExportRequest
 from .hotkeys import parse_chord
 from .tts import voice_label
@@ -31,10 +33,10 @@ except ImportError:  # pragma: no cover
 
 log = logging.getLogger(__name__)
 
-TABS = ("general", "voice", "export", "kokoro", "supertonic", "mcp", "reader", "about")
+TABS = ("general", "voice", "export", "kokoro", "supertonic", "higgs", "mcp", "reader", "about")
 TAB_TITLES = {"general": "General", "voice": "Voice", "export": "Export", "kokoro": "Kokoro",
-              "supertonic": "Supertonic", "mcp": "Agents (MCP)", "reader": "Reader",
-              "about": "About"}
+              "supertonic": "Supertonic", "higgs": "Higgs", "mcp": "Agents (MCP)",
+              "reader": "Reader", "about": "About"}
 SCROLL_TABS = ("voice", "export", "reader")
 PILL_POSITIONS = ("top", "bottom")
 SAMPLE_TEXT = ("Hello! This is how VibeTTS sounds. Select any text, press the hotkey, "
@@ -131,17 +133,26 @@ def _clock(seconds: float) -> str:
 
 READ_AUTO_LABEL = "Auto (detect language)"
 EXPORT_LANG_AUTO = "Auto"
-ENGINE_SUPERTONIC, ENGINE_KOKORO, ENGINE_OFF = "Supertonic", "Kokoro", "Off"
+ENGINE_SUPERTONIC, ENGINE_KOKORO, ENGINE_HIGGS, ENGINE_OFF = (
+    "Supertonic", "Kokoro", "Higgs", "Off")
 OFF_SUFFIX = " (off)"
 SUPERTONIC_NOTE = ("Supertonic 3 by Supertone: 31 languages, about 400 MB. "
                    "Model licence OpenRAIL-M.")
 SUPERTONIC_HINT = "Download Supertonic in the Supertonic tab"
+HIGGS_VOICE_HINT = "Download Higgs in the Higgs tab"
+HIGGS_NOTE = ("Higgs Audio v3 by Boson AI: about 94 languages and voice cloning from your own "
+              "clips. About 3.85 GB download and about 5 GB of RAM while loaded. It is slower "
+              "than real time on a CPU, so live reads pause between sentences (exports are "
+              "unaffected). Licence: Boson Higgs Audio v3 Research and Non-Commercial License: "
+              "personal use only; commercial use needs a licence from Boson AI.")
+HIGGS_TEST_TEXT = "Hello! This is how this voice sounds."
+HIGGS_STEP = 0.05
 VOICES_HINT = ("Auto detects the language of each read and uses that language's voice. "
                "Set a language to Off to stop detecting it.")
 LAST_LANGUAGE_NOTE = "At least one language must stay on."
-# all 31 languages, English first, then by display name: English name -> code
+# every language, English first, then by display name: English name -> code
 LANGUAGE_CODES: dict[str, str] = {"English": "en", **dict(sorted(
-    ((name, code) for code, name in SUPERTONIC_LANGUAGE_NAMES.items() if code != "en"),
+    ((name, code) for code, name in LANGUAGE_NAMES.items() if code != "en"),
     key=lambda kv: kv[0]))}
 FOLLOW_KEYS = ("language_voices", "read_language")
 
@@ -150,7 +161,7 @@ def read_label(code: str) -> str:
     """'auto' -> 'Auto (detect language)', 'hr' -> 'Always Croatian'."""
     if code == READ_AUTO:
         return READ_AUTO_LABEL
-    return f"Always {SUPERTONIC_LANGUAGE_NAMES.get(code, code)}"
+    return f"Always {LANGUAGE_NAMES.get(code, code)}"
 
 
 def read_from_label(label: Any) -> str:
@@ -165,7 +176,7 @@ def read_from_label(label: Any) -> str:
 
 def language_label(code: str, voice: str) -> str:
     """Language combo entry: the display name, marked '(off)' when its voice is Off."""
-    name = SUPERTONIC_LANGUAGE_NAMES[code]
+    name = LANGUAGE_NAMES[code]
     return name if voice else name + OFF_SUFFIX
 
 
@@ -178,15 +189,40 @@ def language_from_label(label: Any) -> str:
 
 
 def engine_choices(code: str) -> list[str]:
-    """Kokoro is offered only for the languages it reads."""
-    kokoro = [ENGINE_KOKORO] if code in KOKORO_LANGUAGES.values() else []
-    return [ENGINE_SUPERTONIC, *kokoro, ENGINE_OFF]
+    """Each engine is offered only for the languages it reads."""
+    return [*([ENGINE_SUPERTONIC] if code in SUPERTONIC_LANGUAGES else []),
+            *([ENGINE_KOKORO] if code in KOKORO_LANGUAGES.values() else []),
+            *([ENGINE_HIGGS] if code in HIGGS_LANGUAGES else []),
+            ENGINE_OFF]
 
 
 def engine_of(voice: str) -> str:
     if not voice:
         return ENGINE_OFF
-    return ENGINE_SUPERTONIC if is_supertonic_voice(voice) else ENGINE_KOKORO
+    if is_supertonic_voice(voice):
+        return ENGINE_SUPERTONIC
+    return ENGINE_HIGGS if is_higgs_voice(voice) else ENGINE_KOKORO
+
+
+_detectable: set[str] | None = None
+
+
+def detectable_languages() -> set[str]:
+    """Language codes automatic detection can recognise (py3langid's model); every code when
+    that cannot be read, so no hint is shown."""
+    global _detectable
+    if _detectable is None:
+        try:
+            from . import langdetect
+            fn = getattr(langdetect, "detectable_languages", None)
+            if fn is not None:
+                _detectable = set(fn())
+            else:
+                _detectable = set(langdetect._get_identifier()._full_model[2])
+        except Exception:
+            log.debug("could not list detectable languages", exc_info=True)
+            return set(ALL_LANGUAGES)
+    return _detectable
 
 
 def _voice_token(raw: Any) -> str:
@@ -214,6 +250,7 @@ def form_from_config(cfg: Config) -> dict[str, Any]:
         "language_voices": dict(s.language_voices),
         "read_language": s.read_language,
         "supertonic_steps": str(s.supertonic_steps),
+        "higgs_temperature": _num(s.higgs_temperature),
         "speed": _num(s.speed),
         "sentence_pause": _num(s.sentence_pause),
         "volume": _num(s.volume),
@@ -274,10 +311,10 @@ def _language_voices(form: dict) -> dict[str, str]:
     if not isinstance(raw, dict):
         raise ValueError("Voices must be a language -> voice table")
     voices: dict[str, str] = {}
-    for code in SUPERTONIC_LANGUAGES:
+    for code in ALL_LANGUAGES:
         voice = _voice_token(raw.get(code, DEFAULT_LANGUAGE_VOICES[code]))
         if voice and not voice_fits_language(voice, code):
-            raise ValueError(f"{SUPERTONIC_LANGUAGE_NAMES[code]} voice '{voice}' cannot read "
+            raise ValueError(f"{LANGUAGE_NAMES[code]} voice '{voice}' cannot read "
                              "that language")
         voices[code] = voice
     if not any(voices.values()):
@@ -317,6 +354,8 @@ def config_from_form(base: Config, form: dict[str, Any]) -> Config:
     s.read_language = read
     s.supertonic_steps = _int(form, "supertonic_steps", "Quality steps",
                               SUPERTONIC_STEPS_RANGE[0], SUPERTONIC_STEPS_RANGE[1])
+    s.higgs_temperature = _float(form, "higgs_temperature", "Higgs temperature",
+                                 HIGGS_TEMPERATURE_RANGE[0], HIGGS_TEMPERATURE_RANGE[1])
     s.speed = _float(form, "speed", "Speed", 0.5, 2.0)
     s.sentence_pause = _float(form, "sentence_pause", "Pause between sentences (s)", 0.0, 3.0)
     s.volume = _float(form, "volume", "Volume", 0.0, 1.0)
@@ -382,6 +421,11 @@ class SettingsHooks:
     supertonic_dir: Callable[[], Path] = lambda: ROOT / "models" / "supertonic-3"
     supertonic_present: Callable[[], bool] = lambda: False
     supertonic_changed: Callable[[], None] = lambda: None
+    # Higgs model files and the user's own voice clips (the Higgs tab)
+    higgs_dir: Callable[[], Path] = lambda: ROOT / "models" / "higgs-audio-v3"
+    higgs_present: Callable[[], bool] = lambda: False
+    higgs_changed: Callable[[], None] = lambda: None  # after download / delete / voice add / delete
+    higgs_voices_dir: Callable[[], Path] = lambda: ROOT / "models" / "higgs-voices"
 
 
 # ---------------------------------------------------------------- win32 / theme helpers
@@ -469,6 +513,12 @@ class SettingsWindow:
         self._st_busy = False
         self._st_cancel = threading.Event()
         self._st_sync = False
+        self._hg_busy = False
+        self._hg_cancel = threading.Event()
+        self._hg_sync = False
+        self._hg_adding = False
+        self._hg_dialog: tk.Toplevel | None = None
+        self._hg_voices: list[str] = []
         # the Voices section: the edited language -> voice table, the language shown in the
         # Language/Engine/Voice combos, the Kokoro voices on disk, and each row's last
         # Supertonic voice (so Supertonic -> Off -> Supertonic keeps it)
@@ -476,6 +526,7 @@ class SettingsWindow:
         self._sel_code = "en"
         self._kokoro_voices: list[str] = []
         self._st_memory: dict[str, str] = {}
+        self._hg_memory: dict[str, str] = {}
         self._voice_sync = False
 
     # -- public -----------------------------------------------------------
@@ -510,6 +561,8 @@ class SettingsWindow:
             pass
         if download and tab == "supertonic":
             self._st_download()
+        elif download and tab == "higgs":
+            self._hg_download()
         elif download and not self._busy:
             self._nb.select(TABS.index("kokoro"))
             self._download_missing()
@@ -521,6 +574,7 @@ class SettingsWindow:
             self._safe_ui(self._follow_config)
             self._safe_ui(self._refresh_files)
             self._safe_ui(self._refresh_supertonic)
+            self._safe_ui(self._refresh_higgs)
             self._safe_ui(self._load_voices)
             self._safe_ui(self._refresh_export)
             self._safe_ui(self._refresh_mcp)
@@ -633,6 +687,7 @@ class SettingsWindow:
         self._build_export(frames["export"])
         self._build_kokoro(frames["kokoro"])
         self._build_supertonic(frames["supertonic"])
+        self._build_higgs(frames["higgs"])
         self._build_mcp(frames["mcp"])
         self._build_reader(frames["reader"])
         self._build_about(frames["about"])
@@ -756,7 +811,8 @@ class SettingsWindow:
                                        readonly=True)
         ttk.Label(vs, text=VOICES_HINT, foreground="gray", wraplength=580,
                   justify="left").grid(row=4, column=0, columnspan=3, sticky="w")
-        self._supertonic_hint = ttk.Label(vs, text="", foreground="#d33")
+        self._supertonic_hint = ttk.Label(vs, text="", foreground="#d33", wraplength=580,
+                                          justify="left")
         self._supertonic_hint.grid(row=5, column=0, columnspan=3, sticky="w", pady=(4, 0))
         self._sel_lang.trace_add("write", lambda *_: self._safe_ui(self._on_language_picked))
         self._sel_engine.trace_add("write", lambda *_: self._safe_ui(self._on_engine_picked))
@@ -789,6 +845,10 @@ class SettingsWindow:
         voices = [v for v in self._kokoro_voices if kokoro_voice_lang(v) == code]
         return voices or ([DEFAULT_KOKORO_VOICES[code]] if code in DEFAULT_KOKORO_VOICES else [])
 
+    def _higgs_choices(self) -> list[str]:
+        """Higgs voices to pick: the ones the app lists, else the bundled presets."""
+        return self._hg_voices or [HIGGS_PREFIX + n for n in HIGGS_PRESETS]
+
     def _sync_voice_rows(self) -> None:
         """Redraw the Language/Engine/Voice combos from the edited table, and keep the Read
         choices to the languages that are on (a Read language that went Off falls to Auto)."""
@@ -803,6 +863,10 @@ class SettingsWindow:
             self._sel_engine.set(engine)
             if engine == ENGINE_SUPERTONIC:
                 voices = [SUPERTONIC_PREFIX + v for v in SUPERTONIC_VOICES]
+            elif engine == ENGINE_HIGGS:
+                voices = list(self._higgs_choices())
+                if voice not in voices:
+                    voices.insert(0, voice)
             elif engine == ENGINE_KOKORO:
                 voices = self._kokoro_choices(code)
                 if voice not in voices:
@@ -843,10 +907,14 @@ class SettingsWindow:
             return
         if is_supertonic_voice(old):
             self._st_memory[code] = old
+        elif is_higgs_voice(old):
+            self._hg_memory[code] = old
         if engine == ENGINE_OFF:
             new = ""
         elif engine == ENGINE_KOKORO:
             new = DEFAULT_KOKORO_VOICES[code]
+        elif engine == ENGINE_HIGGS:
+            new = self._hg_memory.get(code) or self._higgs_choices()[0]
         else:
             new = self._st_memory.get(code, DEFAULT_SUPERTONIC_VOICE)
         self._lang_voices[code] = new
@@ -871,12 +939,25 @@ class SettingsWindow:
         self._vars[key].set(value)
 
     def _refresh_voice_hint(self) -> None:
-        try:
-            present = bool(self.hooks.supertonic_present())
-        except Exception:
-            present = False
-        wanted = any(is_supertonic_voice(v) for v in self._lang_voices.values())
-        self._supertonic_hint.configure(text="" if present or not wanted else SUPERTONIC_HINT)
+        def present(hook: Callable[[], bool]) -> bool:
+            try:
+                return bool(hook())
+            except Exception:
+                return False
+
+        voices = list(self._lang_voices.values())
+        lines = []
+        if any(is_supertonic_voice(v) for v in voices) and not present(
+                self.hooks.supertonic_present):
+            lines.append(SUPERTONIC_HINT)
+        if any(is_higgs_voice(v) for v in voices) and not present(self.hooks.higgs_present):
+            lines.append(HIGGS_VOICE_HINT)
+        code = self._sel_code
+        if (self._lang_voices.get(code) and code not in SUPERTONIC_LANGUAGES
+                and code not in detectable_languages()):
+            lines.append(f"Automatic detection cannot recognise {LANGUAGE_NAMES[code]}: set "
+                         f"Read to \"Always {LANGUAGE_NAMES[code]}\" to use it.")
+        self._supertonic_hint.configure(text="\n".join(lines))
 
     # -- Export ------------------------------------------------------------------
     def _build_export(self, f: ttk.Frame) -> None:
@@ -1604,6 +1685,461 @@ class SettingsWindow:
         self._st_changed()
         self._set_status("Supertonic deleted.")
 
+    # -- Higgs ------------------------------------------------------------------
+    def _build_higgs(self, f: ttk.Frame) -> None:
+        mm = ttk.LabelFrame(f, text="Higgs Audio v3 model", padding=10)
+        mm.pack(fill="x")
+        ttk.Label(mm, text=HIGGS_NOTE, wraplength=580, justify="left").pack(anchor="w")
+        self._hg_status = ttk.Label(mm, text="")
+        self._hg_status.pack(anchor="w", pady=(8, 0))
+        btns = ttk.Frame(mm)
+        btns.pack(fill="x", pady=(8, 0))
+        self._hg_dl_btn = ttk.Button(btns, text="Download", command=self._hg_download,
+                                     style="Accent.TButton" if sv_ttk else "TButton")
+        self._hg_dl_btn.pack(side="left")
+        self._hg_del_btn = ttk.Button(btns, text="Delete", command=self._hg_delete)
+        self._hg_del_btn.pack(side="left", padx=6)
+        self._hg_progress = ttk.Progressbar(btns, mode="determinate", length=160, maximum=100)
+        self._hg_progress.pack(side="left", padx=(12, 6))
+        self._hg_cancel_btn = ttk.Button(btns, text="Cancel", command=self._hg_cancel.set,
+                                         state="disabled")
+        self._hg_cancel_btn.pack(side="left")
+        ttk.Button(btns, text="Open folder", command=self._safe_call(self._open_higgs)).pack(
+            side="right")
+        self._hg_progress_label = ttk.Label(mm, text="")
+        self._hg_progress_label.pack(anchor="w", pady=(4, 0))
+
+        q = ttk.LabelFrame(f, text="Style", padding=10)
+        q.pack(fill="x", pady=(10, 0))
+        lo, hi = HIGGS_TEMPERATURE_RANGE
+        ttk.Label(q, text="Temperature").grid(row=0, column=0, sticky="w", padx=(0, 10))
+        var = self._var("higgs_temperature", "0.8")
+        self._hg_scale = ttk.Scale(q, from_=lo, to=hi, orient="horizontal", length=220,
+                                   command=self._hg_scale_moved)
+        self._hg_scale.grid(row=0, column=1, sticky="w")
+        ttk.Entry(q, textvariable=var, width=5).grid(row=0, column=2, sticky="w", padx=8)
+        ttk.Label(q, text=f"{_num(lo)} .. {_num(hi)}: lower is steadier, higher is more varied",
+                  foreground="gray").grid(row=1, column=1, columnspan=2, sticky="w")
+        var.trace_add("write", lambda *_: self._safe_ui(self._hg_temperature_typed))
+
+        vf = ttk.LabelFrame(f, text="Voices", padding=10)
+        vf.pack(fill="both", expand=True, pady=(10, 0))
+        cols = ("name", "kind", "languages")
+        self._hg_tree = ttk.Treeview(vf, columns=cols, show="headings", height=6,
+                                     selectmode="browse")
+        for c, w, t in (("name", 140, "Voice"), ("kind", 80, "Kind"),
+                        ("languages", 280, "Own clips for")):
+            self._hg_tree.heading(c, text=t)
+            self._hg_tree.column(c, width=w, anchor="w")
+        self._hg_tree.pack(fill="x")
+        self._hg_tree.bind("<<TreeviewSelect>>", lambda e: self._safe_ui(self._hg_select_changed))
+        vb = ttk.Frame(vf)
+        vb.pack(fill="x", pady=(6, 0))
+        self._hg_add_btn = ttk.Button(vb, text="Add…", command=self._hg_add_dialog)
+        self._hg_add_btn.pack(side="left")
+        self._hg_voice_del_btn = ttk.Button(vb, text="Delete", command=self._hg_voice_delete,
+                                            state="disabled")
+        self._hg_voice_del_btn.pack(side="left", padx=6)
+        ttk.Button(vb, text="Play test", command=self._hg_play_test).pack(side="left")
+        self._hg_voice_msg = ttk.Label(vf, text="", wraplength=580, justify="left")
+        self._hg_voice_msg.pack(anchor="w", pady=(4, 0))
+        ttk.Label(vf, text="Add a voice from a clean 3 to 30 second WAV clip of one speaker and "
+                  "its exact transcript, in the language it speaks. A voice can have one clip "
+                  "per language; add the same name again with another language.",
+                  foreground="gray", wraplength=580, justify="left").pack(anchor="w")
+
+    def _hg_scale_moved(self, raw: str) -> None:
+        if self._hg_sync:
+            return
+        self._hg_sync = True
+        try:
+            value = round(round(float(raw) / HIGGS_STEP) * HIGGS_STEP, 2)
+            self._vars["higgs_temperature"].set(_num(value))
+        except (ValueError, tk.TclError):
+            pass
+        finally:
+            self._hg_sync = False
+
+    def _hg_temperature_typed(self) -> None:
+        if self._hg_sync:
+            return
+        self._hg_sync = True
+        try:
+            self._hg_scale.set(float(str(self._vars["higgs_temperature"].get()).strip()))
+        except (ValueError, tk.TclError):
+            pass
+        finally:
+            self._hg_sync = False
+
+    def _open_higgs(self) -> None:
+        folder = self.hooks.higgs_dir()
+        folder.mkdir(parents=True, exist_ok=True)
+        os.startfile(str(folder))  # type: ignore[attr-defined]
+
+    def _hg_download_size(self) -> int:
+        try:
+            from . import higgs
+            return int(higgs.DOWNLOAD_BYTES)
+        except Exception:
+            log.debug("higgs size unavailable", exc_info=True)
+            return 0
+
+    def _refresh_higgs(self) -> None:
+        """Status line, button states, the voice list and the hint on the Voice tab."""
+        folder = Path(self.hooks.higgs_dir())
+        try:
+            missing = list(model_setup.higgs_missing(folder))
+        except Exception:
+            log.debug("higgs status failed", exc_info=True)
+            missing = ["?"]
+        size = 0
+        try:
+            if folder.exists():
+                size = sum(p.stat().st_size for p in folder.rglob("*") if p.is_file())
+        except OSError:
+            pass
+        if not missing:
+            text = f"Installed ({_fmt_size(size)} on disk)"
+        elif size == 0:
+            total = self._hg_download_size()
+            text = "Not installed" + (f" ({total / 1e9:.2f} GB download)" if total else "")
+        else:
+            text = f"Incomplete ({len(missing)} files missing, {_fmt_size(size)} on disk)"
+        self._hg_status.configure(text=text)
+        idle = not self._hg_busy
+        self._hg_dl_btn.configure(state="normal" if idle and missing else "disabled")
+        self._hg_del_btn.configure(state="normal" if idle and (size or not missing) else "disabled")
+        self._refresh_higgs_voices()
+        self._refresh_voice_hint()
+
+    def _hg_voice_rows(self) -> list[tuple[str, str, str]]:
+        """(name, kind, languages text) for the presets and then the user's own voices."""
+        vdir = Path(self.hooks.higgs_voices_dir())
+        custom: list[str] = []
+        higgs: Any = None
+        try:
+            from . import higgs
+            custom = list(higgs.custom_voices(vdir))
+        except Exception:
+            log.debug("custom voices failed", exc_info=True)
+        rows = []
+        for name in (*HIGGS_PRESETS, *[c for c in custom if c not in HIGGS_PRESETS]):
+            kind = "preset" if name in HIGGS_PRESETS else "custom"
+            langs = ""
+            if kind == "custom" and higgs is not None:
+                try:
+                    codes = list(higgs.voice_languages(HIGGS_PREFIX + name, vdir))
+                    langs = ", ".join(LANGUAGE_NAMES.get(c, c) for c in codes)
+                except Exception:
+                    log.debug("voice languages failed", exc_info=True)
+            elif kind == "preset":
+                langs = "many languages"
+            rows.append((name, kind, langs))
+        return rows
+
+    def _refresh_higgs_voices(self) -> None:
+        keep = self._hg_selected()
+        tree = self._hg_tree
+        tree.delete(*tree.get_children())
+        for name, kind, langs in self._hg_voice_rows():
+            tree.insert("", "end", iid=name, values=(name, kind, langs))
+        if keep and tree.exists(keep):
+            tree.selection_set(keep)
+        self._hg_select_changed()
+
+    def _hg_selected(self) -> str | None:
+        sel = self._hg_tree.selection()
+        return sel[0] if sel else None
+
+    def _hg_select_changed(self) -> None:
+        name = self._hg_selected()
+        custom = bool(name) and name not in HIGGS_PRESETS
+        self._hg_voice_del_btn.configure(
+            state="normal" if custom and not self._hg_adding else "disabled")
+
+    def _set_hg_busy(self, busy: bool, text: str = "") -> None:
+        self._hg_busy = busy
+        self._hg_cancel_btn.configure(state="normal" if busy else "disabled")
+        self._hg_progress_label.configure(text=text)
+        if not busy:
+            self._hg_progress.configure(value=0)
+        self._hg_cancel.clear()
+        if busy:
+            self._hg_dl_btn.configure(state="disabled")
+            self._hg_del_btn.configure(state="disabled")
+
+    def _hg_progress_cb(self) -> Callable[[int, int | None], None]:
+        def cb(done: int, total: int | None) -> None:
+            def ui() -> None:
+                try:
+                    if total:
+                        text = f"Downloading Higgs: {done / 1e6:.0f} / {total / 1e6:.0f} MB"
+                        self._hg_progress.configure(mode="determinate",
+                                                    value=100.0 * done / total)
+                    else:
+                        text = f"Downloading Higgs: {done / 1e6:.0f} MB"
+                    self._hg_progress_label.configure(text=text)
+                except tk.TclError:
+                    pass
+            self._post(ui)
+        return cb
+
+    def _hg_changed(self) -> None:
+        """Model or voices changed: tell the app (reload / unload, tray), then redraw."""
+        try:
+            self.hooks.higgs_changed()
+        except Exception:
+            log.exception("higgs_changed failed")
+        self._refresh_higgs()
+        self._load_voices()
+        self._refresh_export()
+
+    def _hg_download(self) -> None:
+        if self._hg_busy:
+            return
+        cancel = self._hg_cancel
+        cb = self._hg_progress_cb()
+        folder = self.hooks.higgs_dir()
+        self._set_hg_busy(True, "Downloading Higgs...")
+
+        def run() -> None:
+            error: Exception | None = None
+            try:
+                model_setup.download_higgs(folder, cb, cancel)
+            except Exception as e:  # noqa: BLE001
+                error = e
+
+            def finish() -> None:
+                self._set_hg_busy(False)
+                if isinstance(error, model_setup.DownloadCancelled):
+                    self._refresh_higgs()
+                    self._set_status("Download cancelled.")
+                elif error is not None:
+                    self._refresh_higgs()
+                    messagebox.showerror("Download failed", str(error), parent=self.top)
+                else:
+                    self._hg_changed()
+                    self._set_status("Higgs downloaded.")
+            self._post(lambda: self._safe_ui(finish))
+
+        self._spawn(run)
+
+    def _hg_delete(self) -> None:
+        if self._hg_busy:
+            return
+        if not messagebox.askyesno("Delete Higgs", "Delete the Higgs model files? Your own "
+                                   "voices are kept.", parent=self.top):
+            return
+        self.hooks.stop()
+        try:
+            model_setup.delete_higgs(self.hooks.higgs_dir())
+        except OSError as e:
+            messagebox.showerror("Delete failed", f"{e}\n\nQuit VibeTTS first if the model is "
+                                 "in use.", parent=self.top)
+            self._refresh_higgs()
+            return
+        self._hg_changed()
+        self._set_status("Higgs deleted.")
+
+    # -- Higgs voices -------------------------------------------------------------
+    def _hg_voice_error(self, name: str, wav: str, transcript: str) -> str:
+        """Why the Add form cannot be submitted ('' when it can); checks the clip too."""
+        name = name.strip()
+        if not name:
+            return "Enter a name for the voice."
+        if not HIGGS_VOICE_NAME_RE.match(name):
+            return "The name may use letters, digits, - and _ only (1 to 32 characters)."
+        if name in HIGGS_PRESETS:
+            return f"{name} is a preset name; pick another."
+        if not wav.strip():
+            return "Choose a WAV file."
+        path = Path(wav.strip())
+        if not path.is_file():
+            return f"File not found: {path}"
+        try:
+            from . import higgs
+            higgs.validate_clip(path)
+        except ValueError as e:
+            return str(e) or "That clip cannot be used."
+        except Exception as e:  # noqa: BLE001
+            return f"Could not read the clip: {e}"
+        if not transcript.strip():
+            return "Type what the clip says (the transcript)."
+        return ""
+
+    def _hg_add_submit(self, name: str, wav: str, lang: str, transcript: str) -> str:
+        """Validate, then add the voice on a worker. Returns the error text, or '' when the
+        add started (the dialog closes when it finishes)."""
+        if self._hg_adding:
+            return "A voice is already being added."
+        error = self._hg_voice_error(name, wav, transcript)
+        if not error and lang not in HIGGS_LANGUAGES:
+            error = "Pick the language of the clip."
+        if error:
+            return error
+        name, wav, transcript = name.strip(), wav.strip(), transcript.strip()
+        vdir = Path(self.hooks.higgs_voices_dir())
+        self._hg_adding = True
+        self._hg_add_btn.configure(state="disabled")
+        self._hg_select_changed()
+        self._hg_voice_msg.configure(text=f"Adding {name}...", foreground="")
+
+        def run() -> None:
+            failure: Exception | None = None
+            try:
+                from . import higgs
+                higgs.add_custom_voice(vdir, name, Path(wav), transcript, lang)
+            except Exception as e:  # noqa: BLE001
+                failure = e
+                if not isinstance(e, ValueError):
+                    log.exception("could not add the voice")
+
+            def finish() -> None:
+                self._hg_adding = False
+                self._hg_add_btn.configure(state="normal")
+                if failure is not None:
+                    msg = str(failure) or failure.__class__.__name__
+                    self._hg_voice_msg.configure(text=f"Could not add {name}: {msg}",
+                                                 foreground="#d33")
+                    if self._hg_dialog is not None:
+                        self._hg_dialog_show_error(msg)
+                    self._hg_select_changed()
+                    return
+                self._hg_voice_msg.configure(text=f"Added {name}.", foreground="")
+                self._hg_close_dialog()
+                self._hg_changed()
+            self._post(lambda: self._safe_ui(finish))
+
+        self._spawn(run)
+        return ""
+
+    def _hg_dialog_show_error(self, text: str) -> None:
+        err = getattr(self, "_hg_dialog_err", None)
+        if err is not None:
+            try:
+                err.configure(text=text, foreground="#d33")
+                self._hg_dialog_ok.configure(state="normal")
+            except tk.TclError:
+                pass
+
+    def _hg_close_dialog(self) -> None:
+        dlg, self._hg_dialog = self._hg_dialog, None
+        if dlg is not None:
+            try:
+                dlg.destroy()
+            except tk.TclError:
+                pass
+
+    def _hg_add_dialog(self) -> None:
+        if self._hg_dialog is not None:
+            try:
+                self._hg_dialog.lift()
+                return
+            except tk.TclError:
+                self._hg_dialog = None
+        dlg = tk.Toplevel(self.top)
+        self._hg_dialog = dlg
+        dlg.title("Add a Higgs voice")
+        dlg.transient(self.top)
+        dlg.protocol("WM_DELETE_WINDOW", self._hg_close_dialog)
+        body = ttk.Frame(dlg, padding=12)
+        body.pack(fill="both", expand=True)
+        name_var, wav_var = tk.StringVar(), tk.StringVar()
+        names = {n: c for n, c in LANGUAGE_CODES.items() if c in HIGGS_LANGUAGES}
+        lang_var = tk.StringVar(value="English")
+        ttk.Label(body, text="Name").grid(row=0, column=0, sticky="w", pady=3, padx=(0, 10))
+        ttk.Entry(body, textvariable=name_var, width=24).grid(row=0, column=1, sticky="w")
+        ttk.Label(body, text="WAV clip").grid(row=1, column=0, sticky="w", pady=3, padx=(0, 10))
+        wav_row = ttk.Frame(body)
+        wav_row.grid(row=1, column=1, sticky="we")
+        ttk.Entry(wav_row, textvariable=wav_var, width=40).pack(side="left")
+
+        def browse() -> None:
+            chosen = filedialog.askopenfilename(
+                parent=dlg, title="Voice clip", filetypes=[("WAV audio", "*.wav")])
+            if chosen:
+                wav_var.set(chosen)
+
+        ttk.Button(wav_row, text="Browse…", command=browse).pack(side="left", padx=6)
+        ttk.Label(body, text="Language").grid(row=2, column=0, sticky="w", pady=3, padx=(0, 10))
+        ttk.Combobox(body, textvariable=lang_var, values=list(names), width=24,
+                     state="readonly").grid(row=2, column=1, sticky="w")
+        ttk.Label(body, text="Transcript").grid(row=3, column=0, sticky="nw", pady=3,
+                                                padx=(0, 10))
+        text = tk.Text(body, height=5, width=48, wrap="word")
+        text.grid(row=3, column=1, sticky="we", pady=3)
+        ttk.Label(body, text="3 to 30 seconds of one speaker, and exactly what is said.",
+                  foreground="gray").grid(row=4, column=1, sticky="w")
+        self._hg_dialog_err = ttk.Label(body, text="", foreground="#d33", wraplength=440,
+                                        justify="left")
+        self._hg_dialog_err.grid(row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        row = ttk.Frame(body)
+        row.grid(row=6, column=0, columnspan=2, sticky="e", pady=(10, 0))
+
+        def submit() -> None:
+            self._hg_dialog_err.configure(text="")
+            error = self._hg_add_submit(name_var.get(), wav_var.get(),
+                                        names.get(lang_var.get(), ""),
+                                        text.get("1.0", "end-1c"))
+            if error:
+                self._hg_dialog_err.configure(text=error)
+            else:
+                self._hg_dialog_ok.configure(state="disabled")
+                self._hg_dialog_err.configure(text="Adding the voice...", foreground="")
+
+        self._hg_dialog_ok = ttk.Button(row, text="Add", command=submit,
+                                        style="Accent.TButton" if sv_ttk else "TButton")
+        self._hg_dialog_ok.pack(side="right")
+        ttk.Button(row, text="Cancel", command=self._hg_close_dialog).pack(side="right",
+                                                                           padx=(0, 8))
+        # exposed so callers (and tests) can fill the form
+        self._hg_form = (name_var, wav_var, lang_var, text, names)
+        dlg.update_idletasks()
+        try:
+            dlg.grab_set()
+        except tk.TclError:
+            pass
+
+    def _hg_voice_delete(self) -> None:
+        name = self._hg_selected()
+        if not name or self._hg_adding:
+            return
+        if name in HIGGS_PRESETS:
+            self._hg_voice_msg.configure(text="Presets cannot be deleted.", foreground="")
+            return
+        if not messagebox.askyesno("Delete voice", f"Delete the voice {name}?", parent=self.top):
+            return
+        try:
+            from . import higgs
+            higgs.delete_custom_voice(Path(self.hooks.higgs_voices_dir()), name)
+        except (ValueError, OSError) as e:
+            messagebox.showerror("Delete failed", str(e), parent=self.top)
+            self._refresh_higgs_voices()
+            return
+        self._hg_voice_msg.configure(text=f"Deleted {name}.", foreground="")
+        self._hg_changed()
+
+    def _hg_play_test(self) -> None:
+        name = self._hg_selected()
+        if not name:
+            self._hg_voice_msg.configure(text="Select a voice first.", foreground="")
+            return
+        voice = HIGGS_PREFIX + name
+        langs: list[str] = []
+        try:
+            from . import higgs
+            langs = list(higgs.voice_languages(voice, Path(self.hooks.higgs_voices_dir())))
+        except Exception:
+            log.debug("voice languages failed", exc_info=True)
+        lang = "en" if "en" in langs or not langs else langs[0]
+        cfg = copy.deepcopy(self.hooks.get_config())
+        cfg.speech.language_voices[lang] = voice
+        self._hg_voice_msg.configure(text="", foreground="")
+        try:
+            self.hooks.play_test(cfg, HIGGS_TEST_TEXT, lang)
+        except Exception as e:  # noqa: BLE001
+            self._hg_voice_msg.configure(text=f"Failed: {e}", foreground="#d33")
+
     def _open_models(self) -> None:
         folder = self.hooks.models_dir()
         folder.mkdir(parents=True, exist_ok=True)
@@ -1627,14 +2163,16 @@ class SettingsWindow:
             self._setup.pack_forget()
 
     def _load_voices(self) -> None:
-        """Remember the Kokoro voices on disk (all supported languages) for the Voices section;
-        Supertonic voices are the fixed F1..M5."""
+        """Remember the Kokoro and Higgs voices on disk for the Voices section; Supertonic
+        voices are the fixed F1..M5."""
         try:
-            voices = [v for v in self.hooks.voices() if not is_supertonic_voice(v)]
+            listed = list(self.hooks.voices())
         except Exception:
             log.debug("voice list failed", exc_info=True)
-            voices = []
-        self._kokoro_voices = voices
+            listed = []
+        self._hg_voices = [v for v in listed if is_higgs_voice(v)]
+        self._kokoro_voices = [v for v in listed
+                               if not is_supertonic_voice(v) and not is_higgs_voice(v)]
         self._sync_voice_rows()
 
     def _refresh_files(self) -> None:
@@ -1768,7 +2306,7 @@ class SettingsWindow:
         code = self._sel_code
         if not cfg.speech.language_voices.get(code):
             self._test_result.configure(
-                text=f"{SUPERTONIC_LANGUAGE_NAMES[code]} is off. Pick a voice to try it.",
+                text=f"{LANGUAGE_NAMES[code]} is off. Pick a voice to try it.",
                 foreground="#d33")
             return
         text = self._sample.get().strip() or SAMPLE_TEXT
@@ -1782,7 +2320,7 @@ class SettingsWindow:
     def _build_about(self, f: ttk.Frame) -> None:
         ttk.Label(f, text="VibeTTS", font=("Segoe UI", 16, "bold")).pack(anchor="w")
         ttk.Label(f, text=f"Version {self.hooks.version}").pack(anchor="w", pady=(2, 8))
-        ttk.Label(f, text="Local text-to-speech with Kokoro-82M (Apache 2.0) and Supertonic 3 (OpenRAIL-M).",
+        ttk.Label(f, text="Local text-to-speech with Kokoro-82M (Apache 2.0), Supertonic 3 (OpenRAIL-M) and Higgs Audio v3 (Boson non-commercial licence).",
                   wraplength=600, justify="left").pack(anchor="w")
         ttk.Label(f, text=f"App folder: {ROOT}", wraplength=600, justify="left").pack(
             anchor="w", pady=(6, 0))
@@ -1817,6 +2355,7 @@ class SettingsWindow:
                 self._set_form_var(key, value)
         self._load_voices()
         self._refresh_supertonic()
+        self._refresh_higgs()
         self._refresh_export()
         self._refresh_mcp()
         self._refresh_reader(init_ticks=True)

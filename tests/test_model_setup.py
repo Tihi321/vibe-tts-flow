@@ -1,4 +1,5 @@
 import threading
+import types
 
 import pytest
 import requests
@@ -208,3 +209,135 @@ def test_cli_supertonic(tmp_path, monkeypatch, fake_files, capsys):
     monkeypatch.setattr(model_setup.requests, "get", lambda url, **kw: Resp(b"", status=500))
     model_setup.delete_supertonic(tmp_path)
     assert model_setup.main(["--supertonic", "--dest", str(tmp_path)]) == 1
+
+
+# ---------------------------------------------------------------- Higgs
+
+HIGGS_FAKE = (("cpu_int4/a.onnx", 10), ("cpu_int4/a.onnx.data", 20), ("cpu_int4/tok.json", 4),
+              ("LICENSE", 3))
+
+
+@pytest.fixture
+def higgs_fake(monkeypatch):
+    monkeypatch.setattr(model_setup, "HIGGS_MODEL_FILES", HIGGS_FAKE)
+    return HIGGS_FAKE
+
+
+def higgs_get(urls):
+    def get(url, **kw):
+        urls.append(url)
+        return Resp(b"x" * dict(HIGGS_FAKE)[url.split("/resolve/", 1)[1].split("/", 1)[1]])
+    return get
+
+
+def test_higgs_files_and_url():
+    from vibetts import higgs
+    assert model_setup.higgs_files() == higgs.MODEL_FILES
+    assert model_setup.HIGGS_BASE_URL == (
+        "https://huggingface.co/onnx-community/higgs-audio-v3-tts-4b/resolve/"
+        "ecc25d6cc6e48909401bfa7ce5ac95e84f41f331/")
+
+
+def test_higgs_missing(tmp_path, higgs_fake):
+    assert model_setup.higgs_missing(tmp_path) == [p for p, _ in HIGGS_FAKE]
+    (tmp_path / "cpu_int4").mkdir()
+    (tmp_path / "cpu_int4" / "a.onnx").write_bytes(b"x" * 10)
+    (tmp_path / "cpu_int4" / "a.onnx.data").write_bytes(b"x" * 5)   # wrong size
+    assert model_setup.higgs_missing(tmp_path) == ["cpu_int4/a.onnx.data", "cpu_int4/tok.json",
+                                                    "LICENSE"]
+
+
+def test_download_higgs_only_missing_and_progress(tmp_path, monkeypatch, higgs_fake):
+    (tmp_path / "cpu_int4").mkdir()
+    (tmp_path / "cpu_int4" / "a.onnx").write_bytes(b"x" * 10)
+    urls = []
+    monkeypatch.setattr(model_setup.requests, "get", higgs_get(urls))
+    progress = []
+    model_setup.download_higgs(tmp_path, lambda d, t: progress.append((d, t)))
+    base = model_setup.HIGGS_BASE_URL
+    assert urls == [base + "cpu_int4/a.onnx.data", base + "cpu_int4/tok.json", base + "LICENSE"]
+    assert model_setup.higgs_missing(tmp_path) == []
+    assert not list(tmp_path.rglob("*.part"))
+    assert progress[0] == (0, 27) and progress[-1] == (27, 27)
+    assert [d for d, _ in progress] == sorted(d for d, _ in progress)
+    urls.clear()
+    model_setup.download_higgs(tmp_path)
+    assert urls == []
+
+
+def test_download_higgs_cancel_leaves_no_partial(tmp_path, monkeypatch, higgs_fake):
+    monkeypatch.setattr(model_setup.requests, "get", higgs_get([]))
+    cancel = threading.Event()
+
+    def progress(done, total):
+        if done >= 12:  # inside the second (20 byte) file
+            cancel.set()
+
+    with pytest.raises(model_setup.DownloadCancelled):
+        model_setup.download_higgs(tmp_path, progress, cancel)
+    assert not list(tmp_path.rglob("*.part"))
+    assert (tmp_path / "cpu_int4" / "a.onnx").exists()
+    assert not (tmp_path / "cpu_int4" / "a.onnx.data").exists()
+
+
+def test_download_higgs_http_error_and_size_mismatch(tmp_path, monkeypatch, higgs_fake):
+    monkeypatch.setattr(model_setup.requests, "get", lambda url, **kw: Resp(b"", status=404))
+    with pytest.raises(model_setup.SetupError, match="404"):
+        model_setup.download_higgs(tmp_path)
+    monkeypatch.setattr(model_setup.requests, "get", lambda url, **kw: Resp(b"short"))
+    with pytest.raises(model_setup.SetupError, match="expected 10"):
+        model_setup.download_higgs(tmp_path)
+    assert not [p for p in tmp_path.rglob("*") if p.is_file()]
+
+
+def test_download_higgs_checks_free_space_first(tmp_path, monkeypatch, higgs_fake):
+    urls = []
+    monkeypatch.setattr(model_setup.requests, "get", higgs_get(urls))
+    seen = []
+
+    def usage(path):
+        seen.append(path)
+        return types.SimpleNamespace(total=10**12, used=10**12 - 1000, free=1000)
+
+    monkeypatch.setattr(model_setup.shutil, "disk_usage", usage)
+    dest = tmp_path / "not" / "yet" / "there"
+    with pytest.raises(OSError, match="Not enough free disk space"):
+        model_setup.download_higgs(dest)
+    assert urls == [] and not dest.exists()
+    assert seen and seen[0].exists()                       # probed the nearest existing folder
+    monkeypatch.setattr(model_setup.shutil, "disk_usage",
+                        lambda p: types.SimpleNamespace(free=model_setup.DISK_MARGIN + 37))
+    model_setup.download_higgs(dest)
+    assert model_setup.higgs_missing(dest) == []
+
+
+def test_download_higgs_nothing_missing_skips_space_check(tmp_path, monkeypatch, higgs_fake):
+    monkeypatch.setattr(model_setup.requests, "get", higgs_get([]))
+    model_setup.download_higgs(tmp_path)
+    monkeypatch.setattr(model_setup.shutil, "disk_usage",
+                        lambda p: (_ for _ in ()).throw(AssertionError("no check needed")))
+    model_setup.download_higgs(tmp_path)
+
+
+def test_delete_higgs(tmp_path, monkeypatch, higgs_fake):
+    monkeypatch.setattr(model_setup.requests, "get", higgs_get([]))
+    model_setup.download_higgs(tmp_path)
+    (tmp_path / "cpu_int4" / "a.onnx.part").write_bytes(b"x")
+    (tmp_path / "keep.txt").write_text("mine")
+    model_setup.delete_higgs(tmp_path)
+    assert model_setup.higgs_missing(tmp_path) == [p for p, _ in HIGGS_FAKE]
+    assert not (tmp_path / "cpu_int4").exists() and (tmp_path / "keep.txt").exists()
+    model_setup.delete_higgs(tmp_path / "nope")
+
+
+def test_cli_higgs(tmp_path, monkeypatch, higgs_fake, capsys):
+    monkeypatch.setattr(model_setup.requests, "get", higgs_get([]))
+    assert model_setup.main(["--higgs", "--dest", str(tmp_path)]) == 0
+    assert model_setup.higgs_missing(tmp_path) == []
+    model_setup.delete_higgs(tmp_path)
+    monkeypatch.setattr(model_setup.requests, "get", lambda url, **kw: Resp(b"", status=500))
+    assert model_setup.main(["--higgs", "--dest", str(tmp_path)]) == 1
+    monkeypatch.setattr(model_setup.shutil, "disk_usage",
+                        lambda p: types.SimpleNamespace(free=0))
+    assert model_setup.main(["--higgs", "--dest", str(tmp_path)]) == 1
+    assert "Not enough free disk space" in capsys.readouterr().err

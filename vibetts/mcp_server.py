@@ -11,15 +11,16 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Protocol
 
-from .config import SUPERTONIC_LANGUAGES
+from .config import ALL_LANGUAGES
 
 log = logging.getLogger(__name__)
 
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")  # newest first
 
 INSTRUCTIONS = (
-    "VibeTTS is a local text-to-speech app: Kokoro (English, Spanish, French, Hindi, Italian, Portuguese) and Supertonic 3 (31 languages, "
-    "when installed). Use synthesize_to_file to turn text or a document (.txt/.md/.html/.docx/.epub/.pdf) into a "
+    "VibeTTS is a local text-to-speech app: Kokoro (English, Spanish, French, Hindi, Italian, Portuguese), Supertonic 3 (31 languages, "
+    "when installed) and Higgs Audio v3 (about 100 languages, voices 'higgs:F1', 'higgs:<name>'; when installed; "
+    "slower than real time on a CPU, so exports with it take longer than the audio lasts). Use synthesize_to_file to turn text or a document (.txt/.md/.html/.docx/.epub/.pdf) into a "
     "WAV or MP3 file (44.1 kHz mono). Use speak to read text aloud on the user's speakers; use it sparingly "
     "because it is audible to the user. Call list_voices first to get valid voice ids and language codes; "
     "pass 'lang' to read in a specific language (omitted: the language is detected among the languages the user "
@@ -342,7 +343,7 @@ def build_tools(api: AgentApi, max_chars: int) -> list[Tool]:
             _opt_str(args, "path")
         _opt_str(args, "output")
         _opt_str(args, "voice")
-        _check_enum(args, "lang", SUPERTONIC_LANGUAGES)
+        _check_enum(args, "lang", ALL_LANGUAGES)
         _check_speed(args)
         _check_enum(args, "format", ("wav", "mp3"))
         _check_bool(args, "overwrite", False)
@@ -361,7 +362,7 @@ def build_tools(api: AgentApi, max_chars: int) -> list[Tool]:
         _check_unknown(args, {"text", "voice", "lang", "speed", "wait", "timeout_seconds"})
         text = _check_text(args.get("text"), max_chars)
         voice = _opt_str(args, "voice")
-        lang = _check_enum(args, "lang", SUPERTONIC_LANGUAGES)
+        lang = _check_enum(args, "lang", ALL_LANGUAGES)
         speed = _check_speed(args)
         wait = _check_bool(args, "wait", False)
         timeout = args.get("timeout_seconds", 120)
@@ -393,8 +394,8 @@ def build_tools(api: AgentApi, max_chars: int) -> list[Tool]:
             extra = sorted(set(it) - allowed)
             if extra:
                 raise ToolError(f"items[{i}]: unknown field(s): {', '.join(extra)}")
-            if it.get("lang") is not None and it["lang"] not in SUPERTONIC_LANGUAGES:
-                raise ToolError(f"items[{i}]: 'lang' must be one of: {', '.join(SUPERTONIC_LANGUAGES)}")
+            if it.get("lang") is not None and it["lang"] not in ALL_LANGUAGES:
+                raise ToolError(f"items[{i}]: 'lang' must be one of: {', '.join(ALL_LANGUAGES)}")
         _check_bool(args, "overwrite", False)
         try:
             return api.synthesize_batch(dict(args))
@@ -412,8 +413,8 @@ def build_tools(api: AgentApi, max_chars: int) -> list[Tool]:
     def schema(props: dict, required: list[str] | None = None) -> dict:
         return {"type": "object", "properties": props, "required": required or [], "additionalProperties": False}
 
-    voice_p = {"type": "string", "description": "Voice id: a Kokoro voice (af_heart; Kokoro reads en, es, fr, hi, it, pt) or a Supertonic voice (supertonic:F1; reads all 31 languages); call list_voices for valid values. Defaults to the configured voice of the text's language."}
-    lang_p = {"type": "string", "enum": list(SUPERTONIC_LANGUAGES), "description": "Language of the text (ISO code, e.g. en, hr, de). Default: detected among the languages the user enabled, read with that language's configured voice. A Kokoro voice only reads its own language (en, es, fr, hi, it, pt); Supertonic voices read all."}
+    voice_p = {"type": "string", "description": "Voice id: a Kokoro voice (af_heart; Kokoro reads en, es, fr, hi, it, pt), a Supertonic voice (supertonic:F1; reads 31 languages) or a Higgs voice (higgs:F1, higgs:<own voice>; reads about 100 languages, slower than real time on a CPU); call list_voices for valid values. Defaults to the configured voice of the text's language."}
+    lang_p = {"type": "string", "enum": list(ALL_LANGUAGES), "description": "Language of the text (ISO code, e.g. en, hr, de, or bs, sr, mk, ca for languages only Higgs reads). Default: detected among the languages the user enabled, read with that language's configured voice. A Kokoro voice only reads its own language (en, es, fr, hi, it, pt); Supertonic voices read 31 languages (not those only Higgs reads); Higgs voices read all but ja."}
     speed_p = {"type": "number", "minimum": 0.5, "maximum": 2, "description": "Speech speed multiplier, 0.5 to 2 (default 1)."}
     limit = f" At most {max_chars} characters." if max_chars > 0 else ""
 
@@ -455,7 +456,7 @@ def build_tools(api: AgentApi, max_chars: int) -> list[Tool]:
         Tool(
             "list_voices",
             "List the available voices (id, label, engine, languages), the language codes, the voice configured for "
-            "each language (language_voices, empty = off), the read_language setting (auto or a code) and whether Supertonic is installed. Call this to get valid voice ids.",
+            "each language (language_voices, empty = off), the read_language setting (auto or a code) and whether Supertonic and Higgs are installed (supertonic_installed, higgs_installed). Call this to get valid voice ids.",
             schema({}),
             list_voices,
             {"title": "List voices", "readOnlyHint": True, "openWorldHint": False},

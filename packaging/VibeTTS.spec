@@ -15,6 +15,8 @@ datas += collect_data_files("sv_ttk")
 datas += collect_data_files("kokoro_onnx")       # config.json (vocabulary)
 datas += collect_data_files("py3langid")        # the language model (data/model.plzma)
 datas += collect_data_files("espeakng_loader")   # espeak-ng-data (phoneme rules)
+# VTF-09: bundled Higgs preset voices (pre-encoded codes + transcripts), same folder layout
+datas += [(os.path.join(ROOT, "vibetts", "voices", "higgs"), "vibetts/voices/higgs")]
 binaries = collect_dynamic_libs("espeakng_loader")  # espeak-ng.dll
 
 hiddenimports = [
@@ -31,6 +33,9 @@ hiddenimports = [
     "vibetts.supertonic",
     "soxr",
     "soxr.soxr_ext",
+    # VTF-09: Higgs Audio v3 engine (lazy; the model is downloaded, the presets are bundled)
+    "vibetts.higgs",
+    "tokenizers",
     # VTF-04: export to audio files + local MCP server (all imported lazily)
     "vibetts.docload",
     "vibetts.export",

@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from vibetts.config import (DEFAULT_LANGUAGE_VOICES, KOKORO_LANGUAGES, MP3_BITRATES,
+from vibetts.config import (ALL_LANGUAGES, DEFAULT_LANGUAGE_VOICES, KOKORO_LANGUAGES, MP3_BITRATES,
                             SUPERTONIC_LANGUAGES, Config, config_from_dict, enabled_languages,
                             export_folder, kokoro_voice_lang, load_config, resolve_path,
                             save_config, snap_bitrate, voice_fits_language)
@@ -62,11 +62,13 @@ def test_kokoro_voice_lang():
 
 def test_language_voice_defaults():
     s = Config().speech
-    assert tuple(s.language_voices) == SUPERTONIC_LANGUAGES and len(s.language_voices) == 31
+    assert tuple(s.language_voices) == ALL_LANGUAGES and len(s.language_voices) == 101
     assert s.language_voices["en"] == "af_heart"
-    assert all(v == "supertonic:F1" for c, v in s.language_voices.items() if c != "en")
+    assert all(v == "supertonic:F1" for c, v in s.language_voices.items()
+               if c != "en" and c in SUPERTONIC_LANGUAGES)
+    assert all(v == "" for c, v in s.language_voices.items() if c not in SUPERTONIC_LANGUAGES)
     assert s.language_voices == DEFAULT_LANGUAGE_VOICES and s.read_language == "auto"
-    assert enabled_languages(s) == list(SUPERTONIC_LANGUAGES)
+    assert enabled_languages(s) == list(SUPERTONIC_LANGUAGES)  # Higgs-only languages start Off
     assert (s.supertonic_dir, s.supertonic_steps) == ("models/supertonic-3", 8)
     for gone in ("voice", "english_engine", "english_supertonic_voice", "other_language",
                  "other_voice", "language_mode"):
@@ -77,7 +79,7 @@ def test_missing_languages_are_filled_with_defaults():
     s = config_from_dict({"speech": {"language_voices": {"es": "ef_dora", "xx": "supertonic:F1"}}}).speech
     assert s.language_voices["es"] == "ef_dora"
     assert s.language_voices["en"] == "af_heart" and s.language_voices["hr"] == "supertonic:F1"
-    assert "xx" not in s.language_voices and len(s.language_voices) == 31
+    assert "xx" not in s.language_voices and len(s.language_voices) == 101
 
 
 def test_language_voices_round_trip(tmp_path):
@@ -284,3 +286,72 @@ def test_export_folder_default_and_relative(tmp_path):
     assert export_folder(cfg).is_absolute()
     cfg.export.folder = str(tmp_path)
     assert export_folder(cfg) == tmp_path
+
+
+# ---------------------------------------------------------------- Higgs (VTF-09)
+
+def test_higgs_language_tables():
+    from vibetts.config import (HIGGS_LANGUAGE_NAMES, HIGGS_LANGUAGES, LANGUAGE_NAMES,
+                                SUPERTONIC_LANGUAGE_NAMES)
+
+    assert HIGGS_LANGUAGES == tuple(HIGGS_LANGUAGE_NAMES) and "ja" not in HIGGS_LANGUAGES
+    assert HIGGS_LANGUAGE_NAMES["hr"] == "Croatian" and HIGGS_LANGUAGE_NAMES["bs"] == "Bosnian"
+    assert set(LANGUAGE_NAMES) == set(SUPERTONIC_LANGUAGE_NAMES) | set(HIGGS_LANGUAGES)
+    assert ALL_LANGUAGES[:31] == SUPERTONIC_LANGUAGES and len(set(ALL_LANGUAGES)) == len(ALL_LANGUAGES)
+    only = ALL_LANGUAGES[31:]
+    assert not set(only) & set(SUPERTONIC_LANGUAGES) and set(only) <= set(HIGGS_LANGUAGES)
+    assert [LANGUAGE_NAMES[c] for c in only] == sorted(LANGUAGE_NAMES[c] for c in only)
+
+
+def test_higgs_voice_ids():
+    from vibetts.config import higgs_voice_name, is_higgs_voice
+
+    assert is_higgs_voice("higgs:F1") and is_higgs_voice("higgs:my-voice_2")
+    assert not is_higgs_voice("higgs:") and not is_higgs_voice("higgs:a b")
+    assert not is_higgs_voice("higgs:" + "x" * 33) and not is_higgs_voice("F1")
+    assert higgs_voice_name("higgs:F1") == "F1"
+    assert voice_fits_language("higgs:F1", "bs") and voice_fits_language("higgs:F1", "hr")
+    assert not voice_fits_language("higgs:F1", "ja")
+    assert not voice_fits_language("supertonic:F1", "bs")
+
+
+def test_higgs_only_language_rows_are_validated():
+    s = config_from_dict({"speech": {"language_voices": {
+        "bs": "higgs:M1", "sr": "supertonic:F1", "mk": "af_heart", "ca": "higgs:Anna",
+        "hr": "higgs:F2", "ja": "higgs:F1"}}}).speech
+    assert s.language_voices["bs"] == "higgs:M1" and s.language_voices["ca"] == "higgs:Anna"
+    assert s.language_voices["sr"] == "" and s.language_voices["mk"] == ""  # do not fit: Off
+    assert s.language_voices["hr"] == "higgs:F2"
+    assert s.language_voices["ja"] == "supertonic:F1"  # Higgs does not read Japanese: default
+    assert "bs" in enabled_languages(s) and "sr" not in enabled_languages(s)
+
+
+def test_old_config_loads_unchanged():
+    old = {c: ("af_heart" if c == "en" else "supertonic:F1") for c in SUPERTONIC_LANGUAGES}
+    old["es"] = "ef_dora"
+    s = config_from_dict({"speech": {"language_voices": old}}).speech
+    assert all(s.language_voices[c] == v for c, v in old.items())
+    assert all(s.language_voices[c] == "" for c in ALL_LANGUAGES[31:])
+
+
+def test_higgs_settings_defaults_clamp_and_round_trip(tmp_path):
+    s = Config().speech
+    assert (s.higgs_dir, s.higgs_voices_dir, s.higgs_temperature) == (
+        "models/higgs-audio-v3", "models/higgs-voices", 0.8)
+    assert config_from_dict({"speech": {"higgs_temperature": 5}}).speech.higgs_temperature == 1.2
+    assert config_from_dict({"speech": {"higgs_temperature": 0.0}}).speech.higgs_temperature == 0.3
+    assert config_from_dict({"speech": {"higgs_temperature": 0.5}}).speech.higgs_temperature == 0.5
+    cfg = Config()
+    cfg.speech.language_voices["bs"] = "higgs:F1"
+    cfg.speech.higgs_temperature = 0.6
+    path = tmp_path / "config.toml"
+    save_config(cfg, path)
+    assert load_config(path) == cfg
+
+
+def test_example_config_has_the_higgs_keys():
+    text = (Path(__file__).resolve().parent.parent / "config.example.toml").read_text(encoding="utf-8")
+    for key in ("higgs_dir", "higgs_voices_dir", "higgs_temperature"):
+        assert key in text
+    s = config_from_dict(tomllib.loads(text)).speech
+    assert s.higgs_temperature == 0.8

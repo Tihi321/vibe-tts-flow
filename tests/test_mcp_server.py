@@ -270,17 +270,17 @@ def test_synthesize_batch_validation(server, api):
         assert len(api.calls) == n
 
 
-def test_lang_param_is_an_enum_of_the_31_codes(server):
-    from vibetts.config import SUPERTONIC_LANGUAGES
+def test_lang_param_is_an_enum_of_all_codes(server):
+    from vibetts.config import ALL_LANGUAGES
 
     tools = {t["name"]: t for t in rpc(server, "tools/list")["result"]["tools"]}
-    assert len(SUPERTONIC_LANGUAGES) == 31
+    assert len(ALL_LANGUAGES) == 101
     for name in ("synthesize_to_file", "speak"):
         lang = tools[name]["inputSchema"]["properties"]["lang"]
-        assert lang["type"] == "string" and lang["enum"] == list(SUPERTONIC_LANGUAGES)
+        assert lang["type"] == "string" and lang["enum"] == list(ALL_LANGUAGES)
     item = tools["synthesize_batch"]["inputSchema"]["properties"]["items"]["items"]
-    assert item["properties"]["lang"]["enum"] == list(SUPERTONIC_LANGUAGES)
-    assert "hr" in SUPERTONIC_LANGUAGES and "en" in SUPERTONIC_LANGUAGES
+    assert item["properties"]["lang"]["enum"] == list(ALL_LANGUAGES)
+    assert {"hr", "en", "ja", "bs", "sr", "mk", "ca"} <= set(ALL_LANGUAGES)
     assert "lang" not in tools["list_voices"]["inputSchema"]["properties"]
 
 
@@ -311,3 +311,18 @@ def test_voice_and_lang_text_describes_per_language_voices(server):
     assert "English only" not in speak["lang"]["description"]
     assert "language_voices" in tools["list_voices"]["description"]
     assert "other-language" not in tools["list_voices"]["description"]
+
+
+def test_descriptions_mention_higgs(server):
+    from vibetts import mcp_server
+
+    tools = {t["name"]: t for t in rpc(server, "tools/list")["result"]["tools"]}
+    assert "higgs:" in mcp_server.INSTRUCTIONS and "slower than real time" in mcp_server.INSTRUCTIONS
+    voice = tools["speak"]["inputSchema"]["properties"]["voice"]["description"]
+    assert "higgs:F1" in voice and "slower than real time" in voice
+    assert "higgs_installed" in tools["list_voices"]["description"]
+
+
+def test_higgs_only_language_is_accepted(server, api):
+    assert call(server, "synthesize_to_file", {"text": "x", "lang": "bs", "voice": "higgs:F1"})["isError"] is False
+    assert api.calls[-1] == ("synth", {"text": "x", "lang": "bs", "voice": "higgs:F1"})

@@ -1,6 +1,6 @@
 # VibeTTS
 
-Read selected text aloud on Windows with a local voice. Select text in any app, press **Alt+Win**, and it is spoken right away; press again (or **Esc**) to stop. Runs [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) (English, Spanish, French, Hindi, Italian, Portuguese) and [Supertonic 3](https://huggingface.co/Supertone/supertonic-3) (31 languages, including Croatian) on the CPU through ONNX Runtime: no GPU, no account, no cloud.
+Read selected text aloud on Windows with a local voice. Select text in any app, press **Alt+Win**, and it is spoken right away; press again (or **Esc**) to stop. Runs [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) (English, Spanish, French, Hindi, Italian, Portuguese) and [Supertonic 3](https://huggingface.co/Supertone/supertonic-3) (31 languages, including Croatian), plus an optional third engine, Higgs Audio v3 (about 100 languages), on the CPU through ONNX Runtime: no GPU, no account, no cloud.
 
 Sister app of [VibeFlow](https://github.com/Tihi321/vibe-whisper-flow) (voice â†’ text). VibeTTS goes the other way (text â†’ voice); text translation is planned next.
 
@@ -8,7 +8,7 @@ Sister app of [VibeFlow](https://github.com/Tihi321/vibe-whisper-flow) (voice â†
 
 - System-wide hotkey: reads the current selection, falls back to the clipboard when nothing is selected
 - Streams sentence by sentence: the first audio plays about 0.4 s after the text is grabbed, the rest is generated while it speaks (Kokoro runs ~8x faster than real time on a Ryzen AI Max+ 395)
-- Two engines, one voice per language: **Kokoro** (English, Spanish, French, Hindi, Italian, Portuguese) and **Supertonic 3** (31 languages, 10 voices F1..F5 / M1..M5). The language of each read is detected from the text; a tray switch forces one language, and any language can be turned off
+- Three engines, one voice per language: **Kokoro** (English, Spanish, French, Hindi, Italian, Portuguese), **Supertonic 3** (31 languages, 10 voices F1..F5 / M1..M5) and the optional **Higgs Audio v3** (about 100 languages, presets F1 F2 M1 M2 plus your own voices; slower than real time on a CPU, see below). The language of each read is detected from the text; a tray switch forces one language, and any language can be turned off
 - All audio is 44.1 kHz mono (Supertonic natively, Kokoro resampled up from 24 kHz)
 - Speed, pause between sentences, volume, output device
 - Export to an audio file (WAV or MP3, 44.1 kHz): type or paste text, or open a .txt, .md, .html, .docx, .epub or .pdf document (Settings > Export)
@@ -24,6 +24,7 @@ Sister app of [VibeFlow](https://github.com/Tihi321/vibe-whisper-flow) (voice â†
 - Windows 10 / 11, Python 3.11+ (to run from source)
 - About 120 MB for the Kokoro int8 model and voices, downloaded from the Settings window
 - Optional: about 400 MB for Supertonic 3 (most languages, and English if you prefer it), downloaded from **Settings > Supertonic**
+- Optional: 3.85 GB for Higgs Audio v3 (about 100 languages) and 4 to 5 GB of free RAM while it is loaded, downloaded from **Settings > Higgs**
 
 ## Install
 
@@ -37,6 +38,7 @@ pip install -r requirements.txt
 # model + voices into .\models (or use the Download button in Settings > Kokoro)
 python -m vibetts.model_setup            # add --model fp32 for the larger model
 python -m vibetts.model_setup --supertonic   # optional: Supertonic 3 (most languages), ~400 MB into .\models\supertonic-3
+python -m vibetts.model_setup --higgs        # optional: Higgs Audio v3 (~100 languages), 3.85 GB into .\models\higgs-audio-v3
 ```
 
 ## Run
@@ -47,6 +49,7 @@ python run.pyw --console   # prints the log to the terminal
 python -m vibetts --say "Hello there"                 # speak once, no tray
 python -m vibetts --say "Hello there" --out out.mp3   # write an audio file instead (.wav or .mp3; --wav still works)
 python -m vibetts --doc C:\path\to\book.epub --out book.mp3   # a whole document to an audio file
+python -m vibetts --say "Dobar dan" --voice higgs:F1 --lang hr   # --voice / --lang pick the voice and language (default: as the hotkey would)
 python -m vibetts --open C:\path\to\book.epub        # open a book in the reader (starts the app if needed)
 ```
 
@@ -61,7 +64,7 @@ The file name's extension picks the format:
 - `.mp3`: the default, 44.1 kHz mono (MPEG-1 Layer III), 64 kbps by default, about 0.5 MB per minute. Bitrates: 32, 48, 64, 96, 128, 160, 192, 256 or 320 kbps.
 - `.wav`: 44.1 kHz 16-bit mono, about 5.3 MB per minute.
 
-In the **Language** box pick `Auto` (the same detection as the hotkey) or one of the 31 languages; the voice list then shows the voices that read it. The format, MP3 bitrate and default folder (`~\Documents\VibeTTS`) are saved in `[export]` in `config.toml`.
+In the **Language** box pick `Auto` (the same detection as the hotkey) or one of the languages (Supertonic's 31 plus those only Higgs reads); the voice list then shows the voices that read it. The format, MP3 bitrate and default folder (`~\Documents\VibeTTS`) are saved in `[export]` in `config.toml`.
 
 The export runs in the background with a progress bar and **Cancel**; a cancelled or failed export leaves no file behind. Reading aloud has priority: if you press the hotkey while an export runs, the export pauses until the reading ends. Only one export runs at a time, whether it comes from the window or from an agent. Export ignores the playback volume.
 
@@ -85,7 +88,7 @@ The same setting as `.mcp.json`: `{"mcpServers": {"vibetts": {"type": "http", "u
 | `list_voices` | `voices` (`id`, `label`, `engine`, `languages`), the 31 `languages` (`code`, `name`), the configured `language_voices` (language code -> voice, empty = Off), `read_language` and `supertonic_installed` |
 | `stop` | Stops reading; `cancel_export = true` also cancels a running export |
 
-`voice` takes a Kokoro id (`af_heart`, each reads one language: `a*`/`b*` English, `e*` Spanish, `f*` French, `h*` Hindi, `i*` Italian, `p*` Portuguese) or a Supertonic id (`supertonic:F1` .. `supertonic:M5`, needs the Supertonic download). `lang` is one of the 31 Supertonic codes (`en`, `hr`, `de`, `sl`, ...). Leave both out to get what the hotkey would do: the language is detected from the text and read with that language's configured voice. A `lang` without a `voice` uses that language's configured voice; a Kokoro `voice` without `lang` reads its own language; a Kokoro `voice` with another `lang` is an error.
+`voice` takes a Kokoro id (`af_heart`, each reads one language: `a*`/`b*` English, `e*` Spanish, `f*` French, `h*` Hindi, `i*` Italian, `p*` Portuguese) a Supertonic id (`supertonic:F1` .. `supertonic:M5`, needs the Supertonic download) or a Higgs id (`higgs:F1`, `higgs:F2`, `higgs:M1`, `higgs:M2`, or `higgs:<name>` for your own voice; needs the Higgs download, and is slower than real time on a CPU). `lang` is any code `list_voices` returns (the 31 Supertonic codes plus the Higgs ones such as `bs`, `sr`, `mk`, `ca`; Supertonic voices read only the 31, Higgs voices every code except `ja`). Leave both out to get what the hotkey would do: the language is detected from the text and read with that language's configured voice. A `lang` without a `voice` uses that language's configured voice; a Kokoro `voice` without `lang` reads its own language; a Kokoro `voice` with another `lang` is an error.
 
 **Security.** The server is off by default.
 
@@ -144,7 +147,7 @@ Only the extension with an id in `[reader] extension_ids` and pages served by th
 | Press **Alt+Win** with nothing selected | Reads the clipboard text (turn off in Settings) |
 | **Alt+Win** or **Esc** while reading | Stops |
 | Tray > **Language** | `Auto (detect language)` or `Always <language>` for each enabled language |
-| Tray > **Voices** / **Speed** | **Voices** has a submenu per enabled language (Off, its Kokoro voices, Supertonic voices); changes apply to the next read |
+| Tray > **Voices** / **Speed** | **Voices** has a submenu per enabled language (Off, its Kokoro voices, Supertonic voices, Higgs voices); changes apply to the next read |
 
 Pill colours: blue animated dots = starting / loading the model, violet = reading, green = done, red text = error.
 
@@ -187,10 +190,13 @@ VibeTTS waits until you release the hotkey (and any other modifier), saves the c
 |---|---|---|---|---|
 | Kokoro-82M | English (American, British), Spanish, French, Hindi, Italian, Portuguese (Brazilian) | 41 (`af_heart`, `bf_emma`, `ef_dora`, `ff_siwis`, `pf_dora` ...) | 92 MB (int8) | ~8x real time |
 | Supertonic 3 | 31: English, Croatian, German, Slovenian, Spanish, French, Russian, Japanese ... | 10: F1..F5, M1..M5 | ~400 MB | ~11x real time |
+| Higgs Audio v3 (optional) | 100: 30 of Supertonic's 31 (not Japanese), plus Bosnian, Serbian, Macedonian, Albanian, Catalan and others | 4 presets (F1 F2 M1 M2) and your own clips | 3.85 GB | slower than real time on a CPU (see below) |
 
-Every language has its own voice, set in **Settings > Voice** (or `[speech.language_voices]` in `config.toml`): pick a language, then its engine (Supertonic, Kokoro where it reads that language, or Off) and voice. English defaults to Kokoro `af_heart`, every other language to Supertonic `F1`. A language set to **Off** is never read and never detected.
+Every language has its own voice, set in **Settings > Voice** (or `[speech.language_voices]` in `config.toml`): pick a language, then its engine (Supertonic, Kokoro where it reads that language, or Off) and voice. English defaults to Kokoro `af_heart`, every other language to Supertonic `F1`. A language set to **Off** is never read and never detected. Languages only Higgs reads (Bosnian, Serbian, Macedonian, Albanian, Catalan ...) start **Off** and offer Higgs or Off.
 
-Every read decides its language once, up front, from the whole text, among the enabled languages (all 31 by default). Detection is local and offline ([py3langid](https://github.com/adbar/py3langid)); very short text (under 4 words) counts as English, so a Croatian name in an English sentence does not switch voices. **Read** in Settings > Voice (or tray > **Language**) sets `Auto (detect language)` or `Always <language>`. Without the Supertonic download, a language falls back to its Kokoro default voice, or Kokoro English, with a hint to download Supertonic.
+Every read decides its language once, up front, from the whole text, among the enabled languages (all 31 by default). Detection is local and offline ([py3langid](https://github.com/adbar/py3langid)); very short text (under 4 words) counts as English, so a Croatian name in an English sentence does not switch voices. **Read** in Settings > Voice (or tray > **Language**) sets `Auto (detect language)` or `Always <language>`. Without the Supertonic download, a language falls back to its Kokoro default voice, or Kokoro English, with a hint to download Supertonic. A language set to a Higgs voice falls back the same way when Higgs is not installed (or the custom voice was deleted): to its Supertonic voice if Supertonic is installed and reads it, else Kokoro.
+
+Detection only picks among languages py3langid knows. These enabled languages are never detected and are reached only through **Read > Always (language)**, tray > **Language**, or an explicit `lang` (CLI `--lang`, MCP `lang`): ast, ceb, ckb, kam, kea, luo, mhr, mi, ny, sd, umb. Closely related languages can be confused: Croatian text is still detected as Croatian with Bosnian and Serbian enabled in the samples tested here, but a Bosnian sample came out as Croatian, so use **Always Bosnian** for it.
 
 Pick voices in the tray (**Voices** > language) or Settings > Voice. `af_heart` (American, female) is the default and the best rated Kokoro voice; `af_bella` and `bf_emma` are other well-rated English voices, `am_michael` and `bm_george` are good male ones. Old `voice`, `english_*`, `other_*` and `language_mode` settings are migrated automatically on the first start.
 
@@ -203,7 +209,15 @@ Kokoro files come from the [kokoro-onnx](https://github.com/thewh1teagle/kokoro-
 
 **Supertonic.** Download it once in **Settings > Supertonic** (about 400 MB from [Supertone/supertonic-3](https://huggingface.co/Supertone/supertonic-3), into `models\supertonic-3`, progress bar, resumable, Cancel) or with `python -m vibetts.model_setup --supertonic`. The same tab sets the quality (4 to 16 steps, default 8: fewer is faster, more sounds better) and deletes the files again. The Supertonic 3 model is released under the OpenRAIL-M license; read its terms before using the audio commercially.
 
-**44.1 kHz.** Everything leaves the app at 44.1 kHz: Supertonic natively, Kokoro resampled up from 24 kHz with [soxr](https://github.com/dofuuz/python-soxr), so there is one output stream and one export format.
+**Higgs Audio v3.** An optional third engine ([Higgs Audio v3 TTS 4B](https://huggingface.co/onnx-community/higgs-audio-v3-tts-4b), community ONNX build, int4 `cpu_int4` graphs). Download it in **Settings > Higgs** (3.85 GB into `models\higgs-audio-v3`) or with `python -m vibetts.model_setup --higgs`. It works like the other engines (hotkey reads, export, MCP, tray, per-language voices), with these differences:
+
+- *Speed.* In a measurement on a Ryzen AI Max+ 395 (CPU, 8 ONNX Runtime threads) it ran at 1.4 to 1.8 seconds of compute per second of audio (zero-shot 1.37 to 1.55, with a voice clip 1.65 to 1.78). Live reads therefore pause between chunks, and a one-minute export takes roughly two minutes. Other machines were not measured.
+- *Memory.* About 4.4 to 4.8 GB of RAM while loaded (up to about 7.5 GB while encoding a new voice clip). The engine is unloaded when no language uses Higgs any more or its files are deleted.
+- *Voices.* A voice is a reference clip (and its transcript) per language. The presets F1, F2, M1, M2 ship with the app; **Settings > Higgs > Voices > Add...** adds your own (a WAV of 3 to 30 seconds, its transcript, a name and a language) under `models\higgs-voices`. A clip in the language being read works much better than one in another language, so give a voice a clip for each language you read with it; a missing clip falls back to a related language, then English.
+- *Not done.* Numbers and dates are not normalised (one Croatian amount with thousands separators was misread in the spike), and the speed slider only approximates speed (a prompt tag with a weak effect).
+- *Licence.* The Higgs Audio v3 weights come under the Boson AI Higgs Audio v3 Research and Non-Commercial License: personal and hobbyist non-commercial use only. Distributing a product or app that uses them, or earning revenue from them, needs a commercial licence from Boson AI; this licence has no creator grant. VibeTTS only downloads the files on your request and does not redistribute them.
+
+**44.1 kHz.** Everything leaves the app at 44.1 kHz: Supertonic natively, Kokoro and Higgs (both 24 kHz) resampled up with [soxr](https://github.com/dofuuz/python-soxr), so there is one output stream and one export format.
 
 ## Portable build (exe)
 
@@ -272,7 +286,8 @@ vibetts/
   textprep.py            markdown cleanup, sentence chunking
   tts.py                 Kokoro engine (soxr resampling to 44.1 kHz), streaming speaker, audio output, voice labels
   supertonic.py          Supertonic 3 engine (ONNX, 31 languages)
-  model_setup.py         Kokoro and Supertonic model downloader (also a CLI)
+  higgs.py               Higgs Audio v3 engine (ONNX, about 100 languages, reference-clip voices)
+  model_setup.py         Kokoro, Supertonic and Higgs model downloader (also a CLI)
   overlay.py             status pill (tkinter)
   tray.py                tray icon and menu
   settings_ui.py         Settings window (tkinter + sv-ttk)
@@ -286,4 +301,4 @@ tests/
 
 ## License
 
-MIT (placeholder). Kokoro-82M weights: Apache 2.0. Supertonic 3 model: OpenRAIL-M (downloaded separately; the inference code in `supertonic.py` is ported from the MIT-licensed `supertonic` SDK).
+MIT (placeholder). Kokoro-82M weights: Apache 2.0. Supertonic 3 model: OpenRAIL-M (downloaded separately; the inference code in `supertonic.py` is ported from the MIT-licensed `supertonic` SDK). Higgs Audio v3 weights: Boson AI Higgs Audio v3 Research and Non-Commercial License (downloaded separately, personal non-commercial use only; a commercial licence from Boson AI is needed for any product, app distribution or revenue).

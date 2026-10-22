@@ -62,8 +62,45 @@ DEFAULT_SUPERTONIC_VOICE = "supertonic:F1"
 # The Kokoro voice that reads each Kokoro language when Supertonic is not installed.
 DEFAULT_KOKORO_VOICES = {"en": "af_heart", "es": "ef_dora", "fr": "ff_siwis", "hi": "hf_alpha",
                          "it": "if_sara", "pt": "pf_dora"}
-DEFAULT_LANGUAGE_VOICES = {c: ("af_heart" if c == "en" else DEFAULT_SUPERTONIC_VOICE)
-                           for c in SUPERTONIC_LANGUAGES}
+
+HIGGS_PREFIX = "higgs:"
+HIGGS_PRESETS = ("F1", "F2", "M1", "M2")  # bundled preset voice names
+HIGGS_VOICE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+HIGGS_TEMPERATURE_RANGE = (0.3, 1.2)
+# The 100 languages in Higgs Audio v3's metadata (Japanese is not one of them).
+HIGGS_LANGUAGE_NAMES = {
+    "af": "Afrikaans", "ar": "Arabic", "as": "Assamese", "ast": "Asturian", "az": "Azerbaijani",
+    "ba": "Bashkir", "be": "Belarusian", "bg": "Bulgarian", "bn": "Bengali", "bs": "Bosnian",
+    "ca": "Catalan", "ceb": "Cebuano", "ckb": "Central Kurdish", "cs": "Czech", "cy": "Welsh",
+    "da": "Danish", "de": "German", "el": "Greek", "en": "English", "eo": "Esperanto",
+    "es": "Spanish", "et": "Estonian", "eu": "Basque", "fa": "Persian", "fi": "Finnish",
+    "fr": "French", "ga": "Irish", "gl": "Galician", "gu": "Gujarati", "ha": "Hausa",
+    "he": "Hebrew", "hi": "Hindi", "hr": "Croatian", "ht": "Haitian Creole", "hu": "Hungarian",
+    "hy": "Armenian", "id": "Indonesian", "is": "Icelandic", "it": "Italian", "jv": "Javanese",
+    "ka": "Georgian", "kab": "Kabyle", "kam": "Kamba", "kea": "Kabuverdianu", "kk": "Kazakh",
+    "kn": "Kannada", "ko": "Korean", "ky": "Kyrgyz", "la": "Latin", "lb": "Luxembourgish",
+    "lg": "Luganda", "ln": "Lingala", "lt": "Lithuanian", "luo": "Luo", "lv": "Latvian",
+    "mhr": "Eastern Mari", "mi": "Maori", "mk": "Macedonian", "ml": "Malayalam",
+    "mn": "Mongolian", "mr": "Marathi", "ms": "Malay", "mt": "Maltese", "ne": "Nepali",
+    "nl": "Dutch", "no": "Norwegian", "nso": "Northern Sotho", "ny": "Chichewa",
+    "oc": "Occitan", "om": "Oromo", "pa": "Punjabi", "pl": "Polish", "ps": "Pashto",
+    "pt": "Portuguese", "ro": "Romanian", "ru": "Russian", "rw": "Kinyarwanda", "sd": "Sindhi",
+    "sk": "Slovak", "sl": "Slovenian", "sn": "Shona", "so": "Somali", "sq": "Albanian",
+    "sr": "Serbian", "sv": "Swedish", "sw": "Swahili", "ta": "Tamil", "te": "Telugu",
+    "tg": "Tajik", "tl": "Tagalog", "tr": "Turkish", "ug": "Uyghur", "uk": "Ukrainian",
+    "umb": "Umbundu", "ur": "Urdu", "uz": "Uzbek", "vi": "Vietnamese", "xh": "Xhosa",
+    "zh": "Chinese", "zu": "Zulu",
+}
+HIGGS_LANGUAGES = tuple(HIGGS_LANGUAGE_NAMES)
+LANGUAGE_NAMES = {**SUPERTONIC_LANGUAGE_NAMES, **HIGGS_LANGUAGE_NAMES}
+# English, the other Supertonic codes in their order, then the Higgs-only codes sorted by name.
+ALL_LANGUAGES = SUPERTONIC_LANGUAGES + tuple(sorted(
+    (c for c in HIGGS_LANGUAGE_NAMES if c not in SUPERTONIC_LANGUAGE_NAMES),
+    key=lambda c: (HIGGS_LANGUAGE_NAMES[c], c)))
+# The 31 Supertonic languages keep their defaults; Higgs-only languages start Off.
+DEFAULT_LANGUAGE_VOICES = {c: ("af_heart" if c == "en" else DEFAULT_SUPERTONIC_VOICE
+                               if c in SUPERTONIC_LANGUAGES else "")
+                           for c in ALL_LANGUAGES}
 
 
 def is_supertonic_voice(voice: str) -> bool:
@@ -78,16 +115,30 @@ def kokoro_voice_lang(voice: str) -> str | None:
     return None
 
 
+def is_higgs_voice(voice: str) -> bool:
+    """'higgs:F1' or 'higgs:<custom name>' (the name's syntax is checked, not that it exists)."""
+    return voice.startswith(HIGGS_PREFIX) and bool(
+        HIGGS_VOICE_NAME_RE.match(voice[len(HIGGS_PREFIX):]))
+
+
+def higgs_voice_name(voice: str) -> str:
+    """'higgs:F1' -> 'F1'."""
+    return voice[len(HIGGS_PREFIX):]
+
+
 def voice_fits_language(voice: str, lang: str) -> bool:
-    """Can `voice` read `lang`? Supertonic voices read all 31; a Kokoro voice only its own."""
+    """Can `voice` read `lang`? Supertonic voices read its 31, Higgs voices its 100; a Kokoro
+    voice only its own."""
     if is_supertonic_voice(voice):
         return lang in SUPERTONIC_LANGUAGES
+    if is_higgs_voice(voice):
+        return lang in HIGGS_LANGUAGES
     return kokoro_voice_lang(voice) == lang
 
 
 def enabled_languages(s: "SpeechConfig") -> list[str]:
-    """Codes whose voice is not Off: English first, then SUPERTONIC_LANGUAGES order."""
-    return [c for c in SUPERTONIC_LANGUAGES if s.language_voices.get(c, "")]
+    """Codes whose voice is not Off, in ALL_LANGUAGES order (English first)."""
+    return [c for c in ALL_LANGUAGES if s.language_voices.get(c, "")]
 
 
 @dataclass
@@ -100,11 +151,14 @@ class SpeechConfig:
     device: str = ""             # "" = Windows default output, or part of the device name
     preload: bool = True         # load the model at startup so the first read starts at once
     # language code -> voice: a Kokoro id (af_heart, ef_dora), "supertonic:F1" .. "supertonic:M5",
-    # or "" = Off (never detected, never offered)
+    # "higgs:<name>", or "" = Off (never detected, never offered)
     language_voices: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_LANGUAGE_VOICES))
     read_language: str = "auto"             # auto: detect the language of each read | a language code
     supertonic_dir: str = "models/supertonic-3"  # Supertonic model files, downloaded from Settings
     supertonic_steps: int = 8               # 4 .. 16: fewer = faster, more = better quality
+    higgs_dir: str = "models/higgs-audio-v3"      # Higgs model files, downloaded from Settings
+    higgs_voices_dir: str = "models/higgs-voices"  # your own Higgs voices (clip + transcript)
+    higgs_temperature: float = 0.8          # 0.3 .. 1.2: lower = steadier, higher = more varied
 
 
 @dataclass
@@ -249,7 +303,7 @@ def _build(cls: type, data: Any, where: str) -> Any:
 def _validate_speech(s: SpeechConfig) -> None:
     voices = {}
     for code, voice in s.language_voices.items():
-        if code not in SUPERTONIC_LANGUAGES:
+        if code not in ALL_LANGUAGES:
             log.warning("config: speech.language_voices has unknown language %r; ignored", code)
             continue
         voices[code] = voice
@@ -260,7 +314,7 @@ def _validate_speech(s: SpeechConfig) -> None:
                         "using %r", code, voice, default)
             voice = default
         voices[code] = voice
-    s.language_voices = {c: voices[c] for c in SUPERTONIC_LANGUAGES}
+    s.language_voices = {c: voices[c] for c in ALL_LANGUAGES}
     if not enabled_languages(s):
         log.warning("config: every language is off; turning English on")
         s.language_voices["en"] = DEFAULT_LANGUAGE_VOICES["en"]
@@ -274,6 +328,12 @@ def _validate_speech(s: SpeechConfig) -> None:
         log.warning("config: speech.supertonic_steps %d outside %d..%d; using %d",
                     s.supertonic_steps, lo, hi, steps)
         s.supertonic_steps = steps
+    lo_t, hi_t = HIGGS_TEMPERATURE_RANGE
+    temp = min(max(float(s.higgs_temperature), lo_t), hi_t)
+    if temp != s.higgs_temperature:
+        log.warning("config: speech.higgs_temperature %s outside %s..%s; using %s",
+                    s.higgs_temperature, lo_t, hi_t, temp)
+        s.higgs_temperature = temp
 
 
 _OLD_SPEECH_KEYS = ("voice", "english_engine", "english_supertonic_voice", "other_language",

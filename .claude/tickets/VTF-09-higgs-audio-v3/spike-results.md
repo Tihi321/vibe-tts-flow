@@ -177,3 +177,65 @@ The first set of `pre_repo_*` runs (`out/extra8/`) used the original 44 s `ref.w
 ## Quality
 
 - Listening test (user): pending. Open `.claude/temp/vtf09/listen.html` (groups: references, zero-shot, clone, consistency, cross-lingual, speed tags, presets, seeds; each with text, ASR, ratio, RTF).
+
+## DirectML (Radeon 8060S)
+
+Date: 2026-10-22 (work item D). Throwaway measurement only; nothing tracked was changed. Scripts, logs and raw JSON are in `.claude/temp/vtf09dml/` (`higgs_patched.py` = the CPU port plus a per-graph DML switch, `run.py` bench, `t1.py` to `t7.py` diagnostics, `out/results_dml_*.json`).
+
+**Conclusion: no. DirectML does not work for this model on this machine.** The int4 `llm_decoder` runs on DML but computes wrong results once the KV cache is used, it is about 3x slower per step than CPU, and the codec graph does not run on DML at all. RTF is 5.6 to 8.6 (CPU: 1.37 to 1.78) and the output is not speech. Neither RTF < 1 nor <= 0.8 is reachable with onnxruntime-directml 1.24.4.
+
+### Setup
+
+- Venv `.claude/temp/vtf09dml/venv` (Python 3.13.12): onnxruntime-directml **1.24.4** (providers `DmlExecutionProvider`, `CPUExecutionProvider`), numpy 2.5.4, tokenizers 0.23.3, soxr 1.1.0, soundfile 0.14.0, psutil 7.2.2. The CPU spike used onnxruntime 1.31.0; 1.24.4 was the directml wheel pip resolved, so a newer DML build might behave differently (none available).
+- Model: the same `cpu_int4` graphs, unchanged. DML sessions use `enable_mem_pattern=False`, `ORT_SEQUENTIAL`, providers `["DmlExecutionProvider", "CPUExecutionProvider"]`. Graph optimisation level ALL / BASIC / DISABLED made no difference. 8 threads for CPU-side sessions. Single samples, seed 0.
+- Because the DML decoder output goes non-finite, `FORCE=1` in the bench replaces non-finite logits with finite values so the AR loop completes and can be timed. Those runs are timing only; their audio is invalid. Without `FORCE` the stock NaN guard raises during the first generation.
+
+### What ran where (ORT verbose log, `llm_decoder.onnx` on DML)
+
+617 nodes on `DmlExecutionProvider`, 2 on CPU (one `Gather`, one `Cast`). This includes all 180 `MatMulNBits` and all 36 `GroupQueryAttention` (plus `SimplifiedLayerNormalization`, `SkipSimplifiedLayerNormalization`, `QuickGelu`): the DML EP in 1.24.4 registers these contrib ops, so nothing falls back to CPU in the decoder. The problem is correctness and speed, not missing kernels.
+
+Other graphs on DML vs CPU (random inputs, one call):
+
+| Graph | Result on DML |
+|---|---|
+| audio_embed, audio_heads, text_embed | run and match CPU (max diff 1e-7 to 1.5e-5; text_embed exact); sub-millisecond, speed irrelevant |
+| audio_tokenizer (codec decode) | **fails** for 13, 50 and 100 frames: `ConvTranspose` node `/acoustic_decoder/block.1/conv_t1/ConvTranspose`, DML error `80070057 The parameter is incorrect` |
+| audio_encoder | runs (0.21 s vs 0.59 s CPU for 10 s of noise); code correctness not verified (noise input) |
+| llm_decoder | runs, but wrong and slow (below) |
+
+So "(1) all graphs on DML" cannot complete: the codec raises on the first generation. The runnable variants are (1b) everything except the codec on DML, and (2) `llm_decoder` only on DML.
+
+### llm_decoder correctness on DML
+
+Compared with the CPU graph on identical inputs (HR short prompt, 10 tokens):
+
+- Prefill: the last hidden state is close (about 0.01 to 0.05 off, magnitudes up to 90), but the returned `present.*.key/value` tensors already differ from CPU (layer 0 key max diff 12.7 of 200; layer 35 value 34 of 60).
+- Decode step with the CPU's own KV cache as input: hidden state max diff 4.9 (about 5% of range).
+- Second decode step (past = DML's own `present`): hidden state differs by about 88 to 100, i.e. different values entirely. The old positions of `present.*.key` come back wrong (the difference equals the full tensor magnitude), so DML's `GroupQueryAttention` does not carry the past KV into `present` correctly for this graph's inputs (separate past/present tensors plus `attention_mask`). Non-finite values appear in `audio_heads` a few frames later.
+- Net effect: never intelligible. `FORCE` zero-shot runs do not end naturally (900-frame cap, 36 s of babble); ASR (faster-whisper medium) returned empty text for all four clips (word ratio 0.00). Not silent (RMS 0.06 to 0.08) and no NaN in the waveform (logits were sanitised), but not speech.
+
+### Speed
+
+Decode step, llm_decoder, 100-token cache, 30 steps, median: CPU 8 threads **55 ms**; DML **157 ms**; DML with IOBinding keeping the KV cache on the device (`present.*` bound to `dml`, next past passed as `OrtValue`) **178 ms**. IO binding / a device-resident KV cache does not help (slightly slower), so the cost is not the host/device copy. A profiled run shows time spread over many small per-layer kernels (per step, inflated by profiling: MatMulNBits about 95 ms, SkipSimplifiedLayerNorm about 43 ms, GroupQueryAttention about 37 ms, SimplifiedLayerNorm about 29 ms), the pattern of per-op dispatch overhead at batch 1 with 36 layers and about 600 nodes, not of a compute-bound graph. Prefill of 100 tokens: CPU 0.56 s, DML 0.73 s.
+
+Full generations (HR texts from `texts.py`, seed 0, 8 threads, load excluded, `FORCE=1`, audio invalid, timing only):
+
+| Config | Load s | Peak RSS | Clip | Synth s | RTF | Frames/s | Valid |
+|---|---|---|---|---|---|---|---|
+| CPU reference (spike) HR short | 5.1 | 4.9 GB | 1.9 s | 2.6 | 1.37 | about 20 | yes |
+| CPU reference (spike) HR paragraph | 5.1 | 4.9 GB | 13.9 s | 21.6 | 1.55 | 18.9 | yes |
+| (1b) all but codec on DML, zero-shot HR short | 3.7 | 3.5 GB | 35.7 s (900-frame cap) | 200.9 | 5.63 | 4.5 | no, ASR empty |
+| (1b) zero-shot HR paragraph | | | 35.7 s (cap) | 254.1 | 7.11 | 3.6 | no, ASR empty |
+| (1b) clone F1_hr, HR short (prefill 418 tokens, 1.25 s) | | | 21.2 s (EOC) | 172.3 | 8.15 | 3.2 | no, ASR empty |
+| (1b) clone F1_hr, HR paragraph (prefill 525 tokens, 1.35 s) | | | 35.7 s (cap) | 306.0 | 8.57 | 3.0 | no, ASR empty |
+| (2) llm_decoder only on DML, zero-shot HR short | 5.1 | 2.8 GB | 35.7 s (cap) | 236.7 | 6.63 | 3.8 | no (NaN guard fires without FORCE) |
+| (1) everything on DML incl. codec | 3.6 | n/a | n/a | n/a | n/a | n/a | fails in codec (ConvTranspose) |
+
+Because the DML runs ramble up to the 900-frame cap, the RTF column divides by a clip that is far too long (the real speech would be 1.9 s / 13.9 s), so frames/s is the reliable number: 3.0 to 4.5 on DML vs 15 to 25 on CPU. Real time needs 25 frames/s (40 ms per frame in total); DML is at about 220 to 330 ms per frame. The first short chunk would be several seconds even without the wrong output, so the first-chunk target also fails. Load time on DML is a little shorter (3.7 s vs 5.1 s) and RAM is lower (2.8 to 3.5 GB peak), neither matters here.
+
+### Verdict and consequences for the plan
+
+- DML does not reach RTF < 1 or <= 0.8. It is 3 to 5 times slower per frame than CPU, and the decoder output is wrong. It is not a speed-up path for this model with onnxruntime-directml 1.24.4.
+- If someone wants to revisit: (a) a DML `GroupQueryAttention` bug or unsupported input pattern (separate past/present, no shared buffer); (b) the codec's `ConvTranspose`; (c) a newer ORT DML build than 1.24.4; (d) an fp16 or DML-targeted export of the graphs (not checked; the repo ships only what is in the pinned revision). None was pursued.
+- Dependency note, for completeness (moot since DML is dropped): `onnxruntime-directml` and `onnxruntime` both provide the `onnxruntime` module and cannot be installed side by side, and `kokoro-onnx` requires `onnxruntime`, so pip sees a conflict. Using DML would need a separate environment or process for Higgs, or a swap to `onnxruntime-directml` for every ONNX engine in the app (Kokoro and Supertonic would then also go through the DML EP unless forced to CPU).
+- Recommendation unchanged: Higgs ships as Export-only; live reads stay on Kokoro and Supertonic.

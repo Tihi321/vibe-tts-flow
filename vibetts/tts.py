@@ -16,7 +16,8 @@ from typing import Any, Callable, Protocol
 
 import numpy as np
 
-from .config import SUPERTONIC_PREFIX, is_supertonic_voice
+from .config import (HIGGS_PRESETS, SUPERTONIC_PREFIX, higgs_voice_name, is_higgs_voice,
+                     is_supertonic_voice)
 from .textprep import Chunk
 
 log = logging.getLogger(__name__)
@@ -42,12 +43,18 @@ def kokoro_voice_supported(voice: str) -> bool:
 
 
 def voice_supported(voice: str) -> bool:
-    """A Kokoro voice id (af_heart) or a Supertonic one (supertonic:F1)."""
-    return kokoro_voice_supported(voice) or is_supertonic_voice(voice)
+    """A Kokoro voice id (af_heart), a Supertonic one (supertonic:F1) or a Higgs one (higgs:F1)."""
+    return kokoro_voice_supported(voice) or is_supertonic_voice(voice) or is_higgs_voice(voice)
 
 
 def voice_label(voice: str) -> str:
-    """'af_heart' -> 'Heart (American English, female)'; 'supertonic:F1' -> 'F1 (Supertonic, female)'."""
+    """'af_heart' -> 'Heart (American English, female)'; 'supertonic:F1' -> 'F1 (Supertonic, female)';
+    'higgs:F1' -> 'F1 (Higgs, female)'; 'higgs:Anna' (own clip) -> 'Anna (Higgs, custom)'."""
+    if is_higgs_voice(voice):
+        name = higgs_voice_name(voice)
+        if name not in HIGGS_PRESETS:
+            return f"{name} (Higgs, custom)"
+        return f"{name} (Higgs, {'female' if name[:1] == 'F' else 'male'})"
     if is_supertonic_voice(voice):
         name = voice[len(SUPERTONIC_PREFIX):]
         return f"{name} (Supertonic, {'female' if name[:1] == 'F' else 'male'})"
@@ -57,6 +64,11 @@ def voice_label(voice: str) -> str:
     name = voice[3:].replace("_", " ").title()
     lang = LANG_LABELS.get(voice[:1], "")
     return f"{name} ({lang}, {gender})" if gender else f"{name} ({lang})"
+
+
+class SynthCancelled(Exception):
+    """A cancellable engine (Higgs) stopped in the middle of a chunk because its cancel event
+    or callable fired (Stop, export Cancel). Not an error."""
 
 
 class Engine(Protocol):
@@ -289,7 +301,11 @@ class Speaker:
                 if stop.is_set():
                     return
                 t0 = time.perf_counter()
-                samples = engine.synth(chunk.text, req.voice, req.speed, req.lang)
+                if getattr(engine, "accepts_cancel", False):  # Higgs: a chunk takes 10-40 s
+                    samples = engine.synth(chunk.text, req.voice, req.speed, req.lang,
+                                           cancel=stop)
+                else:
+                    samples = engine.synth(chunk.text, req.voice, req.speed, req.lang)
                 log.debug("synth %d chars -> %.2fs audio in %.2fs", len(chunk.text),
                           len(samples) / SAMPLE_RATE, time.perf_counter() - t0)
                 gap = int(req.pause * chunk.pause_after * SAMPLE_RATE)
@@ -297,6 +313,9 @@ class Speaker:
                     samples = np.concatenate([samples, np.zeros(gap, dtype=np.float32)])
                 if not self._put(q, (chunk, samples), stop):
                     return
+        except SynthCancelled:
+            log.debug("synthesis cancelled")  # Stop: the player is already winding down
+            return
         except Exception as e:  # noqa: BLE001
             log.exception("speech synthesis failed")
             self._put(q, e, stop)

@@ -1,4 +1,4 @@
-"""VibeTTS application: hotkey -> selected text -> Kokoro / Supertonic -> speakers, plus tray and settings."""
+"""VibeTTS application: hotkey -> selected text -> Kokoro / Supertonic / Higgs -> speakers, plus tray and settings."""
 from __future__ import annotations
 
 import argparse
@@ -18,12 +18,16 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 from . import __version__
 from .config import (
+    ALL_LANGUAGES,
     DEFAULT_KOKORO_VOICES,
     DEFAULT_LANGUAGE_VOICES,
     DEFAULT_SUPERTONIC_VOICE,
+    HIGGS_LANGUAGES,
+    HIGGS_PREFIX,
+    HIGGS_PRESETS,
+    LANGUAGE_NAMES,
     READ_AUTO,
     ROOT,
-    SUPERTONIC_LANGUAGE_NAMES,
     SUPERTONIC_LANGUAGES,
     SUPERTONIC_PREFIX,
     SUPERTONIC_VOICES,
@@ -32,6 +36,7 @@ from .config import (
     config_path,
     enabled_languages,
     export_folder,
+    is_higgs_voice,
     is_supertonic_voice,
     kokoro_voice_lang,
     load_config,
@@ -53,6 +58,8 @@ _READER_LOCK = threading.RLock()  # the same for _sync_reader
 MISSING_MODEL = "Download the voice model to start reading aloud"
 MISSING_SUPERTONIC = "Supertonic is not installed: download it in Settings > Supertonic"
 SUPERTONIC_HINT = "Download Supertonic in Settings"
+MISSING_HIGGS = "Higgs is not installed: download it in Settings > Higgs"
+HIGGS_HINT = "Download Higgs in Settings"
 
 
 def _short(msg: str, limit: int = 60) -> str:
@@ -92,27 +99,75 @@ def supertonic_voice_ids() -> list[str]:
     return [SUPERTONIC_PREFIX + v for v in SUPERTONIC_VOICES]
 
 
+def _hg() -> Any:
+    """The Higgs module, imported on first use (it is only needed for those voices)."""
+    from . import higgs
+
+    return higgs
+
+
+def higgs_dir(s: SpeechConfig) -> Path:
+    return resolve_path(s.higgs_dir)
+
+
+def higgs_voices_dir(s: SpeechConfig) -> Path:
+    return resolve_path(s.higgs_voices_dir)
+
+
+def higgs_present(s: SpeechConfig) -> bool:
+    try:
+        return bool(_hg().models_present(higgs_dir(s)))
+    except Exception:
+        log.debug("Higgs check failed", exc_info=True)
+        return False
+
+
+def higgs_voice_ids(s: SpeechConfig) -> list[str]:
+    """higgs:F1 .. higgs:M2 and the user's own voices."""
+    try:
+        return list(_hg().voice_ids(higgs_voices_dir(s)))
+    except Exception:
+        log.debug("listing the Higgs voices failed", exc_info=True)
+        return [HIGGS_PREFIX + v for v in HIGGS_PRESETS]
+
+
+def higgs_voice_ready(s: SpeechConfig, voice: str, present: bool | None = None) -> bool:
+    """Higgs installed and `voice` exists (a custom voice may have been deleted since a
+    language row was set to it)."""
+    if not (higgs_present(s) if present is None else present):
+        return False
+    return voice in higgs_voice_ids(s)
+
+
 def voice_ready(s: SpeechConfig, voice: str) -> bool:
     """Are the model files for the engine that speaks `voice` present?"""
+    if is_higgs_voice(voice):
+        return higgs_voice_ready(s, voice)
     return supertonic_present(s) if is_supertonic_voice(voice) else models_present(s)
 
 
 def missing_message(voice: str) -> str:
+    if is_higgs_voice(voice):
+        return MISSING_HIGGS
     return MISSING_SUPERTONIC if is_supertonic_voice(voice) else MISSING_MODEL
 
 
 def setup_tab(voice: str) -> str:
     """The Settings tab with the Download panel for the engine that speaks `voice`."""
+    if is_higgs_voice(voice):
+        return "higgs"
     return "supertonic" if is_supertonic_voice(voice) else "kokoro"
 
 
 class Route(NamedTuple):
-    """How one request is read: the engine, the voice id, the language (one of the 31 codes)
-    and whether Supertonic was wanted but is not installed (a Kokoro voice reads it instead)."""
+    """How one request is read: the engine (kokoro, supertonic or higgs), the voice id, the
+    language code and whether the wanted engine (`missing`: supertonic or higgs) is not
+    installed (another engine's voice reads it instead)."""
     engine: str
     voice: str
     lang: str
     fell_back: bool = False
+    missing: str = "supertonic"  # the engine that was wanted; only meaningful with fell_back
 
 
 def kokoro_voice_of(s: SpeechConfig) -> str:
@@ -122,11 +177,15 @@ def kokoro_voice_of(s: SpeechConfig) -> str:
 
 
 def voice_for_lang(s: SpeechConfig, lang: str) -> str:
-    """The voice id of `lang`'s row (the default when the row is Off or not valid)."""
+    """The voice id of `lang`'s row (the default when the row is Off or not valid; languages
+    only Higgs reads default to higgs:F1)."""
     voice = s.language_voices.get(lang, "")
     if voice and voice_fits_language(voice, lang):
         return voice
-    return DEFAULT_LANGUAGE_VOICES.get(lang, DEFAULT_SUPERTONIC_VOICE)
+    default = DEFAULT_LANGUAGE_VOICES.get(lang, DEFAULT_SUPERTONIC_VOICE)
+    if not default and lang in HIGGS_LANGUAGES:
+        return HIGGS_PREFIX + "F1"
+    return default or DEFAULT_SUPERTONIC_VOICE
 
 
 def fallback_lang(s: SpeechConfig) -> str:
@@ -147,12 +206,23 @@ def profile_lang(s: SpeechConfig, text: str) -> str:
 
 
 def route_for(s: SpeechConfig, text: str, lang: str | None = None,
-              supertonic_ok: bool | None = None) -> Route:
+              supertonic_ok: bool | None = None, higgs_ok: bool | None = None) -> Route:
     """Engine, voice and language of one read. `lang` None: read_language or detection picks
-    it; the voice is that language's row. Supertonic wanted but not installed: the Kokoro voice
-    of that language when Kokoro reads it, else Kokoro English (both with fell_back)."""
+    it; the voice is that language's row. Supertonic or Higgs wanted but not installed: the
+    language's Supertonic voice (Higgs only, when Supertonic is installed and reads the
+    language), else the Kokoro voice of that language when Kokoro reads it, else Kokoro
+    English (all with fell_back)."""
     lang = lang or profile_lang(s, text)
     voice = voice_for_lang(s, lang)
+    if is_higgs_voice(voice):
+        if higgs_voice_ready(s, voice, higgs_ok):
+            return Route("higgs", voice, lang)
+        if lang in SUPERTONIC_LANGUAGES and (
+                supertonic_present(s) if supertonic_ok is None else supertonic_ok):
+            return Route("supertonic", DEFAULT_SUPERTONIC_VOICE, lang, True, "higgs")
+        if lang in DEFAULT_KOKORO_VOICES:
+            return Route("kokoro", DEFAULT_KOKORO_VOICES[lang], lang, True, "higgs")
+        return Route("kokoro", kokoro_voice_of(s), "en", True, "higgs")
     if not is_supertonic_voice(voice):
         return Route("kokoro", voice, lang)
     if supertonic_present(s) if supertonic_ok is None else supertonic_ok:
@@ -165,19 +235,27 @@ def route_for(s: SpeechConfig, text: str, lang: str | None = None,
 def route_request(s: SpeechConfig, text: str, voice: str | None = None,
                   lang: str | None = None) -> Route:
     """Route of an explicit request (export, MCP): without `voice` it is route_for. A Supertonic
-    voice reads any language; a Kokoro voice only its own (ValueError for another `lang`)."""
-    if lang is not None and lang not in SUPERTONIC_LANGUAGES:
+    voice reads its 31 languages, a Higgs voice its 100, a Kokoro voice only its own
+    (ValueError for another `lang`)."""
+    if lang is not None and lang not in ALL_LANGUAGES:
         raise ValueError(f"Unknown language '{lang}'")
     if not voice:
         return route_for(s, text, lang)
-    if is_supertonic_voice(voice):
-        return Route("supertonic", voice, lang or profile_lang(s, text))
+    if is_supertonic_voice(voice) or is_higgs_voice(voice):
+        higgs = is_higgs_voice(voice)
+        got = lang or profile_lang(s, text)
+        if got not in (HIGGS_LANGUAGES if higgs else SUPERTONIC_LANGUAGES):
+            name = LANGUAGE_NAMES.get(got, got)
+            raise ValueError(f"{'Higgs' if higgs else 'Supertonic'} does not read {name} "
+                             f"('{got}')" + ("" if higgs else "; use a higgs: voice for it"))
+        return Route("higgs" if higgs else "supertonic", voice, got)
     own = kokoro_voice_lang(voice)
     if own is None:
         raise ValueError(f"Unknown voice '{voice}'")
     if lang not in (None, own):
-        raise ValueError(f"The Kokoro voice '{voice}' reads {SUPERTONIC_LANGUAGE_NAMES[own]} "
-                         f"only; use a supertonic: voice for language '{lang}'")
+        other = "a supertonic: voice" if lang in SUPERTONIC_LANGUAGES else "a higgs: voice"
+        raise ValueError(f"The Kokoro voice '{voice}' reads {LANGUAGE_NAMES[own]} "
+                         f"only; use {other} for language '{lang}'")
     return Route("kokoro", voice, own)
 
 
@@ -206,22 +284,37 @@ def primary_voice(s: SpeechConfig) -> str:
 
 def profile_routes(s: SpeechConfig) -> list[Route]:
     """One route per distinct voice a read can use (what to preload)."""
-    ok = supertonic_present(s)
+    ok, hok = supertonic_present(s), higgs_present(s)
     routes: dict[str, Route] = {}
     for lang in _read_langs(s):
-        route = route_for(s, "", lang, ok)
+        route = route_for(s, "", lang, ok, hok)
         routes.setdefault(route.voice, route)
     return list(routes.values())
 
 
-_fallback_warned = False
+_fallback_warned = False  # Supertonic missing
+_fallback_warned_higgs = False  # Higgs missing
+
+
+def fallback_hint(route: Route) -> str:
+    """The overlay hint for a fallback: which download is missing."""
+    return HIGGS_HINT if route.missing == "higgs" else SUPERTONIC_HINT
 
 
 def note_fallback(route: Route) -> bool:
-    """Log (once per session) that Supertonic is missing and Kokoro English reads instead.
-    True the first time."""
-    global _fallback_warned
-    if not route.fell_back or _fallback_warned:
+    """Log (once per session and engine) that the wanted engine (Supertonic or Higgs) is
+    missing and another voice reads instead. True the first time."""
+    global _fallback_warned, _fallback_warned_higgs
+    if not route.fell_back:
+        return False
+    if route.missing == "higgs":
+        if _fallback_warned_higgs:
+            return False
+        _fallback_warned_higgs = True
+        log.warning("Higgs is not installed: reading with the %s voice %s instead "
+                    "(download it in Settings > Higgs)", route.engine.title(), route.voice)
+        return True
+    if _fallback_warned:
         return False
     _fallback_warned = True
     log.warning("Supertonic is not installed: reading with the Kokoro voice %s instead "
@@ -247,6 +340,8 @@ def run_export(engine: Any, s: SpeechConfig, req: ExportRequest, folder: Path,
     ValueError (bad format / language / empty text) and RuntimeError (voice model missing)."""
     from . import export
 
+    from .tts import SynthCancelled
+
     chunks, route = plan_speech(s, req.text, req.voice, req.lang, req.markdown)
     voice, lang = route.voice, route.lang
     if not chunks:
@@ -267,8 +362,16 @@ def run_export(engine: Any, s: SpeechConfig, req: ExportRequest, folder: Path,
     if fmt == "mp3" and not export.mp3_available():
         raise RuntimeError("MP3 export is unavailable: the lameenc package is not installed")
     path = export.resolve_output(req.out, folder, req.title, fmt, req.overwrite)
+    def synth(text: str) -> Any:
+        if cancel is None or not getattr(engine, "accepts_cancel", False):
+            return engine.synth(text, voice, speed, lang)
+        try:  # Higgs stops mid-chunk when the export is cancelled
+            return engine.synth(text, voice, speed, lang, cancel=cancel)
+        except SynthCancelled:
+            raise export.ExportCancelled() from None
+
     seconds, size = export.render(
-        chunks, lambda text: engine.synth(text, voice, speed, lang), path, fmt,
+        chunks, synth, path, fmt,
         pause=s.sentence_pause, gain=req.gain, bitrate=req.bitrate or bitrate_default,
         progress=progress, cancel=cancel, before_chunk=before_chunk)
     return export.ExportResult(path, fmt, seconds, len(chunks), size, voice, lang)
@@ -286,20 +389,30 @@ def voices_in_file(path: Path) -> list[str]:
 
 class RoutingEngine:
     """Engine protocol over the loaded engines: synth goes to Supertonic for supertonic:
-    voices, to Kokoro for the rest; voices() merges both lists."""
+    voices, to Higgs for higgs: voices, to Kokoro for the rest; voices() merges the lists."""
 
-    def __init__(self, kokoro: Any = None, supertonic: Any = None):
+    def __init__(self, kokoro: Any = None, supertonic: Any = None, higgs: Any = None):
         self.kokoro = kokoro
         self.supertonic = supertonic
+        self.higgs = higgs
 
     def voices(self) -> list[str]:
         out: list[str] = []
-        for engine in (self.kokoro, self.supertonic):
+        for engine in (self.kokoro, self.supertonic, self.higgs):
             if engine is not None:
                 out += list(engine.voices())
         return out
 
-    def synth(self, text: str, voice: str, speed: float, lang: str | None = None):
+    accepts_cancel = True  # forwarded to Higgs only (Kokoro and Supertonic chunks are short)
+
+    def synth(self, text: str, voice: str, speed: float, lang: str | None = None,
+              cancel: Any = None):
+        if is_higgs_voice(voice):
+            if self.higgs is None:
+                raise RuntimeError(MISSING_HIGGS)
+            if cancel is not None and getattr(self.higgs, "accepts_cancel", False):
+                return self.higgs.synth(text, voice, speed, lang, cancel=cancel)
+            return self.higgs.synth(text, voice, speed, lang)
         if is_supertonic_voice(voice):
             if self.supertonic is None:
                 raise RuntimeError(MISSING_SUPERTONIC)
@@ -310,7 +423,7 @@ class RoutingEngine:
 
 
 class EngineHolder:
-    """Loads one engine per family (Kokoro, Supertonic) lazily or in the background and
+    """Loads one engine per family (Kokoro, Supertonic, Higgs) lazily or in the background and
     reloads a family when its files / settings change. get() loads the family that speaks
     `voice` (default: the primary configured voice) and returns a RoutingEngine over
     everything loaded so far."""
@@ -321,24 +434,28 @@ class EngineHolder:
         self._kokoro_key: tuple | None = None
         self._supertonic: Any = None
         self._supertonic_key: tuple | None = None
+        self._higgs: Any = None
+        self._higgs_key: tuple | None = None
         self.on_loading = on_loading
 
     @property
     def loaded(self) -> Any:
         """A RoutingEngine over the loaded families, or None when nothing is loaded."""
         with self._lock:
-            if self._kokoro is None and self._supertonic is None:
+            if self._kokoro is None and self._supertonic is None and self._higgs is None:
                 return None
-            return RoutingEngine(self._kokoro, self._supertonic)
+            return RoutingEngine(self._kokoro, self._supertonic, self._higgs)
 
     def get(self, s: SpeechConfig, announce: bool = True, voice: str | None = None) -> Any:
         voice = voice or primary_voice(s)
         with self._lock:
-            if is_supertonic_voice(voice):
+            if is_higgs_voice(voice):
+                self._ensure_higgs(s, announce, voice)
+            elif is_supertonic_voice(voice):
                 self._ensure_supertonic(s, announce, voice)
             else:
                 self._ensure_kokoro(s, voice, announce)
-            return RoutingEngine(self._kokoro, self._supertonic)
+            return RoutingEngine(self._kokoro, self._supertonic, self._higgs)
 
     def _ensure_kokoro(self, s: SpeechConfig, voice: str, announce: bool) -> None:
         from .tts import KokoroEngine, kokoro_voice_supported
@@ -377,6 +494,28 @@ class EngineHolder:
         """Drop the Supertonic engine (before its files are deleted, or after a download)."""
         with self._lock:
             self._supertonic, self._supertonic_key = None, None
+
+    def _ensure_higgs(self, s: SpeechConfig, announce: bool, voice: str) -> None:
+        key = (higgs_dir(s), higgs_voices_dir(s), float(s.higgs_temperature))
+        if self._higgs is not None and self._higgs_key == key:
+            return
+        if not higgs_present(s):
+            raise RuntimeError(MISSING_HIGGS)
+        if announce:
+            self.on_loading()
+        self._higgs = None
+        engine = _hg().HiggsEngine(key[0], key[1], key[2])
+        try:
+            engine.synth("Ready.", voice if is_higgs_voice(voice) else HIGGS_PREFIX + HIGGS_PRESETS[0],
+                         1.0, "en")  # warm-up: first run is slower
+        except Exception:
+            log.warning("Higgs warm-up failed", exc_info=True)
+        self._higgs, self._higgs_key = engine, key
+
+    def unload_higgs(self) -> None:
+        """Drop the Higgs engine (4-5 GB of RAM): its files are deleted or no language uses it."""
+        with self._lock:
+            self._higgs, self._higgs_key = None, None
 
     def preload(self, s: SpeechConfig) -> None:
         """Load the engine(s) of the configured profile(s) in the background (those whose
@@ -463,6 +602,7 @@ class TTSApp:
             read_language=lambda: self.cfg.speech.read_language,
             set_read_language=self._set_read_language,
             supertonic_available=lambda: supertonic_present(self.cfg.speech),
+            higgs_available=lambda: higgs_present(self.cfg.speech),
             current_speed=lambda: self.cfg.speech.speed,
             set_speed=self._set_speed,
             is_autostart=autostart.is_enabled,
@@ -586,7 +726,7 @@ class TTSApp:
                 self._flash("ok", "Nothing to read")
                 return
             if note_fallback(route):
-                self._hint = SUPERTONIC_HINT
+                self._hint = fallback_hint(route)
             log.info("reading %d chars in %d chunks, language %s, voice %s%s",
                      sum(len(c.text) for c in chunks), len(chunks), route.lang, route.voice,
                      " (from clipboard)" if grab.from_clipboard else "")
@@ -664,6 +804,8 @@ class TTSApp:
                 self.open_settings("kokoro")
             elif MISSING_SUPERTONIC in error:
                 self.open_settings("supertonic")
+            elif MISSING_HIGGS in error:
+                self.open_settings("higgs")
         elif self._hint:
             hint, self._hint = self._hint, None
             self._flash("ok", hint, 3.0)
@@ -971,6 +1113,10 @@ class TTSApp:
                 supertonic_dir=lambda: supertonic_dir(self.cfg.speech),
                 supertonic_present=lambda: supertonic_present(self.cfg.speech),
                 supertonic_changed=self._supertonic_changed,
+                higgs_dir=lambda: higgs_dir(self.cfg.speech),
+                higgs_present=lambda: higgs_present(self.cfg.speech),
+                higgs_changed=self._higgs_changed,
+                higgs_voices_dir=lambda: higgs_voices_dir(self.cfg.speech),
                 output_devices=list_output_devices,
                 play_test=self._play_test,
                 stop=self.stop,
@@ -1060,6 +1206,27 @@ class TTSApp:
         self._preload()
         self._voices_changed()
 
+    def _higgs_changed(self) -> None:
+        """Called after a Higgs download, delete or voice add / delete (on the Tk thread, so it
+        returns at once): a worker unloads the engine, preloads it again if a language uses it
+        and refreshes the menus."""
+        global _fallback_warned_higgs
+        _fallback_warned_higgs = False
+
+        def run() -> None:
+            try:
+                self.engine.unload_higgs()
+                self._preload()
+                self._voices_changed()
+            except Exception:
+                log.exception("Higgs reload failed")
+        threading.Thread(target=run, name="vibetts-higgs-reload", daemon=True).start()
+
+    def _unload_unused_higgs(self, s: SpeechConfig) -> None:
+        """Free the Higgs engine's RAM when no language uses a Higgs voice any more."""
+        if not any(is_higgs_voice(v) for v in s.language_voices.values() if v):
+            self.engine.unload_higgs()
+
     def _set_show_on_start(self, value: bool) -> None:
         self.cfg.ui.show_settings_on_start = bool(value)
         self._save()
@@ -1078,6 +1245,7 @@ class TTSApp:
 
         self.cfg = new
         self.overlay.cfg = new.ui
+        self._unload_unused_higgs(new.speech)
         self._sync_mcp()  # before any early return: MCP settings apply anyway
         self._sync_reader()
         try:
@@ -1115,7 +1283,7 @@ class TTSApp:
 
     def _voices(self) -> list[str]:
         """Kokoro voices (from the loaded engine, else read from the voices file), then
-        the Supertonic voices when they are installed."""
+        the Supertonic and the Higgs voices when those are installed."""
         out: list[str] = []
         loaded = self.engine.loaded
         if loaded is not None and loaded.kokoro is not None:
@@ -1129,13 +1297,15 @@ class TTSApp:
                     log.exception("could not read %s", path)
         if supertonic_present(self.cfg.speech):
             out += supertonic_voice_ids()
+        if higgs_present(self.cfg.speech):
+            out += higgs_voice_ids(self.cfg.speech)
         return out
 
     def _set_voice(self, lang: str, voice: str) -> None:
-        """Pick the voice of one language: a Kokoro id of that language, a supertonic: id, or ""
-        for Off (the last enabled language cannot be turned off)."""
+        """Pick the voice of one language: a Kokoro id of that language, a supertonic: or higgs:
+        id, or "" for Off (the last enabled language cannot be turned off)."""
         s = self.cfg.speech
-        if lang not in SUPERTONIC_LANGUAGES:
+        if lang not in ALL_LANGUAGES:
             return
         if voice == "":
             if enabled_languages(s) == [lang]:
@@ -1146,6 +1316,7 @@ class TTSApp:
         if voice == "" and s.read_language == lang:
             s.read_language = READ_AUTO
         self._save()
+        self._unload_unused_higgs(s)
         self._preload()
         self._voices_changed()
 
@@ -1192,13 +1363,24 @@ class AgentBridge:
     def _check_voice(self, s: SpeechConfig, voice: str | None, lang: str | None = None) -> None:
         from .mcp_server import ToolError
 
-        if lang is not None and lang not in SUPERTONIC_LANGUAGES:
+        if lang is not None and lang not in ALL_LANGUAGES:
             raise ToolError(f"Unknown language '{lang}'. Call list_voices to get the valid codes.")
         if not voice:
+            return
+        if is_higgs_voice(voice):
+            if not higgs_present(s):
+                raise ToolError(MISSING_HIGGS)
+            if voice not in higgs_voice_ids(s):
+                raise ToolError(f"Unknown voice '{voice}'. Call list_voices to get the valid ids.")
+            if lang is not None and lang not in HIGGS_LANGUAGES:
+                raise ToolError(f"Higgs does not read {LANGUAGE_NAMES.get(lang, lang)} ('{lang}').")
             return
         if is_supertonic_voice(voice):
             if not supertonic_present(s):
                 raise ToolError(MISSING_SUPERTONIC)
+            if lang is not None and lang not in SUPERTONIC_LANGUAGES:
+                raise ToolError(f"Supertonic does not read {LANGUAGE_NAMES.get(lang, lang)} "
+                                f"('{lang}'); use a higgs: voice for it.")
             return
         if not models_present(s):
             raise ToolError(MISSING_MODEL)
@@ -1206,9 +1388,10 @@ class AgentBridge:
             raise ToolError(f"Unknown voice '{voice}'. Call list_voices to get the valid ids.")
         own = kokoro_voice_lang(voice)
         if lang not in (None, own):
+            other = "a supertonic: voice" if lang in SUPERTONIC_LANGUAGES else "a higgs: voice"
             raise ToolError(f"The Kokoro voice '{voice}' reads "
-                            f"{SUPERTONIC_LANGUAGE_NAMES.get(own, own)} only; use a supertonic: "
-                            f"voice for language '{lang}'.")
+                            f"{LANGUAGE_NAMES.get(own, own)} only; use {other} "
+                            f"for language '{lang}'.")
 
     def list_voices(self) -> dict:
         from .tts import voice_label
@@ -1216,16 +1399,20 @@ class AgentBridge:
         s = self.app.cfg.speech
         voices = []
         for v in self.app._voices():
-            supertonic = is_supertonic_voice(v)
-            voices.append({"id": v, "label": voice_label(v),
-                           "engine": "supertonic" if supertonic else "kokoro",
-                           "languages": (list(SUPERTONIC_LANGUAGES) if supertonic
-                                         else [kokoro_voice_lang(v) or "en"])})
+            if is_higgs_voice(v):
+                engine, langs = "higgs", list(HIGGS_LANGUAGES)
+            elif is_supertonic_voice(v):
+                engine, langs = "supertonic", list(SUPERTONIC_LANGUAGES)
+            else:
+                engine, langs = "kokoro", [kokoro_voice_lang(v) or "en"]
+            voices.append({"id": v, "label": voice_label(v), "engine": engine,
+                           "languages": langs})
         return {"voices": voices,
-                "languages": [{"code": c, "name": n} for c, n in SUPERTONIC_LANGUAGE_NAMES.items()],
+                "languages": [{"code": c, "name": LANGUAGE_NAMES[c]} for c in ALL_LANGUAGES],
                 "language_voices": dict(s.language_voices),
                 "read_language": s.read_language,
-                "supertonic_installed": supertonic_present(s)}
+                "supertonic_installed": supertonic_present(s),
+                "higgs_installed": higgs_present(s)}
 
     def synthesize_batch(self, args: dict) -> dict:
         from .export import ExportRequest, format_for
@@ -1486,10 +1673,10 @@ def run_mcp_only(cfg: Config, port: int | None = None) -> int:
 # ---------------------------------------------------------------- one-shot CLI
 
 def say(cfg: Config, text: str, out: str | None = None, title: str = "",
-        markdown: bool | None = None) -> int:
+        markdown: bool | None = None, voice: str | None = None, lang: str | None = None) -> int:
     """Speak `text` (or write it to an audio file, WAV/MP3 by extension) without the tray,
-    routed like the hotkey (detected or fixed language, that language's voice); for testing and
-    scripts."""
+    routed like the hotkey (detected or fixed language, that language's voice) unless `voice`
+    and / or `lang` are given (--voice, --lang); for testing and scripts."""
     from . import textprep
     from .export import ExportRequest
     from .tts import SpeakRequest, Speaker
@@ -1497,9 +1684,16 @@ def say(cfg: Config, text: str, out: str | None = None, title: str = "",
     s = cfg.speech
     if markdown is None:
         markdown = cfg.selection.clean_markdown
-    route = route_for(s, text)
+    try:
+        route = route_request(s, text, voice, lang)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
     if not voice_ready(s, route.voice):
-        if is_supertonic_voice(route.voice):
+        if is_higgs_voice(route.voice):
+            print(f"error: Higgs files missing ({s.higgs_dir}); "
+                  "run: python -m vibetts.model_setup --higgs", file=sys.stderr)
+        elif is_supertonic_voice(route.voice):
             print(f"error: Supertonic files missing ({s.supertonic_dir}); "
                   "run: python -m vibetts.model_setup --supertonic", file=sys.stderr)
         else:
@@ -1511,8 +1705,9 @@ def say(cfg: Config, text: str, out: str | None = None, title: str = "",
         print("error: nothing to say", file=sys.stderr)
         return 1
     if note_fallback(route):
-        print(f"note: Supertonic is not installed; reading with {route.voice} instead "
-              "(python -m vibetts.model_setup --supertonic)", file=sys.stderr)
+        print(f"note: {'Higgs' if route.missing == 'higgs' else 'Supertonic'} is not installed; "
+              f"reading with {route.voice} instead (python -m vibetts.model_setup "
+              f"--{route.missing})", file=sys.stderr)
     t0 = time.perf_counter()
     engine = EngineHolder().get(s, announce=False, voice=route.voice)  # loads, warms it up
     print(f"model loaded in {time.perf_counter() - t0:.2f}s (voice {route.voice}, "
@@ -1574,6 +1769,12 @@ def main(argv: list[str] | None = None) -> int:
                         help="speak a document (.txt .md .html .docx .epub .pdf) and exit")
     parser.add_argument("--out", "--wav", dest="out", metavar="PATH",
                         help="with --say / --doc: write an audio file (.wav or .mp3) instead")
+    parser.add_argument("--voice", metavar="ID",
+                        help="with --say / --doc: the voice (af_heart, supertonic:F1, higgs:F1 ...); "
+                             "default: the configured voice of the text's language")
+    parser.add_argument("--lang", metavar="CODE",
+                        help="with --say / --doc: the language of the text (e.g. hr); "
+                             "default: detected")
     parser.add_argument("--open", metavar="PATH",
                         help="open a book (.epub .txt ...) in the reader; used by the Windows "
                              "Open with registration")
@@ -1593,6 +1794,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("use either --say or --doc")
     if args.out and args.say is None and args.doc is None:
         parser.error("--out needs --say TEXT or --doc PATH")
+    if (args.voice or args.lang) and args.say is None and args.doc is None:
+        parser.error("--voice and --lang need --say TEXT or --doc PATH")
     if args.version:
         print(f"vibetts {__version__}")
         return 0
@@ -1605,7 +1808,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.mcp_only:
             return run_mcp_only(load_config(), args.port)
         if args.say is not None:
-            return say(load_config(), args.say, args.out)
+            return say(load_config(), args.say, args.out, voice=args.voice, lang=args.lang)
         if args.doc is not None:
             from . import docload
 
@@ -1614,7 +1817,8 @@ def main(argv: list[str] | None = None) -> int:
             except docload.DocumentError as e:
                 print(f"error: {e}", file=sys.stderr)
                 return 1
-            return say(load_config(), doc.text, args.out, doc.title, doc.markdown)
+            return say(load_config(), doc.text, args.out, doc.title, doc.markdown,
+                       voice=args.voice, lang=args.lang)
         _set_dpi_aware()
         from .single_instance import SingleInstance
         inst = SingleInstance()

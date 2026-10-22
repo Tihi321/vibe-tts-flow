@@ -21,6 +21,7 @@ dependencies = [
     "pypdf>=4",
     "lameenc>=1.7",
     "soxr",
+    "tokenizers",
     "py3langid",
 ]
 

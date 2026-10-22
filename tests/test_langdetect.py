@@ -62,3 +62,37 @@ def test_failure_uses_fallback(monkeypatch):
 
     monkeypatch.setattr(ld, "_get_identifier", boom)
     assert detect_language(SAMPLES["de"], ["en", "de"], "en") == "en"
+
+
+HR_SAMPLES = [
+    SAMPLES["hr"],
+    "Stari svjetionik stajao je na rubu litice i više od stotinu godina promatrao sivo more.",
+    "Sastanak je u ponedjeljak u devet sati, a poslije njega idemo zajedno na ručak.",
+]
+
+
+def test_croatian_stays_croatian_with_bosnian_and_serbian_enabled():
+    # py3langid separates hr from bs/sr on these samples. Written Bosnian is close to Croatian,
+    # so a Bosnian text may well come out as hr: that is a limit of py3langid, not of the app
+    # (use Read > Always Bosnian for such text).
+    cands = ["en", "hr", "bs", "sr", "sl", "mk", "ca", "sq"]
+    for text in HR_SAMPLES:
+        assert detect_language(text, cands, "en") == "hr"
+
+
+def test_undetectable_candidates_are_ignored():
+    import vibetts.langdetect as ld
+
+    ld._get_identifier()
+    assert "umb" not in ld._known and "luo" not in ld._known  # the model has no such class
+    assert detect_language(SAMPLES["de"], ["umb", "luo", "de", "fr"], "en") == "de"
+    assert detect_language(SAMPLES["de"], ["umb", "luo"], "en") == "en"  # nothing detectable: fallback
+
+
+def test_detectable_languages_is_cached_and_excludes_unknown_codes():
+    from vibetts.langdetect import detectable_languages
+
+    known = detectable_languages()
+    assert detectable_languages() is known
+    assert {"en", "hr", "bs", "sr", "ca"} <= known
+    assert "umb" not in known and "luo" not in known

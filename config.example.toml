@@ -19,17 +19,24 @@ preload = true               # load the model at startup so the first read start
 read_language = "auto"
 supertonic_dir = "models/supertonic-3"  # Supertonic model files (downloaded from Settings)
 supertonic_steps = 8                 # 4 .. 16: fewer = faster, more = better quality
+higgs_dir = "models/higgs-audio-v3"  # Higgs Audio v3 model files (downloaded from Settings)
+higgs_voices_dir = "models/higgs-voices"  # your own Higgs voices (a clip + transcript per language)
+higgs_temperature = 0.8             # 0.3 .. 1.2: lower = steadier, higher = more varied
 
-# One voice per language (31 languages). A voice is a Kokoro id (Kokoro reads en es fr hi it pt:
+# One voice per language (101 languages). A voice is a Kokoro id (Kokoro reads en es fr hi it pt:
 # af_* am_* bf_* bm_* ef_* em_* ff_* hf_* hm_* if_* im_* pf_* pm_*), "supertonic:F1" .. "supertonic:M5"
-# (Supertonic 3 reads all 31; download it in Settings), or "" = Off (never detected or read).
-# Languages missing from this table use "supertonic:F1" (English: "af_heart").
+# (Supertonic 3 reads 31; download it in Settings), "higgs:F1" .. "higgs:M2" or "higgs:<your voice>"
+# (Higgs Audio v3 reads 100 languages, slower than real time on a CPU; personal non-commercial
+# use only; download it in Settings), or "" = Off (never detected or read).
+# Languages missing from this table use "supertonic:F1" (English: "af_heart"); languages only Higgs
+# reads (bs, sr, mk, sq, ca, ...) are Off.
 [speech.language_voices]
 en = "af_heart"
 hr = "supertonic:F1"
 # es = "ef_dora"             # Spanish with Kokoro instead
 # de = "supertonic:M1"
 # ru = ""                    # Off
+# sr = "higgs:F1"            # Serbian, only Higgs reads it
 
 [selection]
 copy_timeout_ms = 400        # how long to wait for the app to answer the copy shortcut

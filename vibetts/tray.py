@@ -9,11 +9,16 @@ import pystray
 from PIL import Image, ImageDraw
 
 from .config import (
+    HIGGS_PRESETS,
+    LANGUAGE_NAMES,
     READ_AUTO,
-    SUPERTONIC_LANGUAGE_NAMES,
+    SUPERTONIC_LANGUAGES,
     SUPERTONIC_PREFIX,
+    higgs_voice_name,
+    is_higgs_voice,
     is_supertonic_voice,
     kokoro_voice_lang,
+    voice_fits_language,
 )
 
 log = logging.getLogger(__name__)
@@ -45,13 +50,14 @@ class TrayHooks:
     quit: Callable[[], None]
     open_export: Callable[[], None] = lambda: None         # Settings > Export
     # per-language voices: languages() lists the enabled language codes (English first),
-    # voices() the Kokoro ids, then the Supertonic ids when installed
+    # voices() the Kokoro ids, then the Supertonic and Higgs ids when installed
     languages: Callable[[], list[str]] = lambda: ["en"]
     current_voice: Callable[[str], str] = lambda lang: ""         # voice id of a language
     set_voice: Callable[[str, str], None] = lambda lang, voice: None  # voice "" = Off
     read_language: Callable[[], str] = lambda: "auto"             # auto | a language code
     set_read_language: Callable[[str], None] = lambda code: None
     supertonic_available: Callable[[], bool] = lambda: False
+    higgs_available: Callable[[], bool] = lambda: False
     # book reader (VTF-07): the menu item shows only while the reader server runs
     reader_running: Callable[[], bool] = lambda: False
     open_reader: Callable[[], None] = lambda: None
@@ -107,6 +113,13 @@ class Tray:
         name = v[len(SUPERTONIC_PREFIX):]
         return f"{name} ({'female' if name[:1] == 'F' else 'male'})"
 
+    @staticmethod
+    def _higgs_text(v: str) -> str:
+        name = higgs_voice_name(v)
+        if name not in HIGGS_PRESETS:
+            return f"{name} (custom)"
+        return f"{name} ({'female' if name[:1] == 'F' else 'male'})"
+
     def _languages(self) -> list[str]:
         try:
             return list(self.hooks.languages())
@@ -115,7 +128,8 @@ class Tray:
             return []
 
     def _language_voice_menu(self, lang: str, voices: list[str]) -> pystray.Menu:
-        """Voices of one language: Off, its Kokoro voices, then the Supertonic voices."""
+        """Voices of one language: Off, its Kokoro voices, then the Supertonic and Higgs voices
+        that read it (languages only Higgs reads: Off and the Higgs voices)."""
         h = self.hooks
         M = pystray.MenuItem
 
@@ -125,15 +139,18 @@ class Tray:
 
         items = [item("", "Off")]
         for v in voices:
-            if is_supertonic_voice(v) or kokoro_voice_lang(v) != lang:
+            if is_supertonic_voice(v) or is_higgs_voice(v) or kokoro_voice_lang(v) != lang:
                 continue
             gender = {"f": "female", "m": "male"}.get(v[1:2], "")
             items.append(item(v, f"{v[3:].title()} ({gender})" if gender else v))
-        items += [item(v, self._supertonic_text(v)) for v in voices if is_supertonic_voice(v)]
+        if lang in SUPERTONIC_LANGUAGES:
+            items += [item(v, self._supertonic_text(v)) for v in voices if is_supertonic_voice(v)]
+        items += [item(v, self._higgs_text(v)) for v in voices
+                  if is_higgs_voice(v) and voice_fits_language(v, lang)]
         return pystray.Menu(*items)
 
     def _voice_menu(self) -> pystray.Menu | None:
-        """One submenu per enabled language (Off, Kokoro voices of that language, Supertonic)."""
+        """One submenu per enabled language (Off, Kokoro voices of that language, Supertonic, Higgs)."""
         try:
             voices = list(self.hooks.voices())
         except Exception:
@@ -144,7 +161,7 @@ class Tray:
             return None
         M = pystray.MenuItem
         return pystray.Menu(*[
-            M(SUPERTONIC_LANGUAGE_NAMES.get(lang, lang), self._language_voice_menu(lang, voices))
+            M(LANGUAGE_NAMES.get(lang, lang), self._language_voice_menu(lang, voices))
             for lang in langs])
 
     def _language_menu(self) -> pystray.Menu:
@@ -152,7 +169,7 @@ class Tray:
         h = self.hooks
         M = pystray.MenuItem
         modes = [(READ_AUTO, "Auto (detect language)")]
-        modes += [(c, f"Always {SUPERTONIC_LANGUAGE_NAMES.get(c, c)}") for c in self._languages()]
+        modes += [(c, f"Always {LANGUAGE_NAMES.get(c, c)}") for c in self._languages()]
         return pystray.Menu(*[
             M(label, self._action(h.set_read_language, code), radio=True,
               checked=self._checked(lambda code=code: h.read_language() == code))

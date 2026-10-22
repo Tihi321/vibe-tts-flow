@@ -173,6 +173,14 @@ def test_supertonic_voice_ids_and_labels():
     assert sorted(VOICE_LANGS) == sorted(LANG_LABELS) == ["a", "b", "e", "f", "h", "i", "p"]
 
 
+def test_higgs_voice_support_and_labels():
+    assert voice_supported("higgs:F1") and voice_supported("higgs:Anna_2")
+    assert not voice_supported("higgs:") and not voice_supported("higgs:a b")
+    assert voice_label("higgs:F1") == "F1 (Higgs, female)"
+    assert voice_label("higgs:M1") == "M1 (Higgs, male)"
+    assert voice_label("higgs:Anna") == "Anna (Higgs, custom)"
+
+
 def test_unsupported_voice_ids():
     assert not voice_supported("ox_foo") and not voice_supported("omni:default")
     assert voice_label("omni:default") == "omni:default"  # unknown ids are shown as is
@@ -432,3 +440,57 @@ def test_pause_before_the_first_audio_holds_until_resume():
     assert sp.resume()
     assert r.done.wait(5) and not r.interrupted
     assert sum(len(b) for b in FakeOutput.instances[0].frames) == int(0.05 * SAMPLE_RATE)
+
+
+class SlowCancellableEngine:
+    """Like Higgs: one lock, a chunk takes seconds, `cancel` is honoured every 10 ms."""
+    accepts_cancel = True
+
+    def __init__(self):
+        import threading
+
+        self.lock = threading.Lock()
+        self.entered = threading.Event()
+        self.cancelled = 0
+
+    def voices(self):
+        return ["af_heart"]
+
+    def synth(self, text, voice, speed, lang=None, cancel=None):
+        from vibetts.tts import SynthCancelled
+
+        with self.lock:
+            self.entered.set()
+            end = time.monotonic() + (8.0 if text == "slow" else 0.0)
+            while time.monotonic() < end:
+                if cancel is not None and cancel.is_set():
+                    self.cancelled += 1
+                    raise SynthCancelled()
+                time.sleep(0.01)
+            return np.full(int(0.05 * SAMPLE_RATE), 0.5, dtype=np.float32)
+
+
+def test_stop_cancels_a_running_synth_so_the_next_read_starts_promptly():
+    engine, events = SlowCancellableEngine(), []
+    sp = make(engine, events)
+    sp.speak(req(["slow"]))
+    assert engine.entered.wait(2)
+    t0 = time.monotonic()
+    sp.stop()
+    sp.speak(req(["fast"]))
+    for _ in range(200):
+        if any(e[0] == "start" for e in events):
+            break
+        time.sleep(0.01)
+    assert any(e[0] == "start" for e in events)
+    assert time.monotonic() - t0 < 3.0  # not the 8 s the slow chunk would have taken
+    assert engine.cancelled == 1
+    # the cancelled request ended without an error
+    done = [e for e in events if e[0] == "done"]
+    assert all(e[2] is None for e in done)
+
+
+def test_engines_without_accepts_cancel_are_called_as_before():
+    engine, events = FakeEngine(), []  # synth() takes no cancel argument
+    make(engine, events).speak_and_wait(req(["a"]), timeout=5)
+    assert engine.calls and events[-1][2] is None

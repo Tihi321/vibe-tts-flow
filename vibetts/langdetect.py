@@ -12,21 +12,33 @@ log = logging.getLogger(__name__)
 SHORT_LETTERS = 15  # unspaced scripts (Japanese ...) have few 'words' but plenty of letters
 _lock = threading.Lock()
 _identifier: Any = None
+_known: frozenset[str] = frozenset()  # codes py3langid knows (its model classes), set on load
 
 
 def _get_identifier() -> Any:
     """The shared LanguageIdentifier, loaded on first use (the import and model load are slow)."""
-    global _identifier
+    global _identifier, _known
     if _identifier is None:
         from py3langid.langid import MODEL_FILE, LanguageIdentifier
 
-        _identifier = LanguageIdentifier.from_model_file(MODEL_FILE, norm_probs=True)
+        ident = LanguageIdentifier.from_model_file(MODEL_FILE, norm_probs=True)
+        _known = frozenset(ident._full_model[2])
+        _identifier = ident
     return _identifier
+
+
+def detectable_languages() -> frozenset[str]:
+    """The language codes py3langid knows (its model classes); loads the model on first use.
+    Other languages (ceb, kab, ...) are never detected: they need Read "Always X" or `lang`."""
+    with _lock:
+        _get_identifier()
+        return _known
 
 
 def detect_language(text: str, candidates: Sequence[str], fallback: str) -> str:
     """The language of `text` among `candidates` (language codes), decided once for the whole
-    text. `fallback` when there is no candidate, the text is too short to judge (fewer than
+    text. Candidates py3langid does not know are ignored: those languages are reached only by
+    Read "Always X" or an explicit `lang`. `fallback` when there is no candidate, the text is too short to judge (fewer than
     EN_SHORT_WORDS words and SHORT_LETTERS letters; "en" if it is a candidate) or detection fails."""
     cands = list(dict.fromkeys(candidates))
     if not cands:
@@ -38,8 +50,7 @@ def detect_language(text: str, candidates: Sequence[str], fallback: str) -> str:
     try:
         with _lock:
             ident = _get_identifier()
-            known = set(ident._full_model[2])
-            use = [c for c in cands if c in known]
+            use = [c for c in cands if c in _known]  # the rest (ceb, kab, ...) are never detected
             if not use:
                 return fallback
             ident.set_languages(use)

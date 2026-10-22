@@ -6,7 +6,8 @@ import pytest
 
 from vibetts import settings_ui
 from vibetts import model_setup
-from vibetts.config import (MP3_BITRATES, SUPERTONIC_LANGUAGE_NAMES, SUPERTONIC_LANGUAGES,
+from vibetts.config import (ALL_LANGUAGES, HIGGS_LANGUAGES, HIGGS_PRESETS, LANGUAGE_NAMES,
+                            MP3_BITRATES, SUPERTONIC_LANGUAGE_NAMES, SUPERTONIC_LANGUAGES,
                             SUPERTONIC_VOICES, Config)
 from vibetts.docload import Document, DocumentError
 from vibetts.export import (ExportBusy, ExportCancelled, ExportProgress, ExportRequest,
@@ -108,7 +109,7 @@ def test_invalid_voice_for_language():
 
 def test_all_languages_off_and_read_must_be_on():
     form = form_from_config(Config())
-    form["language_voices"] = {c: "" for c in SUPERTONIC_LANGUAGES}
+    form["language_voices"] = {c: "" for c in ALL_LANGUAGES}
     with pytest.raises(ValueError, match="at least one language"):
         config_from_form(Config(), form)
     form = _form_with(de="")
@@ -131,7 +132,9 @@ def test_read_and_language_labels():
     assert settings_ui.language_from_label("Nope") == ""
     assert list(settings_ui.LANGUAGE_CODES.values())[0] == "en"
     names = list(settings_ui.LANGUAGE_CODES)
-    assert names[1:] == sorted(names[1:]) and len(names) == 31
+    assert names[1:] == sorted(names[1:]) and len(names) == len(ALL_LANGUAGES)
+    assert settings_ui.language_label("bs", "") == "Bosnian (off)"
+    assert settings_ui.read_label("bs") == "Always Bosnian"
 
 
 def test_invalid_messages_are_readable():
@@ -160,6 +163,11 @@ class Recorder:
         self.st_present = False
         self.st_changed = 0
         self.voice_list = ["af_heart", "bf_emma"]
+        self.hg_dir = Path("hg-models")
+        self.hg_voices = Path("hg-voices")
+        self.hg_present = False
+        self.hg_changed = 0
+        self.tests: list[tuple] = []
 
     def hooks(self):
         def apply(cfg):
@@ -187,7 +195,9 @@ class Recorder:
             open_default_apps=lambda: self.calls.append("default_apps"),
             open_folder=lambda p: self.calls.append(("open_folder", p)),
             supertonic_dir=lambda: self.st_dir, supertonic_present=lambda: self.st_present,
-            supertonic_changed=self._st_changed)
+            supertonic_changed=self._st_changed,
+            higgs_dir=lambda: self.hg_dir, higgs_present=lambda: self.hg_present,
+            higgs_changed=self._hg_changed, higgs_voices_dir=lambda: self.hg_voices)
 
     def _register_files(self, exts):
         self.calls.append(("register", list(exts)))
@@ -201,6 +211,9 @@ class Recorder:
 
     def _st_changed(self):
         self.st_changed += 1
+
+    def _hg_changed(self):
+        self.hg_changed += 1
 
     def _load_document(self, path):
         self.calls.append(("load", path))
@@ -253,10 +266,12 @@ def state(widget):
 
 
 def test_tabs(tk_root):
-    assert TABS == ("general", "voice", "export", "kokoro", "supertonic", "mcp", "reader", "about")
+    assert TABS == ("general", "voice", "export", "kokoro", "supertonic", "higgs", "mcp", "reader",
+                    "about")
     win = make_window(tk_root, Recorder())
     assert [win._nb.tab(i, "text") for i in range(len(TABS))] == [
-        "General", "Voice", "Export", "Kokoro", "Supertonic", "Agents (MCP)", "Reader", "About"]
+        "General", "Voice", "Export", "Kokoro", "Supertonic", "Higgs", "Agents (MCP)", "Reader",
+        "About"]
 
 
 def pick_language(win, name):
@@ -266,7 +281,10 @@ def pick_language(win, name):
 def test_voices_section_defaults(tk_root):
     win = make_window(tk_root, Recorder())
     langs = list(win._lang_combo.cget("values"))
-    assert len(langs) == 31 and langs[0] == "English" and langs[1:] == sorted(langs[1:])
+    assert len(langs) == len(ALL_LANGUAGES) and langs[0] == "English"
+    assert [x.removesuffix(" (off)") for x in langs[1:]] == sorted(
+        x.removesuffix(" (off)") for x in langs[1:])
+    assert "Bosnian (off)" in langs and "Croatian" in langs
     assert win._sel_lang.get() == "English" and win._sel_engine.get() == "Kokoro"
     assert [v.split(" ")[0] for v in win._voice_combo.cget("values")] == ["af_heart", "bf_emma"]
     assert win._sel_voice.get().startswith("af_heart  Heart")
@@ -279,14 +297,14 @@ def test_engine_choices_depend_on_language(tk_root):
     rec = Recorder()
     rec.voice_list = ["af_heart", "supertonic:F1", "bf_emma", "ef_dora", "em_alex", "ff_siwis"]
     win = make_window(tk_root, rec)
-    assert list(win._engine_combo.cget("values")) == ["Supertonic", "Kokoro", "Off"]
+    assert list(win._engine_combo.cget("values")) == ["Supertonic", "Kokoro", "Higgs", "Off"]
     pick_language(win, "Croatian")  # Kokoro does not read Croatian
-    assert list(win._engine_combo.cget("values")) == ["Supertonic", "Off"]
+    assert list(win._engine_combo.cget("values")) == ["Supertonic", "Higgs", "Off"]
     assert win._sel_engine.get() == "Supertonic"
     assert list(win._voice_combo.cget("values"))[0].startswith("supertonic:F1")
     assert len(win._voice_combo.cget("values")) == len(SUPERTONIC_VOICES)
     pick_language(win, "Spanish")
-    assert list(win._engine_combo.cget("values")) == ["Supertonic", "Kokoro", "Off"]
+    assert list(win._engine_combo.cget("values")) == ["Supertonic", "Kokoro", "Higgs", "Off"]
     win._sel_engine.set("Kokoro")
     assert win._lang_voices["es"] == "ef_dora"
     # only Spanish Kokoro voices, from the loaded list
@@ -426,7 +444,7 @@ def test_supertonic_hint_follows_presence(tk_root):
     assert win._supertonic_hint.cget("text") == ""
     # nothing enabled uses Supertonic: no hint even when it is missing
     rec.st_present = False
-    rec.config.speech.language_voices = {c: "" for c in SUPERTONIC_LANGUAGES}
+    rec.config.speech.language_voices = {c: "" for c in ALL_LANGUAGES}
     rec.config.speech.language_voices["en"] = "af_heart"
     win.refresh()
     assert win._supertonic_hint.cget("text") == ""
@@ -486,7 +504,7 @@ def test_play_previews_the_selected_language(tk_root):
 
 def test_window_fits_a_1080p_screen(tk_root):
     win = make_window(tk_root, Recorder())
-    for tab in ("voice", "export", "supertonic"):
+    for tab in ("voice", "export", "supertonic", "higgs"):
         win._nb.select(TABS.index(tab))
         win.top.update_idletasks()
         assert win.top.winfo_reqheight() <= 1080 - 90
@@ -741,16 +759,16 @@ def test_export_voice_choice_and_missing_extension(tk_root, monkeypatch, tmp_pat
 def test_export_language_combo_and_mapping(tk_root, monkeypatch, tmp_path):
     rec, win = export_win(tk_root, monkeypatch, save_to=tmp_path / "a.wav")
     values = list(win._export_lang_combo.cget("values"))
-    assert values[:2] == ["Auto", "English"] and len(values) == 32
+    assert values[:2] == ["Auto", "English"] and len(values) == len(ALL_LANGUAGES) + 1
     assert values[2:] == sorted(values[2:])
     assert win._export_lang.get() == "Auto"
     win._export_set_text("Hi")
     for label, lang in (("Auto", None), ("English", "en"), ("Croatian", "hr"),
-                        ("Korean", "ko")):
+                        ("Korean", "ko"), ("Bosnian", "bs")):
         win._export_lang.set(label)
         win._export_start()
         assert rec.exports[-1].lang == lang
-    assert {win._export_lang_codes[v] for v in values[2:]} == set(SUPERTONIC_LANGUAGES) - {"en"}
+    assert {win._export_lang_codes[v] for v in values[2:]} == set(ALL_LANGUAGES) - {"en"}
     assert not win._is_dirty()  # transient export control
 
 
@@ -1053,3 +1071,421 @@ def test_reader_fields_save_and_dirty(tk_root):
     assert win.save() is True
     assert rec.config.reader.port == 8124 and rec.config.reader.extension_ids == []
     assert not win._is_dirty()
+
+
+def test_export_voice_lists_higgs_voices(tk_root):
+    rec = Recorder()
+    rec.voice_list = ["af_heart", "higgs:F1", "higgs:mine"]
+    win = make_window(tk_root, rec)
+    ids = win._export_voice_ids
+    assert [v for v in ids.values() if v] == ["af_heart", "higgs:F1", "higgs:mine"]
+    assert any("higgs:mine" in label for label in ids)
+
+
+# ---------------------------------------------------------------- voice tab: Higgs
+
+def test_engine_choices_per_language():
+    assert settings_ui.engine_choices("hr") == ["Supertonic", "Higgs", "Off"]
+    assert settings_ui.engine_choices("es") == ["Supertonic", "Kokoro", "Higgs", "Off"]
+    assert settings_ui.engine_choices("bs") == ["Higgs", "Off"]
+    assert settings_ui.engine_choices("ja") == ["Supertonic", "Off"]
+    assert settings_ui.engine_choices("en") == ["Supertonic", "Kokoro", "Higgs", "Off"]
+    assert settings_ui.engine_of("higgs:F1") == "Higgs"
+    assert settings_ui.engine_of("supertonic:F1") == "Supertonic"
+
+
+def test_higgs_only_language_engine_combo_and_voices(tk_root):
+    rec = Recorder()
+    rec.voice_list = ["af_heart", "higgs:F1", "higgs:F2", "higgs:mine"]
+    win = make_window(tk_root, rec)
+    pick_language(win, "Bosnian (off)")
+    assert list(win._engine_combo.cget("values")) == ["Higgs", "Off"]
+    assert win._sel_engine.get() == "Off" and state(win._voice_combo) == "disabled"
+    win._sel_engine.set("Higgs")
+    assert win._lang_voices["bs"] == "higgs:F1"
+    assert [v.split(" ")[0] for v in win._voice_combo.cget("values")] == [
+        "higgs:F1", "higgs:F2", "higgs:mine"]
+    win._sel_voice.set("higgs:mine  mine (Higgs, custom)")
+    assert win._lang_voices["bs"] == "higgs:mine"
+    assert win._sel_lang.get() == "Bosnian"
+    assert win.save() is True
+    assert rec.config.speech.language_voices["bs"] == "higgs:mine"
+    # Higgs -> Off -> Higgs keeps the voice of the row
+    win._sel_engine.set("Off")
+    assert win._lang_voices["bs"] == ""
+    win._sel_engine.set("Higgs")
+    assert win._lang_voices["bs"] == "higgs:mine"
+
+
+def test_higgs_engine_for_a_supertonic_language_and_japanese(tk_root):
+    rec = Recorder()
+    rec.voice_list = ["higgs:F1"]
+    win = make_window(tk_root, rec)
+    pick_language(win, "Croatian")
+    win._sel_engine.set("Higgs")
+    assert win._lang_voices["hr"] == "higgs:F1"
+    win._sel_engine.set("Supertonic")
+    assert win._lang_voices["hr"] == "supertonic:F1"
+    pick_language(win, "Japanese")
+    assert list(win._engine_combo.cget("values")) == ["Supertonic", "Off"]
+
+
+def test_higgs_voice_choices_fall_back_to_the_presets(tk_root):
+    rec = Recorder()
+    rec.voice_list = []  # Higgs not installed: hooks.voices() has no Higgs ids
+    win = make_window(tk_root, rec)
+    pick_language(win, "Serbian (off)")
+    win._sel_engine.set("Higgs")
+    assert [v.split(" ")[0] for v in win._voice_combo.cget("values")] == [
+        f"higgs:{n}" for n in HIGGS_PRESETS]
+
+
+def test_voice_hint_for_missing_higgs_and_undetectable_language(tk_root, monkeypatch):
+    monkeypatch.setattr(settings_ui, "_detectable", set(SUPERTONIC_LANGUAGES))
+    rec = Recorder()
+    win = make_window(tk_root, rec)
+    assert "Higgs" not in win._supertonic_hint.cget("text")
+    pick_language(win, "Bosnian (off)")
+    win._sel_engine.set("Higgs")
+    text = win._supertonic_hint.cget("text")
+    assert "Higgs tab" in text and "Supertonic tab" in text
+    assert "Automatic detection cannot recognise Bosnian" in text and "Always Bosnian" in text
+    rec.hg_present = True
+    rec.st_present = True
+    win.refresh()
+    text = win._supertonic_hint.cget("text")
+    assert "tab" not in text and "Always Bosnian" in text
+    monkeypatch.setattr(settings_ui, "_detectable", set(ALL_LANGUAGES))
+    win._sync_voice_rows()
+    assert win._supertonic_hint.cget("text") == ""
+
+
+def test_play_test_for_higgs_row(tk_root):
+    rec = Recorder()
+    calls = []
+    hooks = rec.hooks()
+    hooks.play_test = lambda cfg, text, lang: calls.append((cfg.speech.language_voices[lang], lang))
+    win = SettingsWindow(tk_root, hooks, lambda fn: fn(), lambda fn: fn())
+    try:
+        win.show("voice")
+    except tk.TclError:
+        pytest.skip("settings window cannot be built headless")
+    pick_language(win, "Bosnian (off)")
+    win._sel_engine.set("Higgs")
+    win._play_test()
+    assert calls == [("higgs:F1", "bs")]
+
+
+# ---------------------------------------------------------------- higgs tab
+
+def test_higgs_hooks_defaults():
+    hooks = Recorder().hooks()
+    h = SettingsHooks(get_config=hooks.get_config, apply=hooks.apply, is_autostart=lambda: False,
+                      set_autostart=lambda v: None, set_show_on_start=lambda v: None,
+                      models_dir=lambda: Path("."), voices=lambda: [], output_devices=lambda: [],
+                      play_test=lambda c, t, lang=None: None, stop=lambda: None,
+                      open_logs=lambda: None, open_config=lambda: None)
+    assert h.higgs_present() is False and h.higgs_changed() is None
+    assert h.higgs_dir().parts[-2:] == ("models", "higgs-audio-v3")
+    assert h.higgs_voices_dir().parts[-2:] == ("models", "higgs-voices")
+
+
+def test_higgs_temperature_form_round_trip():
+    cfg = Config()
+    form = form_from_config(cfg)
+    assert form["higgs_temperature"] == "0.8"
+    cfg.speech.higgs_temperature = 0.55
+    assert config_from_form(Config(), form_from_config(cfg)) == cfg
+    for bad in ("0.1", "2", "x", ""):
+        form["higgs_temperature"] = bad
+        with pytest.raises(ValueError, match="Higgs temperature"):
+            config_from_form(Config(), form)
+
+
+class FakeHiggs:
+    """Stands in for model_setup's Higgs functions and the vibetts.higgs voice functions."""
+
+    def __init__(self, monkeypatch, installed=False):
+        from vibetts import higgs
+        self.installed = installed
+        self.downloads, self.deletes = [], []
+        self.error = None
+        self.custom: dict[str, list[str]] = {}
+        self.added: list[tuple] = []
+        self.add_error = None
+        self.clip_error = None
+        self.progress = [(500_000_000, 3_850_000_000), (3_850_000_000, 3_850_000_000)]
+        monkeypatch.setattr(model_setup, "higgs_missing",
+                            lambda d: [] if self.installed else ["cpu_int4/llm_decoder.onnx"],
+                            raising=False)
+        monkeypatch.setattr(model_setup, "download_higgs", self.download, raising=False)
+        monkeypatch.setattr(model_setup, "delete_higgs", self.delete, raising=False)
+        monkeypatch.setattr(higgs, "DOWNLOAD_BYTES", 3_849_529_018, raising=False)
+        monkeypatch.setattr(higgs, "custom_voices", lambda d: sorted(self.custom), raising=False)
+        monkeypatch.setattr(higgs, "voice_languages",
+                            lambda v, d: self.custom.get(v.split(":", 1)[1], ["en", "hr"]),
+                            raising=False)
+        monkeypatch.setattr(higgs, "validate_clip", self.validate, raising=False)
+        monkeypatch.setattr(higgs, "add_custom_voice", self.add, raising=False)
+        monkeypatch.setattr(higgs, "delete_custom_voice", self.delete_voice, raising=False)
+
+    def download(self, dest, progress=None, cancel=None):
+        self.downloads.append(dest)
+        for done, total in self.progress:
+            if progress:
+                progress(done, total)
+        if self.error:
+            raise self.error
+        self.installed = True
+
+    def delete(self, dest):
+        self.deletes.append(dest)
+        self.installed = False
+
+    def validate(self, path):
+        if self.clip_error:
+            raise ValueError(self.clip_error)
+        return 8.0
+
+    def add(self, vdir, name, wav, transcript, lang):
+        if self.add_error:
+            raise self.add_error
+        self.added.append((vdir, name, wav, transcript, lang))
+        self.custom.setdefault(name, []).append(lang)
+
+    def delete_voice(self, vdir, name):
+        if name in HIGGS_PRESETS:
+            raise ValueError("presets cannot be deleted")
+        self.deletes.append(("voice", name))
+        self.custom.pop(name, None)
+
+
+def hg_win(tk_root, monkeypatch, installed=False, spawn=lambda fn: fn(), tmp_path=None):
+    fake = FakeHiggs(monkeypatch, installed)
+    rec = Recorder()
+    if tmp_path is not None:
+        rec.hg_dir = tmp_path / "model"
+        rec.hg_voices = tmp_path / "voices"
+    win = SettingsWindow(tk_root, rec.hooks(), lambda fn: fn(), spawn)
+    try:
+        win.show("higgs")
+    except tk.TclError:
+        pytest.skip("settings window cannot be built headless")
+    return fake, rec, win
+
+
+def test_higgs_tab_status_not_installed_and_installed(tk_root, monkeypatch, tmp_path):
+    fake, rec, win = hg_win(tk_root, monkeypatch, tmp_path=tmp_path)
+    assert win._nb.index(win._nb.select()) == TABS.index("higgs")
+    assert win._hg_status.cget("text") == "Not installed (3.85 GB download)"
+    assert state(win._hg_dl_btn) == "normal" and state(win._hg_del_btn) == "disabled"
+    for word in ("3.85 GB", "5 GB of RAM", "slower than real time", "Non-Commercial",
+                 "commercial use needs a licence from Boson AI"):
+        assert word in settings_ui.HIGGS_NOTE
+    rec.hg_dir.mkdir()
+    (rec.hg_dir / "a.bin").write_bytes(b"x" * 2_000_000)
+    fake.installed = True
+    win.refresh()
+    assert win._hg_status.cget("text") == "Installed (2 MB on disk)"
+    assert state(win._hg_dl_btn) == "disabled" and state(win._hg_del_btn) == "normal"
+
+
+def test_higgs_download_success(tk_root, monkeypatch, tmp_path):
+    fake, rec, win = hg_win(tk_root, monkeypatch, tmp_path=tmp_path)
+    labels = []
+    real = win._hg_progress_label.configure
+    win._hg_progress_label.configure = lambda **kw: (labels.append(kw.get("text")), real(**kw))
+    win._hg_dl_btn.invoke()
+    assert fake.downloads == [rec.hg_dir]
+    assert "Downloading Higgs: 500 / 3850 MB" in labels
+    assert rec.hg_changed == 1
+    assert not win._hg_busy and state(win._hg_cancel_btn) == "disabled"
+    assert win._hg_status.cget("text").startswith("Installed")
+
+
+def test_show_with_download_on_higgs_tab_fetches_higgs(tk_root, monkeypatch, tmp_path):
+    fake, rec, win = hg_win(tk_root, monkeypatch, tmp_path=tmp_path)
+    kokoro = []
+    monkeypatch.setattr(win, "_download_missing", lambda: kokoro.append(1))
+    win.show("higgs", download=True)
+    assert fake.downloads == [rec.hg_dir] and kokoro == []
+
+
+def test_higgs_download_cancelled_and_failed(tk_root, monkeypatch, tmp_path):
+    errors = []
+    monkeypatch.setattr(settings_ui.messagebox, "showerror", lambda *a, **k: errors.append(a))
+    fake, rec, win = hg_win(tk_root, monkeypatch, tmp_path=tmp_path)
+    fake.error = model_setup.DownloadCancelled()
+    win._hg_dl_btn.invoke()
+    assert rec.hg_changed == 0 and errors == [] and not win._hg_busy
+    assert win._status.cget("text") == "Download cancelled."
+    fake.error = OSError("Not enough free disk space")
+    win._hg_dl_btn.invoke()
+    assert rec.hg_changed == 0 and errors and "free disk space" in errors[0][1]
+    assert state(win._hg_dl_btn) == "normal"
+
+
+def test_higgs_cancel_button_sets_event(tk_root, monkeypatch, tmp_path):
+    pending = []
+    fake, rec, win = hg_win(tk_root, monkeypatch, spawn=pending.append, tmp_path=tmp_path)
+    win._hg_dl_btn.invoke()
+    assert win._hg_busy and state(win._hg_cancel_btn) == "normal"
+    assert state(win._hg_dl_btn) == "disabled" and state(win._hg_del_btn) == "disabled"
+    win._hg_dl_btn.invoke()  # ignored while busy
+    assert len(pending) == 1
+    win._hg_cancel_btn.invoke()
+    assert win._hg_cancel.is_set()
+    pending.pop()()
+    assert not win._hg_busy
+
+
+def test_higgs_delete_confirms(tk_root, monkeypatch, tmp_path):
+    fake, rec, win = hg_win(tk_root, monkeypatch, installed=True, tmp_path=tmp_path)
+    monkeypatch.setattr(settings_ui.messagebox, "askyesno", lambda *a, **k: False)
+    win._hg_del_btn.invoke()
+    assert fake.deletes == [] and rec.hg_changed == 0
+    monkeypatch.setattr(settings_ui.messagebox, "askyesno", lambda *a, **k: True)
+    win._hg_del_btn.invoke()
+    assert fake.deletes == [rec.hg_dir] and rec.hg_changed == 1 and "stop" in rec.calls
+    assert win._hg_status.cget("text").startswith("Not installed")
+
+
+def test_higgs_temperature_slider_and_entry(tk_root, monkeypatch, tmp_path):
+    fake, rec, win = hg_win(tk_root, monkeypatch, tmp_path=tmp_path)
+    assert win._vars["higgs_temperature"].get() == "0.8"
+    win._hg_scale.set(0.93)
+    assert win._vars["higgs_temperature"].get() == "0.95"
+    win._vars["higgs_temperature"].set("0.5")
+    assert abs(float(win._hg_scale.get()) - 0.5) < 1e-6
+    assert win._is_dirty()
+    assert win.save() is True and rec.config.speech.higgs_temperature == 0.5
+    monkeypatch.setattr(settings_ui.messagebox, "showerror", lambda *a, **k: None)
+    win._vars["higgs_temperature"].set("5")
+    assert win.save() is False
+
+
+def test_higgs_voice_list_marks_presets_and_custom(tk_root, monkeypatch, tmp_path):
+    fake, rec, win = hg_win(tk_root, monkeypatch, tmp_path=tmp_path)
+    fake.custom = {"mine": ["hr", "bs"]}
+    win.refresh()
+    rows = {iid: win._hg_tree.item(iid, "values") for iid in win._hg_tree.get_children()}
+    assert list(rows) == [*HIGGS_PRESETS, "mine"]
+    assert rows["F1"][1] == "preset" and rows["mine"][1] == "custom"
+    assert rows["mine"][2] == "Croatian, Bosnian"
+    win._hg_tree.selection_set("F1")
+    win._hg_select_changed()
+    assert state(win._hg_voice_del_btn) == "disabled"
+    win._hg_tree.selection_set("mine")
+    win._hg_select_changed()
+    assert state(win._hg_voice_del_btn) == "normal"
+
+
+@pytest.mark.parametrize("name,wav,transcript,clip_error,expected", [
+    ("", "a.wav", "hi", None, "Enter a name"),
+    ("bad name", "a.wav", "hi", None, "letters, digits"),
+    ("F1", "a.wav", "hi", None, "preset name"),
+    ("mine", "", "hi", None, "Choose a WAV"),
+    ("mine", "missing.wav", "hi", None, "File not found"),
+    ("mine", "a.wav", "hi", "The clip is only 1.0 s long (3 to 30 s)", "only 1.0 s"),
+    ("mine", "a.wav", "   ", None, "transcript"),
+])
+def test_higgs_add_voice_validation(tk_root, monkeypatch, tmp_path, name, wav, transcript,
+                                    clip_error, expected):
+    fake, rec, win = hg_win(tk_root, monkeypatch, tmp_path=tmp_path)
+    clip = tmp_path / "a.wav"
+    clip.write_bytes(b"RIFF")
+    fake.clip_error = clip_error
+    if wav == "a.wav":
+        wav = str(clip)
+    elif wav == "missing.wav":
+        wav = str(tmp_path / "missing.wav")
+    error = win._hg_add_submit(name, wav, "hr", transcript)
+    assert expected in error
+    assert fake.added == [] and rec.hg_changed == 0 and not win._hg_adding
+
+
+def test_higgs_add_voice_bad_language(tk_root, monkeypatch, tmp_path):
+    fake, rec, win = hg_win(tk_root, monkeypatch, tmp_path=tmp_path)
+    clip = tmp_path / "a.wav"
+    clip.write_bytes(b"RIFF")
+    assert "language" in win._hg_add_submit("mine", str(clip), "ja", "hi")
+    assert "language" in win._hg_add_submit("mine", str(clip), "", "hi")
+
+
+def test_higgs_add_voice_runs_on_the_worker(tk_root, monkeypatch, tmp_path):
+    pending = []
+    fake, rec, win = hg_win(tk_root, monkeypatch, spawn=pending.append, tmp_path=tmp_path)
+    clip = tmp_path / "a.wav"
+    clip.write_bytes(b"RIFF")
+    assert win._hg_add_submit(" mine ", str(clip), "hr", " Dobar dan. ") == ""
+    assert fake.added == [] and win._hg_adding and len(pending) == 1  # the UI thread returned
+    assert state(win._hg_add_btn) == "disabled"
+    assert "already" in win._hg_add_submit("other", str(clip), "hr", "x")
+    pending.pop()()
+    assert fake.added == [(rec.hg_voices, "mine", clip, "Dobar dan.", "hr")]
+    assert not win._hg_adding and rec.hg_changed == 1 and state(win._hg_add_btn) == "normal"
+    assert "mine" in win._hg_tree.get_children()
+    assert win._hg_voice_msg.cget("text") == "Added mine."
+
+
+def test_higgs_add_voice_worker_failure_is_reported(tk_root, monkeypatch, tmp_path):
+    fake, rec, win = hg_win(tk_root, monkeypatch, tmp_path=tmp_path)
+    clip = tmp_path / "a.wav"
+    clip.write_bytes(b"RIFF")
+    fake.add_error = ValueError("The clip has no speech")
+    assert win._hg_add_submit("mine", str(clip), "hr", "x") == ""
+    assert rec.hg_changed == 0 and not win._hg_adding
+    assert "no speech" in win._hg_voice_msg.cget("text")
+
+
+def test_higgs_add_dialog_fills_and_submits(tk_root, monkeypatch, tmp_path):
+    fake, rec, win = hg_win(tk_root, monkeypatch, tmp_path=tmp_path)
+    clip = tmp_path / "a.wav"
+    clip.write_bytes(b"RIFF")
+    win._hg_add_btn.invoke()
+    name_var, wav_var, lang_var, text, names = win._hg_form
+    assert "Croatian" in names and "Japanese" not in names and lang_var.get() == "English"
+    win._hg_dialog_ok.invoke()
+    assert "Enter a name" in win._hg_dialog_err.cget("text")
+    name_var.set("mine")
+    wav_var.set(str(clip))
+    lang_var.set("Croatian")
+    text.insert("1.0", "Dobar dan.")
+    win._hg_dialog_ok.invoke()
+    assert fake.added == [(rec.hg_voices, "mine", clip, "Dobar dan.", "hr")]
+    assert win._hg_dialog is None and rec.hg_changed == 1
+
+
+def test_higgs_voice_delete_confirms_and_refuses_presets(tk_root, monkeypatch, tmp_path):
+    fake, rec, win = hg_win(tk_root, monkeypatch, tmp_path=tmp_path)
+    fake.custom = {"mine": ["hr"]}
+    win.refresh()
+    win._hg_tree.selection_set("F1")
+    win._hg_voice_delete()
+    assert fake.deletes == [] and "Presets cannot be deleted" in win._hg_voice_msg.cget("text")
+    win._hg_tree.selection_set("mine")
+    monkeypatch.setattr(settings_ui.messagebox, "askyesno", lambda *a, **k: False)
+    win._hg_voice_delete()
+    assert fake.deletes == [] and rec.hg_changed == 0
+    monkeypatch.setattr(settings_ui.messagebox, "askyesno", lambda *a, **k: True)
+    win._hg_voice_delete()
+    assert fake.deletes == [("voice", "mine")] and rec.hg_changed == 1
+    assert "mine" not in win._hg_tree.get_children()
+
+
+def test_higgs_play_test_uses_the_voices_language(tk_root, monkeypatch, tmp_path):
+    fake, rec, win = hg_win(tk_root, monkeypatch, tmp_path=tmp_path)
+    fake.custom = {"mine": ["hr", "bs"]}
+    calls = []
+    win.hooks.play_test = lambda cfg, text, lang: calls.append(
+        (cfg.speech.language_voices[lang], text, lang))
+    win.refresh()
+    win._hg_play_test()
+    assert calls == [] and "Select a voice" in win._hg_voice_msg.cget("text")
+    win._hg_tree.selection_set("mine")
+    win._hg_play_test()
+    assert calls == [("higgs:mine", settings_ui.HIGGS_TEST_TEXT, "hr")]
+    win._hg_tree.selection_set("F2")  # has English
+    win._hg_play_test()
+    assert calls[-1][0] == "higgs:F2" and calls[-1][2] == "en"
+    assert rec.config.speech.language_voices["hr"] != "higgs:mine"  # a copy, not the live config
