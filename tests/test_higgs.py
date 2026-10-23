@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import struct
 import sys
 import types
 import wave
@@ -214,6 +215,41 @@ def write_wav(path, seconds=4.0, rate=24000, channels=1, width=2):
         wf.setsampwidth(width)
         wf.setframerate(rate)
         wf.writeframes(data.astype("<i2").tobytes() if width == 2 else bytes(n * channels))
+
+
+def write_raw_wav(path, tag, bits, payload, rate=48000, channels=1, extensible=False):
+    """A WAV the stdlib `wave` module cannot write (float, 24-bit, extensible, ADPCM)."""
+    block = channels * ((bits + 7) // 8)
+    fmt = struct.pack("<HHIIHH", 0xFFFE if extensible else tag, channels, rate, rate * block,
+                      block, bits)
+    if extensible:
+        fmt += struct.pack("<HHI", 22, bits, 0) + struct.pack("<H", tag) + bytes(14)
+    body = b"WAVE" + b"fmt " + struct.pack("<I", len(fmt)) + fmt \
+        + b"fact" + struct.pack("<II", 4, 0) + b"data" + struct.pack("<I", len(payload)) + payload
+    path.write_bytes(b"RIFF" + struct.pack("<I", len(body)) + body)
+
+
+def test_read_wav_float_24bit_and_extensible(tmp_path):
+    rate, n = 48000, 48000 * 4
+    tone = (np.sin(2 * np.pi * 220 * np.arange(n) / rate) * 0.5).astype("<f4")
+    stereo = tmp_path / "float.wav"
+    write_raw_wav(stereo, 3, 32, np.repeat(tone[:, None], 2, axis=1).tobytes(), channels=2)
+    samples, got_rate = higgs._read_wav(stereo)
+    assert got_rate == rate and len(samples) == n
+    assert np.allclose(samples, tone, atol=1e-6)
+    assert higgs.validate_clip(stereo) == pytest.approx(4.0)
+
+    ints = np.round(tone.astype(np.float64) * 2**23).astype("<i4")
+    packed = np.frombuffer(ints.tobytes(), dtype=np.uint8).reshape(-1, 4)[:, :3].tobytes()
+    s24 = tmp_path / "s24.wav"
+    write_raw_wav(s24, 1, 24, packed, extensible=True)
+    samples, _ = higgs._read_wav(s24)
+    assert np.allclose(samples, tone, atol=1e-6)
+
+    eight = tmp_path / "eight.wav"
+    write_raw_wav(eight, 1, 8, bytes([128, 255, 0]) * 8000, rate=8000)
+    samples, _ = higgs._read_wav(eight)
+    assert samples[:3].tolist() == [0.0, 127 / 128, -1.0]
 
 
 @pytest.fixture(autouse=True)
@@ -559,14 +595,10 @@ def test_validate_clip_errors(tmp_path):
     edge = tmp_path / "edge.wav"
     write_wav(edge, 3.0, rate=8000)
     assert higgs.validate_clip(edge) == pytest.approx(3.0)
-    eight = tmp_path / "eight.wav"
-    with wave.open(str(eight), "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(1)
-        wf.setframerate(8000)
-        wf.writeframes(bytes(8000 * 5))
-    with pytest.raises(ValueError, match="16-bit"):
-        higgs.validate_clip(eight)
+    adpcm = tmp_path / "adpcm.wav"
+    write_raw_wav(adpcm, 2, 4, bytes(8000 * 5), rate=8000)
+    with pytest.raises(ValueError, match="Unsupported WAV encoding"):
+        higgs.validate_clip(adpcm)
     junk = tmp_path / "junk.wav"
     junk.write_bytes(b"this is not a wav file at all")
     with pytest.raises(ValueError, match="WAV"):

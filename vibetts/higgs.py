@@ -4,7 +4,7 @@ The inference path is a port of `inference.py` from the community ONNX conversio
 https://huggingface.co/onnx-community/higgs-audio-v3-tts-4b (the `cpu_int4/` graphs of Boson AI's
 Higgs Audio v3 TTS 4B): the Qwen3 decoder loop with its KV cache, the 8-codebook delay-pattern
 sampler and the neural codec. Only numpy, onnxruntime and `tokenizers` are needed (the original
-also pulls in transformers and librosa); WAV clips are read with the stdlib `wave` module and
+also pulls in transformers and librosa); WAV clips (integer PCM or float) are parsed by hand and
 resampled with soxr.
 
 LICENSE: the weights are under the Boson Higgs Audio v3 Research and Non-Commercial License.
@@ -28,7 +28,6 @@ import re
 import shutil
 import threading
 import time
-import wave
 from pathlib import Path
 from typing import Any
 
@@ -256,25 +255,58 @@ def voice_languages(voice: str, voices_dir: Path) -> list[str]:
     return _clip_languages(_voice_dir(name, voices_dir), preset=name in HIGGS_PRESETS)
 
 
+_WAV_PCM, _WAV_FLOAT, _WAV_EXTENSIBLE = 1, 3, 0xFFFE
+
+
 def _read_wav(path: Path) -> tuple[np.ndarray, int]:
-    """16-bit PCM WAV -> (mono float32, sample rate). ValueError with a user-facing message."""
+    """PCM (8/16/24/32-bit) or float (32/64-bit) WAV -> (mono float32, sample rate).
+    ValueError with a user-facing message. The RIFF chunks are parsed by hand because the stdlib
+    `wave` module reads integer PCM only, and recorders often save 32-bit float."""
     try:
-        with wave.open(str(path), "rb") as wf:
-            channels, width, rate, frames = (wf.getnchannels(), wf.getsampwidth(),
-                                             wf.getframerate(), wf.getnframes())
-            if wf.getcomptype() != "NONE" or width != 2:
-                raise ValueError("Only 16-bit PCM WAV files are supported "
-                                 "(re-save the clip as 16-bit WAV).")
-            raw = wf.readframes(frames)
-    except (wave.Error, EOFError) as e:
-        raise ValueError(f"Not a readable WAV file: {e}") from e
+        blob = Path(path).read_bytes()
     except OSError as e:
         raise ValueError(f"Could not read {path}: {e}") from e
+    if len(blob) < 12 or blob[:4] != b"RIFF" or blob[8:12] != b"WAVE":
+        raise ValueError("Not a readable WAV file: no RIFF/WAVE header.")
+    fmt = raw = None
+    pos = 12
+    while pos + 8 <= len(blob):
+        cid, size = blob[pos:pos + 4], int.from_bytes(blob[pos + 4:pos + 8], "little")
+        body = blob[pos + 8:pos + 8 + size]
+        if cid == b"fmt ":
+            fmt = body
+        elif cid == b"data":
+            raw = body   # a truncated last chunk keeps what is there
+            break
+        pos += 8 + size + (size & 1)
+    if fmt is None or len(fmt) < 16 or raw is None:
+        raise ValueError("Not a readable WAV file: missing fmt or data chunk.")
+    tag, channels, rate = (int.from_bytes(fmt[0:2], "little"), int.from_bytes(fmt[2:4], "little"),
+                           int.from_bytes(fmt[4:8], "little"))
+    bits = int.from_bytes(fmt[14:16], "little")
+    if tag == _WAV_EXTENSIBLE and len(fmt) >= 26:
+        tag = int.from_bytes(fmt[24:26], "little")   # first two bytes of the sub-format GUID
     if rate <= 0 or channels <= 0:
         raise ValueError("Not a readable WAV file.")
-    data = np.frombuffer(raw[:len(raw) - len(raw) % (2 * channels)], dtype="<i2")
-    data = data.reshape(-1, channels).astype(np.float32) / 32768.0
-    return data.mean(axis=1), rate
+    dtypes = {(_WAV_PCM, 8): "u1", (_WAV_PCM, 16): "<i2", (_WAV_PCM, 32): "<i4",
+              (_WAV_FLOAT, 32): "<f4", (_WAV_FLOAT, 64): "<f8"}
+    width = (bits + 7) // 8
+    raw = raw[:len(raw) - len(raw) % (width * channels)] if width else b""
+    if (tag, bits) == (_WAV_PCM, 24):
+        b = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 3).astype(np.int32)
+        data = ((b[:, 0] | (b[:, 1] << 8) | (b[:, 2] << 16)) << 8 >> 8).astype(np.float32) / 2**23
+    elif (tag, bits) in dtypes:
+        data = np.frombuffer(raw, dtype=dtypes[(tag, bits)])
+        if tag == _WAV_FLOAT:
+            data = np.nan_to_num(data.astype(np.float32))
+        elif bits == 8:
+            data = (data.astype(np.float32) - 128.0) / 128.0
+        else:
+            data = data.astype(np.float32) / float(2 ** (bits - 1))
+    else:
+        raise ValueError("Unsupported WAV encoding: use PCM (8, 16, 24 or 32-bit) or "
+                         "32-bit float (re-save the clip as 16-bit WAV).")
+    return data.reshape(-1, channels).mean(axis=1), rate
 
 
 def validate_clip(wav_path: Path) -> float:
