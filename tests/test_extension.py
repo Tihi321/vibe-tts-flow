@@ -70,3 +70,32 @@ def test_js_syntax(script):
     else:
         result = subprocess.run(args, capture_output=True)
     assert result.returncode == 0, result.stderr.decode(errors="replace")
+
+
+# ---- jump to a selection made while reading
+
+def test_background_seek_to_checks_owner_tab():
+    src = (EXT / "background.js").read_text(encoding="utf-8")
+    assert 'case "seek-to"' in src
+    assert "sender.tab.id !== ours.tabId" in src  # only the reading tab may move the reading
+    assert "/api/seek" in src and "st.count - 1" in src  # absolute item, clamped
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not on PATH")
+def test_content_jump_on_selection():
+    node = shutil.which("node")
+    result = subprocess.run([node, str(ROOT / "tests" / "extension_content_harness.js")], capture_output=True)
+    assert result.returncode == 0, result.stderr.decode(errors="replace")
+    r = json.loads(result.stdout)
+    assert r["count"] == 6
+    assert r["beforeProgress"] == {"queued": None, "sent": 0}  # not reading yet: selection ignored
+    assert r["afterSelect"]["queued"] == 5  # sentence where the selection starts is marked
+    assert r["insideParagraph"] == {"queued": 5, "sent": 0}  # collapsed click keeps it, no jump yet
+    assert r["atBoundary"] == {"queued": None, "sent": [{"cmd": "seek-to", "item": 5}]}
+    assert r["afterJump"]["sent"] == 0  # the progress caused by the jump does not re-trigger
+    assert r["replaced"]["queued"] == 4  # newer selection replaces the older one
+    assert r["inCurrent"]["queued"] is None  # selecting inside the current sentence cancels
+    assert r["escaped"] == {"queued": None, "sent": 0}  # Escape cancels
+    assert r["cleared"]["queued"] is None and r["afterClear"]["queued"] is None
+    assert r["skipped"] == {"queued": None, "sent": [{"cmd": "seek-to", "item": 4}]}  # coalesced prev+2 still jumps
+    assert r["outside"]["queued"] is None  # selection beyond the collected text is ignored

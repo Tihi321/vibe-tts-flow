@@ -11,7 +11,9 @@
   const MAX_ITEMS = 20000;
   const MAX_CHARS = 500000;
   const HIGHLIGHT_NAME = "vibetts-current";
+  const QUEUED_NAME = "vibetts-queued";
   const STYLE_ID = "vibetts-highlight-style";
+  const SELECTION_DEBOUNCE_MS = 250;
 
   const SKIP_TAGS = new Set([
     "SCRIPT", "STYLE", "NOSCRIPT", "TEMPLATE", "SVG", "CANVAS", "NAV", "ASIDE", "HEADER", "FOOTER",
@@ -24,7 +26,10 @@
 
   // state kept across messages: DOM ranges of the last collected items
   let ranges = [];
+  let paraOf = []; // paragraph index of each item, parallel to ranges
   let current = -1;
+  let pendingJump = null; // item index queued by a selection made while reading, or null
+  let selectionTimer = null;
 
   // ------------------------------------------------------------ highlight
 
@@ -32,12 +37,29 @@
     if (document.getElementById(STYLE_ID)) return;
     const st = document.createElement("style");
     st.id = STYLE_ID;
-    st.textContent = "::highlight(" + HIGHLIGHT_NAME + "){background-color: rgba(255, 213, 79, .55); color: inherit}";
+    st.textContent =
+      "::highlight(" + HIGHLIGHT_NAME + "){background-color: rgba(255, 213, 79, .55); color: inherit}" +
+      "::highlight(" + QUEUED_NAME + "){background-color: rgba(66, 133, 244, .14); color: inherit;" +
+      " text-decoration: underline dotted rgba(66, 133, 244, .9); text-decoration-thickness: 2px}";
     (document.head || document.documentElement).appendChild(st);
+  }
+
+  function clearQueued() {
+    pendingJump = null;
+    try {
+      if (typeof CSS !== "undefined" && CSS.highlights) CSS.highlights.delete(QUEUED_NAME);
+    } catch (e) {
+      /* ignore */
+    }
   }
 
   function clearHighlight() {
     current = -1;
+    clearQueued();
+    if (selectionTimer !== null) {
+      clearTimeout(selectionTimer);
+      selectionTimer = null;
+    }
     try {
       if (typeof CSS !== "undefined" && CSS.highlights) CSS.highlights.delete(HIGHLIGHT_NAME);
     } catch (e) {
@@ -207,6 +229,7 @@
     displayCache.clear();
     clearHighlight();
     ranges = [];
+    paraOf = [];
     const sel = window.getSelection();
     const selRange = sel && sel.rangeCount ? sel.getRangeAt(0).cloneRange() : null;
     if (mode === "auto") mode = selRange && !selRange.collapsed ? "selection" : "from-here";
@@ -230,6 +253,7 @@
     const lang = docLang();
     const items = [];
     let chars = 0;
+    let para = 0;
 
     outer: for (const block of collectBlocks(root, limit)) {
       // normalized text with a map from each char back to (segment node, offset)
@@ -269,25 +293,95 @@
         chars += s.text.length;
         items.push({ text: s.text, pause: k === sentences.length - 1 ? "paragraph" : "sentence" });
         ranges.push(r);
+        paraOf.push(para);
       }
+      para += 1;
     }
     displayCache.clear();
 
     let start = 0;
     if (mode === "from-here" && selRange) {
-      const caret = document.createRange();
-      caret.setStart(selRange.startContainer, selRange.startOffset);
-      caret.collapse(true);
-      for (let i = 0; i < ranges.length; i++) {
-        // item end is after the selection start
-        if (ranges[i].compareBoundaryPoints(Range.START_TO_END, caret) > 0) {
-          start = i;
-          break;
-        }
-      }
+      const i = itemAtSelectionStart(selRange);
+      if (i >= 0) start = i;
     }
     return { items, start };
   }
+
+  // First item whose end is after the selection start, or -1 when the selection starts after every item.
+  function itemAtSelectionStart(selRange) {
+    const caret = document.createRange();
+    caret.setStart(selRange.startContainer, selRange.startOffset);
+    caret.collapse(true);
+    for (let i = 0; i < ranges.length; i++) {
+      if (ranges[i].compareBoundaryPoints(Range.START_TO_END, caret) > 0) return i;
+    }
+    return -1;
+  }
+
+  // ------------------------------------------------------------ jump on selection
+
+  function showQueued(index) {
+    try {
+      if (typeof CSS !== "undefined" && CSS.highlights && typeof Highlight === "function") {
+        ensureStyle();
+        CSS.highlights.set(QUEUED_NAME, new Highlight(ranges[index]));
+      }
+    } catch (e) {
+      console.warn("VibeTTS: highlight failed", e);
+    }
+  }
+
+  // Selecting text while a reading is active queues a jump: when the current paragraph ends,
+  // reading continues from the sentence where the selection starts.
+  function onSelectionChange() {
+    selectionTimer = null;
+    if (!ranges.length || current < 0) return;
+    const sel = window.getSelection();
+    if (!sel || !sel.rangeCount) return;
+    const selRange = sel.getRangeAt(0);
+    if (selRange.collapsed) return; // a plain click does not cancel a queued jump
+    const i = itemAtSelectionStart(selRange);
+    // the selection has to touch the item it starts in, otherwise it is outside the collected text
+    if (i < 0 || ranges[i].compareBoundaryPoints(Range.END_TO_START, selRange) >= 0) return;
+    if (i === current) {
+      clearQueued();
+      return;
+    }
+    pendingJump = i;
+    showQueued(i);
+  }
+
+  function scheduleSelectionCheck() {
+    if (!ranges.length || current < 0) return;
+    if (selectionTimer !== null) clearTimeout(selectionTimer);
+    selectionTimer = setTimeout(onSelectionChange, SELECTION_DEBOUNCE_MS);
+  }
+
+  function requestJump(item) {
+    try {
+      const p = chrome.runtime.sendMessage({ cmd: "seek-to", item });
+      if (p && p.catch) p.catch(() => {});
+    } catch (e) {
+      /* extension reloaded: nothing to do */
+    }
+  }
+
+  // Normal playback moved on to the next paragraph while a jump was queued: take it.
+  function onProgress(item) {
+    if (item === current) return;
+    const prev = current;
+    highlight(item);
+    if (pendingJump === null || prev < 0 || item <= prev) return;
+    if (paraOf[item] === paraOf[prev]) return;
+    const target = pendingJump;
+    clearQueued();
+    if (target !== item) requestJump(target);
+  }
+
+  document.addEventListener("selectionchange", scheduleSelectionCheck);
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && pendingJump !== null) clearQueued();
+  });
 
   // ------------------------------------------------------------ messages
 
@@ -301,7 +395,7 @@
         sendResponse({ items: [], start: 0 });
       }
     } else if (msg.cmd === "progress") {
-      if (msg.item !== current) highlight(msg.item);
+      onProgress(msg.item);
       sendResponse({ ok: true });
     } else if (msg.cmd === "clear") {
       clearHighlight();

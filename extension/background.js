@@ -243,6 +243,21 @@ async function seek(delta) {
   }
 }
 
+// Jump to an absolute item (content script: a selection made while reading was queued).
+async function seekTo(item) {
+  try {
+    const ours = await getOurs();
+    const st = await api("/api/status");
+    if (!ours || st.session !== ours.session || !ACTIVE_STATES.includes(st.state)) {
+      return { ok: false, error: "Not reading from this extension." };
+    }
+    const n = Math.max(0, Math.min(st.count - 1, Math.trunc(item)));
+    return { ok: true, status: await api("/api/seek", { method: "POST", body: { item: n } }) };
+  } catch (e) {
+    return { ok: false, offline: e instanceof OfflineError, error: e.message };
+  }
+}
+
 async function fullStatus() {
   try {
     const info = await api("/api/info");
@@ -296,7 +311,7 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
   }
 });
 
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   const run = async () => {
     switch (msg && msg.cmd) {
       case "status":
@@ -309,6 +324,15 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         return control(msg.cmd);
       case "seek":
         return seek(Number(msg.delta) || 0);
+      case "seek-to": {
+        // only the tab that owns the current reading may move it
+        const ours = await getOurs();
+        const item = Number(msg.item);
+        if (!ours || !sender || !sender.tab || sender.tab.id !== ours.tabId || !Number.isFinite(item)) {
+          return { ok: false, error: "Not reading from this tab." };
+        }
+        return seekTo(item);
+      }
       case "voices":
         try {
           return { ok: true, data: await api("/api/voices") };
